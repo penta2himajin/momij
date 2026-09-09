@@ -126,6 +126,9 @@ struct MomijMain {
                 if has(args, "--profile-moe") {
                     print(try SeedlessEngine.profileMoEBlock(store: store, layer: 0, iters: 40))
                 }
+                if has(args, "--profile-floor") {
+                    print(try SeedlessEngine.profileDecodeFloor(store: store, iters: 16))
+                }
                 if has(args, "--sweep-cb") {
                     print(try SeedlessDecodeEngine.sweepLayersPerCB(store: store, prompt: 64, gen: 64))
                 }

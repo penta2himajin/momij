@@ -230,6 +230,20 @@ regresses (CPU encode stall and/or event/argmax tax). Keep `MOMIJ_CHAIN_K` opt-i
 Stable ~200 is essentially the sequential Seedless path on this machine; peak 250 still
 needs a lower GPU floor (next: per-op layer profile).
 
+## 2026-09-10 decode-floor profile (`--profile-floor`)
+
+Solo-CB per-op times include launch tax (noisy; `sdpaish` by subtraction can go ~0). Use **shares** and packed 24L.
+
+| Probe | result |
+|---|---|
+| 24L commit→1w @pos≈0 | gpu **~5.1 ms** → ~196 tok/s |
+| 24L commit→1w after ~32 steps | gpu **~4.3 ms** → **~231 tok/s** |
+| e2e sequential p128/g128 | **~193–198** gen |
+
+Rank (when shares are stable): **gqmm2 MoE up/down** and **gate** dominate MoE; attn qkv/o secondary; SDPA not the main lever at N≤128 on SWA.
+
+Implication for peak 250 (~4.0 ms/tok): need ~20% less packed GPU work — focus MoE gather-qmv / gate, not chain or FlashHead.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

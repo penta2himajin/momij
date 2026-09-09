@@ -450,4 +450,171 @@ extension SeedlessEngine {
         note: tok/s floors are decode-layer estimate at fixed pos=0; growing KV will add cost.
         """
     }
+
+    /// Per-op GPU floor inside one decode layer (attn + MoE), at cold and warm KV.
+    public static func profileDecodeFloor(store: WeightStore, iters: Int = 20) throws -> String {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device else { throw SeedlessError.notReady }
+        fputs("[momij] decode-floor profile: loading layers…\n", stderr)
+        let stack = try SeedlessLayerStack(store: store, device: device)
+        let swa = stack.layers[0]
+        let full = stack.layers.first(where: { !$0.isSliding }) ?? stack.layers[min(3, stack.layers.count - 1)]
+        let warmPos = 127
+
+        func fillKV(_ layer: SeedlessLayerBlock, upTo pos: Int) throws {
+            layer.resetCache()
+            stack.fillH(0.01)
+            for p in 0 ..< pos {
+                _ = try SeedlessMetal.timeCB { enc in try layer.encode(into: enc, at: p) }
+            }
+        }
+
+        func avg(_ n: Int, _ body: (MTLComputeCommandEncoder) throws -> Void) throws -> Double {
+            var g = 0.0
+            for _ in 0 ..< n {
+                let t = try SeedlessMetal.timeCB(body)
+                g += t.gpuMs
+            }
+            return g / Double(n)
+        }
+
+        func breakdown(_ layer: SeedlessLayerBlock, pos: Int, label: String) throws -> String {
+            let H = layer.H, I = layer.I, E = layer.E, Ktop = layer.Ktop, gs = layer.gs, eps = layer.eps
+            let qDim = layer.numHeads * layer.headDim
+            let kvDim = layer.numKV * layer.headDim
+            let qkvN = qDim + 2 * kvDim
+            let rotate = layer.isSliding && pos >= layer.maxLen
+            let writePos = rotate ? layer.maxLen - 1 : pos
+            let seqLen = rotate ? layer.maxLen : pos + 1
+
+            stack.fillH(0.01)
+            // Warm pipelines
+            for _ in 0 ..< 3 {
+                _ = try SeedlessMetal.timeCB { enc in try layer.encode(into: enc, at: pos) }
+            }
+
+            let inRms = try avg(iters) { enc in
+                SeedlessMetal.encodeRms(into: enc, h: layer.hBuf, w: layer.inNorm, out: layer.xAttn, H: H, eps: eps)
+            }
+            let qkv = try avg(iters) { enc in
+                try SeedlessMetal.gqmm2(
+                    x: layer.xAttn, w: layer.qkvW, scales: layer.qkvS, biases: layer.qkvB,
+                    inds: layer.densInds, out: layer.qkvOut,
+                    Ktop: 1, K: H, N: qkvN, gs: gs, into: enc)
+            }
+            let oProj = try avg(iters) { enc in
+                try SeedlessMetal.gqmm2(
+                    x: layer.attnTmp, w: layer.oW, scales: layer.oS, biases: layer.oB,
+                    inds: layer.densInds, out: layer.attnOut,
+                    Ktop: 1, K: qDim, N: H, gs: gs, into: enc)
+            }
+            let attnFull = try avg(iters) { enc in
+                try layer.encodeAttnOnly(into: enc, at: pos)
+            }
+            let moeFull = try avg(iters) { enc in
+                try SeedlessMetal.encodeMoEBlock(
+                    into: enc, h: layer.hBuf, normW: layer.postNorm, gateW: layer.gateW,
+                    upGateW: layer.upGateW, upGateS: layer.upGateS, upGateB: layer.upGateB,
+                    downW: layer.downW, downS: layer.downS, downB: layer.downB,
+                    xNorm: layer.xMoe, logits: layer.logits, inds: layer.inds, scores: layer.scores,
+                    ugOut: layer.ugOut, act: layer.act, downOut: layer.downOut, moeOut: layer.moeOut,
+                    H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs)
+            }
+            let moeRms = try avg(iters) { enc in
+                SeedlessMetal.encodeRms(into: enc, h: layer.hBuf, w: layer.postNorm, out: layer.xMoe, H: H, eps: eps)
+            }
+            let gate = try avg(iters) { enc in
+                SeedlessMetal.encodeGate(into: enc, w: layer.gateW, x: layer.xMoe, y: layer.logits, E: E, H: H)
+            }
+            let route = try avg(iters) { enc in
+                SeedlessMetal.encodeRoute(into: enc, logits: layer.logits, inds: layer.inds,
+                                          scores: layer.scores, E: E, Ktop: Ktop)
+            }
+            let up = try avg(iters) { enc in
+                try SeedlessMetal.gqmm2(
+                    x: layer.xMoe, w: layer.upGateW, scales: layer.upGateS, biases: layer.upGateB,
+                    inds: layer.inds, out: layer.ugOut,
+                    Ktop: Ktop, K: H, N: 2 * I, gs: gs, into: enc)
+            }
+            let swiglu = try avg(iters) { enc in
+                SeedlessMetal.encodeClampedSwiglu(into: enc, ug: layer.ugOut, act: layer.act, I: I, Ktop: Ktop)
+            }
+            let down = try avg(iters) { enc in
+                try SeedlessMetal.gqmm2(
+                    x: layer.act, w: layer.downW, scales: layer.downS, biases: layer.downB,
+                    inds: layer.inds, out: layer.downOut,
+                    Ktop: Ktop, K: I, N: H, gs: gs, lhsPerExpert: true, into: enc)
+            }
+            let layerFull = try avg(iters) { enc in
+                try layer.encode(into: enc, at: pos)
+            }
+
+            // encodeAttnOnly = inRms + attn body + resid; residual ≈ sdpa+qk+kv+resid
+            let sdpaish = max(0, attnFull - inRms - qkv - oProj)
+            _ = kvDim; _ = writePos; _ = rotate
+
+            func pct(_ x: Double, _ tot: Double) -> Double { 100 * x / max(tot, 1e-9) }
+            let sumParts = inRms + qkv + sdpaish + oProj + moeRms + gate + route + up + swiglu + down
+            return String(format: """
+              [%@] pos=%d seqLen=%d layer_gpu=%.3f ms
+                attn: in_rms=%.3f  qkv=%.3f  sdpa+qk+kv≈%.3f  o_proj=%.3f  attn_full=%.3f
+                moe:  rms=%.3f  gate=%.3f  route=%.3f  gqmm2_up=%.3f  swiglu=%.3f  gqmm2_dn=%.3f  moe_full=%.3f
+                share%% of sum_parts(%.3f): qkv=%.0f o=%.0f sdpaish=%.0f up=%.0f dn=%.0f gate=%.0f
+              """,
+                label as NSString, pos, seqLen, layerFull,
+                inRms, qkv, sdpaish, oProj, attnFull,
+                moeRms, gate, route, up, swiglu, down, moeFull,
+                sumParts,
+                pct(qkv, sumParts), pct(oProj, sumParts), pct(sdpaish, sumParts),
+                pct(up, sumParts), pct(down, sumParts), pct(gate, sumParts))
+        }
+
+        var lines: [String] = ["seedless decode-floor per-op GPU (own CB each; launch tax included)"]
+        try fillKV(swa, upTo: 0)
+        lines.append(try breakdown(swa, pos: 0, label: "SWA L0 cold"))
+        try fillKV(swa, upTo: warmPos)
+        lines.append(try breakdown(swa, pos: warmPos, label: "SWA L0 warm"))
+        try fillKV(full, upTo: 0)
+        lines.append(try breakdown(full, pos: 0, label: "full-attn cold"))
+        try fillKV(full, upTo: warmPos)
+        lines.append(try breakdown(full, pos: warmPos, label: "full-attn warm"))
+
+        // Packed 24L at warm-ish: advance all layers once then measure commit→1w
+        stack.resetCaches()
+        stack.fillH(0.01)
+        for _ in 0 ..< min(32, warmPos) {
+            try stack.stepCommitWait(layersPerCB: 4)
+            stack.fillH(0.01)
+        }
+        var packW = 0.0, packG = 0.0
+        let packN = 8
+        guard let q = SeedlessMetal.queue else { throw SeedlessError.notReady }
+        for _ in 0 ..< packN {
+            stack.fillH(0.01)
+            let t0 = CFAbsoluteTimeGetCurrent()
+            var cbs: [MTLCommandBuffer] = []
+            let g = 4
+            var i = 0
+            while i < stack.layers.count {
+                let cb = q.makeCommandBuffer()!
+                let enc = cb.makeComputeCommandEncoder()!
+                let end = min(i + g, stack.layers.count)
+                for j in i ..< end { try stack.layers[j].encodeStep(into: enc) }
+                enc.endEncoding()
+                cb.commit()
+                cbs.append(cb)
+                i = end
+            }
+            cbs.last!.waitUntilCompleted()
+            packW += (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            if let f = cbs.first, let l = cbs.last, f.gpuStartTime > 0, l.gpuEndTime > f.gpuStartTime {
+                packG += (l.gpuEndTime - f.gpuStartTime) * 1000
+            }
+        }
+        lines.append(String(format: "  24L commit→1w (after ~32 steps) wall=%.3f ms gpu=%.3f ms → ~%.0f tok/s gpu",
+                            packW / Double(packN), packG / Double(packN),
+                            1000.0 / max(packG / Double(packN), 1e-9)))
+        lines.append("note: per-op times are solo-CB (overstate launch); use shares to rank kernel work.")
+        return lines.joined(separator: "\n")
+    }
 }

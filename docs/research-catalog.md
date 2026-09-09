@@ -16,8 +16,9 @@ Phase profile: [bench/RESULTS.md](../bench/RESULTS.md) (2026-09-09).
 
 ## Ordered plan (do in order)
 
-1. **Parity: momij MLX → oracle (~97→~182 tok/s)**  
-   Port Maple fused router / SwitchGLU details; match decode graph+eval cadence. Re-measure e2e.
+1. **Parity: momij MLX → oracle (~97→~182 tok/s)** — **in progress (~143 vs ~170+)**  
+   Landed: async token pipeline, fused add+RMSNorm, fused Metal router, chunked KV.  
+   Still open: remaining ~15–25% (compile / emb / attn details). Re-measure e2e after each lever.
 2. **Drop host-bridged hybrid as the decode hot path**  
    Keep Metal experts for 1-CB; do not ship `MOMIJ_SEEDLESS_MOE` host roundtrip.
 3. **P0 Seedless: full 1-CB decode**  

@@ -13,6 +13,8 @@ public struct MapleMoE {
     let gateW: MLXArray  // [E, H] dense
     let upGateW: MLXArray, upGateS: MLXArray, upGateB: MLXArray  // [E, 2I, ...]
     let downW: MLXArray, downS: MLXArray, downB: MLXArray
+    /// Persistent arrival counter for fused decode router (one per layer).
+    let routerCtr: MLXArray
 
     public init(
         topK: Int, numExperts: Int, bits: Int, groupSize: Int,
@@ -25,6 +27,9 @@ public struct MapleMoE {
         self.gateW = gateW
         self.upGateW = upGateW; self.upGateS = upGateS; self.upGateB = upGateB
         self.downW = downW; self.downS = downS; self.downB = downB
+        let ctr = MLXArray.zeros([8], dtype: .uint32)
+        MLX.eval(ctr)
+        self.routerCtr = ctr
     }
 
     private func clampedSwiglu(gate: MLXArray, up: MLXArray) -> MLXArray {
@@ -33,24 +38,34 @@ public struct MapleMoE {
         return (g * MLX.sigmoid(g)) * u
     }
 
-    /// x: [B, L, H] → [B, L, H]
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let B = x.dim(0), L = x.dim(1), H = x.dim(2)
-        let flat = x.reshaped([B * L, H])
-        // dense router in fp32 for stability (matches maple fused_router spirit)
+    private func route(_ flat: MLXArray, tokens: Int) -> (inds: MLXArray, scores: MLXArray) {
+        // Decode (T=1): oracle fused Metal router (~+18% claimed).
+        if tokens == 1, topK == 8 {
+            let (inds, scores) = MapleFused.fusedRouter(
+                x: flat, weight: gateW, ctr: routerCtr,
+                numExperts: numExperts, topK: topK)
+            return (inds.reshaped([1, topK]).asType(.uint32), scores.reshaped([1, topK]))
+        }
         let logits = MLX.matmul(flat.asType(.float32), gateW.transposed(1, 0).asType(.float32))
         let gates = MLX.softmax(logits, axis: -1, precise: true)
         let order = MLX.argPartition(gates, kth: numExperts - topK, axis: -1)
         let inds = order[0..., (numExperts - topK)...].asType(.uint32)
         var scores = MLX.takeAlong(gates, inds.asType(.int32), axis: -1)
         scores = scores / scores.sum(axis: -1, keepDims: true)
+        return (inds, scores)
+    }
+
+    /// x: [B, L, H] → [B, L, H]
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let B = x.dim(0), L = x.dim(1), H = x.dim(2)
+        let flat = x.reshaped([B * L, H])
+        let (inds, scores) = route(flat, tokens: B * L)
 
         let xe = flat.expandedDimensions(axes: [-2, -3])  // [T,1,1,H]
         let ug = MLX.gatherQuantizedMM(
             xe, upGateW, scales: upGateS, biases: upGateB, rhsIndices: inds,
             transpose: true, groupSize: groupSize, bits: bits, mode: .affine,
             sortedIndices: false)  // [T, K, 1, 2I]
-        // maple.py: x_up, x_gate = split(up_gate, 2, axis=-1)
         let parts = ug.split(parts: 2, axis: -1)
         let h = clampedSwiglu(gate: parts[1], up: parts[0])
         let d = MLX.gatherQuantizedMM(

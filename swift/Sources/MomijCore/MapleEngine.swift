@@ -13,7 +13,8 @@ public final class MapleEngine: @unchecked Sendable {
     private let normW: MLXArray
     private let lmHead: QuantProj
     private var caches: [KVCache] = []
-
+    /// Cached zeros for decode fused residual (oracle `MapleModel._zero`).
+    private var decodeZero: MLXArray?
     private struct Layer {
         let attn: MapleAttention
         let moe: MapleMoEHybrid
@@ -133,34 +134,54 @@ public final class MapleEngine: @unchecked Sendable {
         return lmHead.apply(h[0..., (h.dim(1) - 1) ..< h.dim(1), 0...])
     }
 
-    private func stepLogits(_ token: Int) -> MLXArray {
-        let tok = MLXArray(Int32(token)).reshaped([1, 1])
+    private func stepLogits(_ token: MLXArray) -> MLXArray {
+        // token: scalar or [1]/int — keep on-device (oracle generate_step style)
+        let tok = token.asType(.int32).reshaped([1, 1])
         var h = embed(tok)
-        for (layer, cache) in zip(layers, caches) {
-            let r = layer.attn(rms(h, layer.inNorm), cache: cache)
-            h = h + r
-            let r2 = layer.moe(rms(h, layer.postNorm))
-            h = h + r2
+        // Oracle `_decode_fused`: carry residual `r`, fold add+RMSNorm into one dispatch.
+        if decodeZero == nil || decodeZero!.dim(0) != h.dim(0) {
+            let z = MLXArray.zeros(like: h)
+            MLX.eval(z)
+            decodeZero = z
         }
-        h = rms(h, normW)
-        return lmHead.apply(h)
+        var r = decodeZero!
+        for (layer, cache) in zip(layers, caches) {
+            let hn: MLXArray
+            (h, hn) = MapleFused.addRmsNorm(h, r, weight: layer.inNorm, eps: config.rmsNormEps)
+            r = layer.attn(hn, cache: cache)
+            let hn2: MLXArray
+            (h, hn2) = MapleFused.addRmsNorm(h, r, weight: layer.postNorm, eps: config.rmsNormEps)
+            r = layer.moe(hn2)
+        }
+        let hnFinal: MLXArray
+        (_, hnFinal) = MapleFused.addRmsNorm(h, r, weight: normW, eps: config.rmsNormEps)
+        return lmHead.apply(hnFinal)
+    }
+
+    private func stepLogits(_ token: Int) -> MLXArray {
+        stepLogits(MLXArray(Int32(token)))
     }
 
     /// Prefill + decode. Returns generated token ids (not including prompt).
     public func generate(prompt: [Int], maxTokens: Int, eos: Int? = 151_645) -> [Int] {
         guard !prompt.isEmpty, maxTokens > 0 else { return [] }
-        var logits = forwardLastLogits(prompt, reset: true)
-        MLX.eval(logits)
+        let logits0 = forwardLastLogits(prompt, reset: true)
+        var y = MLX.argMax(logits0[0, 0], axis: -1)
+        asyncEval(y)
         var out: [Int] = []
-        var next = MLX.argMax(logits[0, 0], axis: -1).item(Int.self)
-        out.append(next)
-        if let eos, next == eos { return out }
-        for _ in 1 ..< maxTokens {
-            logits = stepLogits(next)
-            MLX.eval(logits)
-            next = MLX.argMax(logits[0, 0], axis: -1).item(Int.self)
+        for i in 0 ..< maxTokens {
+            // Overlap next forward with reading current token (mlx_lm.generate_step).
+            var nextY: MLXArray? = nil
+            if i + 1 < maxTokens {
+                let logits = stepLogits(y)
+                nextY = MLX.argMax(logits[0, 0], axis: -1)
+                asyncEval(nextY!)
+            }
+            let next = y.item(Int.self)
             out.append(next)
             if let eos, next == eos { break }
+            guard let n = nextY else { break }
+            y = n
         }
         return out
     }
@@ -175,14 +196,21 @@ public final class MapleEngine: @unchecked Sendable {
         for _ in 0 ..< trials {
             let prompt = Array(repeating: 100, count: promptTokens)
             let t0 = CFAbsoluteTimeGetCurrent()
-            var logits = forwardLastLogits(prompt, reset: true)
-            MLX.eval(logits)
+            let logits0 = forwardLastLogits(prompt, reset: true)
+            var y = MLX.argMax(logits0[0, 0], axis: -1)
+            asyncEval(y)
+            // Prefill complete once first token id is ready (matches oracle first-yield).
+            _ = y.item(Int.self)
             let t1 = CFAbsoluteTimeGetCurrent()
-            var next = MLX.argMax(logits[0, 0], axis: -1).item(Int.self)
-            for _ in 0 ..< genTokens {
-                logits = stepLogits(next)
-                MLX.eval(logits)
-                next = MLX.argMax(logits[0, 0], axis: -1).item(Int.self)
+            Stream.withNewDefaultStream {
+                for _ in 0 ..< genTokens {
+                    let logits = stepLogits(y)
+                    let nextY = MLX.argMax(logits[0, 0], axis: -1)
+                    asyncEval(nextY)
+                    _ = y.item(Int.self)
+                    y = nextY
+                }
+                _ = y.item(Int.self)
             }
             let t2 = CFAbsoluteTimeGetCurrent()
             pTps.append(Double(promptTokens) / max(t1 - t0, 1e-9))

@@ -185,6 +185,23 @@ Policy: batch **off by default**; enable only with `MOMIJ_SPEC_BATCH=1` or rolli
 
 True M-row verify still needed for peak ~250; chain mainly amortizes CB wait when drafts hit.
 
+## 2026-09-09 gqmm2 A — split-K / w16 (measured)
+
+Goal: raise packed-CB GPU floor (~5.1 ms / ~194 gpu tok/s @24L) without TG-cache metallib bloat.
+
+| Variant | env | micro (own CB) | 24L commit→1w GPU | e2e gen (p128/g128, interleaved×3) |
+|---|---|---|---|---|
+| default `gqmm2_rows` (8 rows/TG) | — | ~3.0k kernel/s | **~5.1 ms** | **~175–183** (mean ~178) |
+| split-K + reduce | `MOMIJ_GQMM2_SPLITK=1` | ↑ (expert micro often +50%+) | **~6.1 ms worse** | **~146–154** (regress) |
+| wide TG 16 rows | `MOMIJ_GQMM2_W16=1` | ~neutral | ~5.1 ms | **~181–184** (mean ~182, mild) |
+
+Lessons:
+
+1. Single-CB micro can lie: split-K fills wait bubbles; under packed layers the extra partials+reduce traffic loses.
+2. No large `threadgroup` caches (prior occupancy attempt tanked legacy path ~3×).
+3. Default stays stock `gqmm2_rows`. Both variants opt-in + parity-tested.
+4. Next A candidates: software-pipeline inner K loop (no extra dispatch), CB double-buffer for wall, or SDPA/gqmm2 fuse — not another reduce-style split-K.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

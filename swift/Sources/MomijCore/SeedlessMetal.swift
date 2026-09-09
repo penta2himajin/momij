@@ -8,11 +8,18 @@ import MLX
 /// with `group_size` 64|128. Expert path = up_gate gather → clamped SwiGLU →
 /// down gather → score reduce on one command buffer. Optional `gqmm2_up_swiglu`
 /// (`MOMIJ_FUSE_UP_SWIGLU=1`) fuses the first two; default keeps them separate (faster e2e).
+/// Experimental (default off): `MOMIJ_GQMM2_SPLITK=1` (micro↑ e2e↓), `MOMIJ_GQMM2_W16=1` (mild).
 public enum SeedlessMetal {
     nonisolated(unsafe) static var device: MTLDevice?
     nonisolated(unsafe) static var queue: MTLCommandQueue?
     nonisolated(unsafe) static var gqmm2Pipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var gqmm2W16Pipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var gqmm2SplitKPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var gqmm2ReduceSKPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var gqmm2UpSwigluPipeline: MTLComputePipelineState?
+    /// Scratch for split-K partials: [nChunks, Ktop, N] half. Grown on demand.
+    nonisolated(unsafe) static var gqmm2SKPartials: MTLBuffer?
+    nonisolated(unsafe) static var gqmm2SKPartialsBytes: Int = 0
     nonisolated(unsafe) static var swigluPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var scoreReducePipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var rmsPipeline: MTLComputePipelineState?
@@ -46,6 +53,9 @@ public enum SeedlessMetal {
             try dev.makeComputePipelineState(function: lib.makeFunction(name: name)!)
         }
         gqmm2Pipeline = try pipe("gqmm2_rows")
+        gqmm2W16Pipeline = try pipe("gqmm2_rows_w16")
+        gqmm2SplitKPipeline = try pipe("gqmm2_rows_sk")
+        gqmm2ReduceSKPipeline = try pipe("gqmm2_reduce_sk")
         gqmm2UpSwigluPipeline = try pipe("gqmm2_up_swiglu")
         swigluPipeline = try pipe("maple_clamped_swiglu")
         scoreReducePipeline = try pipe("maple_score_reduce")
@@ -86,17 +96,44 @@ public enum SeedlessMetal {
         return String(cString: raw) == "1"
     }
 
+    /// Split-K gqmm2 (more TGs along K). Default off — micro↑ packed-CB↓.
+    /// Env: `MOMIJ_GQMM2_SPLITK=1`.
+    public static var useSplitK: Bool {
+        guard let raw = getenv("MOMIJ_GQMM2_SPLITK") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    /// Wider TG: 16 output rows / TG (4 simdgroups). Env: `MOMIJ_GQMM2_W16=1`.
+    public static var useW16: Bool {
+        guard let raw = getenv("MOMIJ_GQMM2_W16") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    private static let gqmm2BlockSize = 512
+
+    private static func ensureSKPartials(bytes: Int) throws -> MTLBuffer {
+        if let b = gqmm2SKPartials, gqmm2SKPartialsBytes >= bytes { return b }
+        guard let device else { throw SeedlessError.notReady }
+        let buf = device.makeBuffer(length: bytes, options: .storageModeShared)!
+        gqmm2SKPartials = buf
+        gqmm2SKPartialsBytes = bytes
+        return buf
+    }
+
     /// 2-bit gather-qmv: x[1,K], w[E,N,K/16], scales/biases[E,N,K/gs], inds[Ktop] → y[Ktop,N]
     public static func gqmm2(
         x: MTLBuffer, w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer, inds: MTLBuffer,
         out: MTLBuffer,
         Ktop: Int, K: Int, N: Int, gs: Int = 128, lhsPerExpert: Bool = false,
         into encoder: MTLComputeCommandEncoder? = nil,
-        commandQueue: MTLCommandQueue? = nil
+        commandQueue: MTLCommandQueue? = nil,
+        splitK: Bool? = nil,
+        w16: Bool? = nil
     ) throws {
         try ensureCompiled()
-        guard let pipe = gqmm2Pipeline, let stop = stopBuf else { throw SeedlessError.notReady }
-        guard N % 8 == 0, K % 512 == 0, gs == 64 || gs == 128 else {
+        guard let stop = stopBuf else { throw SeedlessError.notReady }
+        let rowsPerTG = ((w16 ?? useW16) && !(splitK ?? useSplitK)) ? 16 : 8
+        guard N % rowsPerTG == 0, K % gqmm2BlockSize == 0, gs == 64 || gs == 128 else {
             throw SeedlessError.unsupportedShape(N: N, K: K, gs: gs)
         }
 
@@ -104,27 +141,73 @@ public enum SeedlessMetal {
         let q = commandQueue ?? queue!
         let cb = ownsCB ? q.makeCommandBuffer()! : nil
         let enc = encoder ?? cb!.makeComputeCommandEncoder()!
+        let doSK = splitK ?? useSplitK
 
-        enc.setComputePipelineState(pipe)
-        enc.setBuffer(w, offset: 0, index: 0)
-        enc.setBuffer(scales, offset: 0, index: 1)
-        enc.setBuffer(biases, offset: 0, index: 2)
-        enc.setBuffer(x, offset: 0, index: 3)
-        enc.setBuffer(inds, offset: 0, index: 4)
-        enc.setBuffer(out, offset: 0, index: 5)
-        var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
-        enc.setBytes(&kk, length: 4, index: 6)
-        enc.setBytes(&nn, length: 4, index: 7)
-        enc.setBytes(&kt, length: 4, index: 8)
-        enc.setBuffer(stop, offset: 0, index: 9)
-        var lp = UInt32(lhsPerExpert ? 1 : 0)
-        enc.setBytes(&lp, length: 4, index: 10)
-        var gsv = Int32(gs)
-        enc.setBytes(&gsv, length: 4, index: 11)
-        // grid: width=1, height=N/8, depth=M*Ktop (M=1)
-        enc.dispatchThreadgroups(
-            MTLSize(width: 1, height: N / 8, depth: Ktop),
-            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        if doSK {
+            guard let sk = gqmm2SplitKPipeline, let red = gqmm2ReduceSKPipeline else {
+                throw SeedlessError.notReady
+            }
+            let nChunks = K / gqmm2BlockSize
+            let partials = try ensureSKPartials(bytes: nChunks * Ktop * N * 2)
+            enc.setComputePipelineState(sk)
+            enc.setBuffer(w, offset: 0, index: 0)
+            enc.setBuffer(scales, offset: 0, index: 1)
+            enc.setBuffer(biases, offset: 0, index: 2)
+            enc.setBuffer(x, offset: 0, index: 3)
+            enc.setBuffer(inds, offset: 0, index: 4)
+            enc.setBuffer(partials, offset: 0, index: 5)
+            var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
+            enc.setBytes(&kk, length: 4, index: 6)
+            enc.setBytes(&nn, length: 4, index: 7)
+            enc.setBytes(&kt, length: 4, index: 8)
+            enc.setBuffer(stop, offset: 0, index: 9)
+            var lp = UInt32(lhsPerExpert ? 1 : 0)
+            enc.setBytes(&lp, length: 4, index: 10)
+            var gsv = Int32(gs)
+            enc.setBytes(&gsv, length: 4, index: 11)
+            // width = K-chunks → more TGs, one block each (no large TG cache).
+            enc.dispatchThreadgroups(
+                MTLSize(width: nChunks, height: N / 8, depth: Ktop),
+                threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+
+            enc.setComputePipelineState(red)
+            enc.setBuffer(partials, offset: 0, index: 0)
+            enc.setBuffer(out, offset: 0, index: 1)
+            var nc = Int32(nChunks)
+            enc.setBytes(&nn, length: 4, index: 2)
+            enc.setBytes(&kt, length: 4, index: 3)
+            enc.setBytes(&nc, length: 4, index: 4)
+            enc.setBuffer(stop, offset: 0, index: 5)
+            enc.dispatchThreads(
+                MTLSize(width: N, height: Ktop, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: min(256, N), height: 1, depth: 1))
+        } else {
+            let useWide = w16 ?? useW16
+            guard let pipe = useWide ? gqmm2W16Pipeline : gqmm2Pipeline else {
+                throw SeedlessError.notReady
+            }
+            enc.setComputePipelineState(pipe)
+            enc.setBuffer(w, offset: 0, index: 0)
+            enc.setBuffer(scales, offset: 0, index: 1)
+            enc.setBuffer(biases, offset: 0, index: 2)
+            enc.setBuffer(x, offset: 0, index: 3)
+            enc.setBuffer(inds, offset: 0, index: 4)
+            enc.setBuffer(out, offset: 0, index: 5)
+            var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
+            enc.setBytes(&kk, length: 4, index: 6)
+            enc.setBytes(&nn, length: 4, index: 7)
+            enc.setBytes(&kt, length: 4, index: 8)
+            enc.setBuffer(stop, offset: 0, index: 9)
+            var lp = UInt32(lhsPerExpert ? 1 : 0)
+            enc.setBytes(&lp, length: 4, index: 10)
+            var gsv = Int32(gs)
+            enc.setBytes(&gsv, length: 4, index: 11)
+            let tptg = useWide ? 128 : 64
+            let rows = useWide ? 16 : 8
+            enc.dispatchThreadgroups(
+                MTLSize(width: 1, height: N / rows, depth: Ktop),
+                threadsPerThreadgroup: MTLSize(width: tptg, height: 1, depth: 1))
+        }
 
         if ownsCB {
             enc.endEncoding()
@@ -808,6 +891,142 @@ public enum SeedlessMetal {
             result[row] = simd_sum(result[row]);
             if (simd_lid == 0) y[row] = (half)result[row];
         }
+    }
+
+    // Same math as gqmm2_rows; 4 simdgroups → 16 rows/TG (more x reuse, fewer TGs).
+    kernel void gqmm2_rows_w16(
+        device const uint32_t* w      [[buffer(0)]],
+        device const half*     scales [[buffer(1)]],
+        device const half*     biases [[buffer(2)]],
+        device const half*     x      [[buffer(3)]],
+        device const int*      inds   [[buffer(4)]],
+        device half*           y      [[buffer(5)]],
+        constant int& in_vec_size  [[buffer(6)]],
+        constant int& out_vec_size [[buffer(7)]],
+        constant int& ktop         [[buffer(8)]],
+        device const int* stopFlag [[buffer(9)]],
+        constant uint& lhsPer      [[buffer(10)]],
+        constant int&  gsz         [[buffer(11)]],
+        uint3 tid      [[threadgroup_position_in_grid]],
+        uint  simd_gid [[simdgroup_index_in_threadgroup]],
+        uint  simd_lid [[thread_index_in_simdgroup]])
+    {
+        if (stopFlag[0] != 0) return;
+        constexpr int packs_per_thread = 1, num_simdgroups = 4, results_per_simdgroup = 4;
+        constexpr int pack_factor = 16, bytes_per_pack = 4, values_per_thread = 16;
+        constexpr int block_size = 512;
+        const int scale_step_per_thread = gsz / values_per_thread;
+        const device uint8_t* ws = (const device uint8_t*)w;
+        thread float x_thread[16];
+        thread float result[4] = {0};
+        const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+        const int in_vec_size_g = in_vec_size / gsz;
+        uint mk = tid.z;
+        uint e = (uint)inds[mk];
+        ws     += (size_t)e * out_vec_size * in_vec_size_w;
+        scales += (size_t)e * out_vec_size * in_vec_size_g;
+        biases += (size_t)e * out_vec_size * in_vec_size_g;
+        const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+        ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+        scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+        biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+        x += (size_t)(lhsPer ? mk : mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
+        y += (size_t)mk * out_vec_size + out_row;
+        for (int k = 0; k < in_vec_size; k += block_size) {
+            float sum = ld16_b2(x, x_thread);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                const device half* sl = scales + row * in_vec_size_g;
+                const device half* bl = biases + row * in_vec_size_g;
+                result[row] += qd2(wl, x_thread, sl[0], bl[0], sum);
+            }
+            ws += block_size * bytes_per_pack / pack_factor;
+            scales += block_size / gsz; biases += block_size / gsz; x += block_size;
+        }
+        for (int row = 0; row < results_per_simdgroup; row++) {
+            result[row] = simd_sum(result[row]);
+            if (simd_lid == 0) y[row] = (half)result[row];
+        }
+    }
+
+    // Split-K: one K-block (512) per tid.x → partials[chunk, mk, N]. No TG cache.
+    kernel void gqmm2_rows_sk(
+        device const uint32_t* w      [[buffer(0)]],
+        device const half*     scales [[buffer(1)]],
+        device const half*     biases [[buffer(2)]],
+        device const half*     x      [[buffer(3)]],
+        device const int*      inds   [[buffer(4)]],
+        device half*           partials [[buffer(5)]],
+        constant int& in_vec_size  [[buffer(6)]],
+        constant int& out_vec_size [[buffer(7)]],
+        constant int& ktop         [[buffer(8)]],
+        device const int* stopFlag [[buffer(9)]],
+        constant uint& lhsPer      [[buffer(10)]],
+        constant int&  gsz         [[buffer(11)]],
+        uint3 tid      [[threadgroup_position_in_grid]],
+        uint  simd_gid [[simdgroup_index_in_threadgroup]],
+        uint  simd_lid [[thread_index_in_simdgroup]])
+    {
+        if (stopFlag[0] != 0) return;
+        constexpr int packs_per_thread = 1, num_simdgroups = 2, results_per_simdgroup = 4;
+        constexpr int pack_factor = 16, bytes_per_pack = 4, values_per_thread = 16;
+        constexpr int block_size = 512;
+        const int scale_step_per_thread = gsz / values_per_thread;
+        const device uint8_t* ws = (const device uint8_t*)w;
+        thread float x_thread[16];
+        thread float result[4] = {0};
+        const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+        const int in_vec_size_g = in_vec_size / gsz;
+        const int nChunks = in_vec_size / block_size;
+        uint chunk = tid.x;
+        if ((int)chunk >= nChunks) return;
+        uint mk = tid.z;
+        uint e = (uint)inds[mk];
+        ws     += (size_t)e * out_vec_size * in_vec_size_w;
+        scales += (size_t)e * out_vec_size * in_vec_size_g;
+        biases += (size_t)e * out_vec_size * in_vec_size_g;
+        const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+        const int k0 = (int)chunk * block_size;
+        ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack
+                + k0 * bytes_per_pack / pack_factor;
+        scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread + k0 / gsz;
+        biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread + k0 / gsz;
+        x += (size_t)(lhsPer ? mk : mk / (uint)ktop) * in_vec_size
+           + simd_lid * values_per_thread + k0;
+        float sum = ld16_b2(x, x_thread);
+        for (int row = 0; row < results_per_simdgroup; row++) {
+            auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+            const device half* sl = scales + row * in_vec_size_g;
+            const device half* bl = biases + row * in_vec_size_g;
+            result[row] += qd2(wl, x_thread, sl[0], bl[0], sum);
+        }
+        device half* y = partials
+            + ((size_t)chunk * (size_t)ktop + (size_t)mk) * (size_t)out_vec_size
+            + out_row;
+        for (int row = 0; row < results_per_simdgroup; row++) {
+            result[row] = simd_sum(result[row]);
+            if (simd_lid == 0) y[row] = (half)result[row];
+        }
+    }
+
+    kernel void gqmm2_reduce_sk(
+        device const half* partials [[buffer(0)]],
+        device half*       y        [[buffer(1)]],
+        constant int& out_vec_size  [[buffer(2)]],
+        constant int& ktop          [[buffer(3)]],
+        constant int& nChunks       [[buffer(4)]],
+        device const int* stopFlag  [[buffer(5)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (stopFlag[0] != 0) return;
+        uint col = gid.x;
+        uint mk = gid.y;
+        if ((int)col >= out_vec_size || (int)mk >= ktop) return;
+        float acc = 0;
+        for (int c = 0; c < nChunks; c++) {
+            acc += (float)partials[((size_t)c * (size_t)ktop + (size_t)mk) * (size_t)out_vec_size + col];
+        }
+        y[(size_t)mk * (size_t)out_vec_size + col] = (half)acc;
     }
 
     // Up||gate gather-qmv fused with clamped SwiGLU. out_vec_size = I; weight has 2I rows.

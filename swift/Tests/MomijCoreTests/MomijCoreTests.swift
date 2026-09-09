@@ -51,6 +51,120 @@ final class SeedlessMetalTests: XCTestCase {
         XCTAssertGreaterThan(rate, 10, "fused expert should exceed 10 steps/s, got \(rate)")
     }
 
+    func testGqmm2SplitKMatchesDefault() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 512, N = 128, E = 4, Ktop = 2, gs = 128
+        func fill(_ buf: MTLBuffer) {
+            let n = buf.length
+            let p = buf.contents().bindMemory(to: UInt8.self, capacity: n)
+            for i in 0 ..< n { p[i] = UInt8((i * 17 + 3) & 0xff) }
+        }
+        func fillHalf(_ buf: MTLBuffer, _ v: Float16) {
+            let n = buf.length / 2
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = v }
+        }
+        func buf(_ bytes: Int) -> MTLBuffer {
+            device.makeBuffer(length: bytes, options: .storageModeShared)!
+        }
+        let packedK = H * 2 / 32
+        let nGroups = H / gs
+        let x = buf(H * 2); fillHalf(x, 0.01)
+        let w = buf(E * N * packedK * 4); fill(w)
+        let s = buf(E * N * nGroups * 2); fillHalf(s, 0.02)
+        let b = buf(E * N * nGroups * 2); fillHalf(b, 0.001)
+        let inds = buf(Ktop * 4)
+        let ip = inds.contents().bindMemory(to: Int32.self, capacity: Ktop)
+        ip[0] = 1; ip[1] = 2
+        let y0 = buf(Ktop * N * 2)
+        let y1 = buf(Ktop * N * 2)
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        try SeedlessMetal.gqmm2(
+            x: x, w: w, scales: s, biases: b, inds: inds, out: y0,
+            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: false, w16: false)
+        try SeedlessMetal.gqmm2(
+            x: x, w: w, scales: s, biases: b, inds: inds, out: y1,
+            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: true, w16: false)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let a = y0.contents().bindMemory(to: Float16.self, capacity: Ktop * N)
+        let bOut = y1.contents().bindMemory(to: Float16.self, capacity: Ktop * N)
+        var maxAbs: Float = 0
+        var num = 0.0, den = 0.0
+        for i in 0 ..< (Ktop * N) {
+            let d = abs(Float(a[i]) - Float(bOut[i]))
+            maxAbs = max(maxAbs, d)
+            num += Double(d * d)
+            den += Double(Float(a[i]) * Float(a[i]))
+        }
+        let rel = sqrt(num / max(den, 1e-30))
+        XCTAssertLessThan(rel, 1e-3, "split-K gqmm2 must match default; rel_l2=\(rel) maxAbs=\(maxAbs)")
+    }
+
+    func testGqmm2W16MatchesDefault() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 512, N = 128, E = 4, Ktop = 2, gs = 128
+        func fill(_ buf: MTLBuffer) {
+            let n = buf.length
+            let p = buf.contents().bindMemory(to: UInt8.self, capacity: n)
+            for i in 0 ..< n { p[i] = UInt8((i * 17 + 3) & 0xff) }
+        }
+        func fillHalf(_ buf: MTLBuffer, _ v: Float16) {
+            let n = buf.length / 2
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = v }
+        }
+        func buf(_ bytes: Int) -> MTLBuffer {
+            device.makeBuffer(length: bytes, options: .storageModeShared)!
+        }
+        let packedK = H * 2 / 32
+        let nGroups = H / gs
+        let x = buf(H * 2); fillHalf(x, 0.01)
+        let w = buf(E * N * packedK * 4); fill(w)
+        let s = buf(E * N * nGroups * 2); fillHalf(s, 0.02)
+        let b = buf(E * N * nGroups * 2); fillHalf(b, 0.001)
+        let inds = buf(Ktop * 4)
+        let ip = inds.contents().bindMemory(to: Int32.self, capacity: Ktop)
+        ip[0] = 1; ip[1] = 2
+        let y0 = buf(Ktop * N * 2)
+        let y1 = buf(Ktop * N * 2)
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        try SeedlessMetal.gqmm2(
+            x: x, w: w, scales: s, biases: b, inds: inds, out: y0,
+            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: false, w16: false)
+        try SeedlessMetal.gqmm2(
+            x: x, w: w, scales: s, biases: b, inds: inds, out: y1,
+            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: false, w16: true)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let a = y0.contents().bindMemory(to: Float16.self, capacity: Ktop * N)
+        let bOut = y1.contents().bindMemory(to: Float16.self, capacity: Ktop * N)
+        var maxAbs: Float = 0
+        var num = 0.0, den = 0.0
+        for i in 0 ..< (Ktop * N) {
+            let d = abs(Float(a[i]) - Float(bOut[i]))
+            maxAbs = max(maxAbs, d)
+            num += Double(d * d)
+            den += Double(Float(a[i]) * Float(a[i]))
+        }
+        let rel = sqrt(num / max(den, 1e-30))
+        XCTAssertLessThan(rel, 1e-3, "w16 gqmm2 must match default; rel_l2=\(rel) maxAbs=\(maxAbs)")
+    }
+
     func testUpSwigluFusedMatchesSeparate() throws {
         try SeedlessMetal.ensureCompiled()
         guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {

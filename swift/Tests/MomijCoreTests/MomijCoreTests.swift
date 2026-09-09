@@ -146,7 +146,7 @@ final class SeedlessAttnEncodeTests: XCTestCase {
             qkvOut: qkvOut, qkOut: qkOut, attnTmp: attnTmp, attnOut: attnOut,
             kCache: kCache, vCache: vCache,
             H: H, numHeads: heads, numKV: kv, headDim: d,
-            ropeDim: 64, pos: 0, maxLen: maxLen, seqLen: 1, eps: 1e-6, gs: gs)
+            ropeDim: 64, ropePos: 0, writePos: 0, maxLen: maxLen, seqLen: 1, eps: 1e-6, gs: gs)
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()

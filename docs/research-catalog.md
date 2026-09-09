@@ -32,7 +32,7 @@ Phase profile: [bench/RESULTS.md](../bench/RESULTS.md) (2026-09-09).
 
 | Lever | Status in momij | Notes |
 |---|---|---|
-| Raw Metal 1-CB decode (Seedless) | **Milestone B**: attn+MoE `SeedlessLayerStack` | **commit→1wait ~182 tok/s wall** @pos=0; giant single-encoder is encode-bound (~58). Next: engine wire + SWA/pos |
+| Raw Metal 1-CB decode (Seedless) | **e2e wired** `SeedlessDecodeEngine` | **~169 gen tok/s** vs oracle ~177 (p128/g128); L0 rel_l2 1.9e-4; next=layers/lm_head |
 | Fused ternary expert block | real-weight ~1600–2300 steps/s | building block inside 1-CB |
 | MLX exact greedy | `MapleEngine` ~143 tok/s | oracle-aligned fused kernels; residual vs Python MLX |
 | Oracle (= mlx-lm-deepgrove) | MLX graph + metal_kernel (not 1-CB) | ~182 tok/s; Seedless MoE+attn now matches this band at cold pos=0 |

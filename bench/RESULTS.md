@@ -101,6 +101,22 @@ Kernels: `maple_qk_norm_rope`, `maple_write_kv`, `maple_sdpa_d128` + existing `g
 
 Claim: packing 24 full layers into **one** encoder is wrong for wall time (encode tax). Right pattern is **per-layer CB commit, single final wait** → MoE+attn decode floor **~182 tok/s wall** at pos=0 (N=1), matching oracle e2e band before embed/lm_head/growing KV. Next: wire into `MapleEngine`, SWA rotate, longer `pos`.
 
+## 2026-09-09 Seedless e2e (embed + layers + lm_head + SWA/pos)
+
+Connected: memcpy embed, Metal attn+MoE with SWA rotate + growing `offset`, final RMS on last CB, MLX 4-bit lm_head+argmax. L0 parity **rel_l2 ≈ 1.9e-4**.
+
+M1 Max, AC, omlx stop, p128/g128 n=3 (seedless) / n=2 (oracle, mlx):
+
+| Backend | prompt tok/s | generation tok/s |
+|---|---|---|
+| **seedless** | **170** | **168–169** |
+| oracle | 655 | **177** |
+| momij MLX | 673 | 142 |
+
+Phase ms/tok (seedless gen): embed **0.001** · layers **4.7–4.8** · head(lm_head+argmax) **1.18** · sum ≈ 5.96 → ~168 tok/s.
+
+Bottleneck now: **layers (~80%)** then **lm_head (~20%)**. Embed solved. Gap to oracle ~5% (~0.3 ms/tok). Next levers: faster SDPA/gqmm2 under growing N; Metal/FlashHead for lm_head.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

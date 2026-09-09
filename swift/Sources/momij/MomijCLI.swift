@@ -35,9 +35,9 @@ struct MomijMain {
             momij — Maple-Preview high-speed inference (oMLX replacement)
 
             Usage:
-              momij bench --model <dir> [--backend mlx|oracle] [--flash-head] [-p 128] [-g 256] [-n 3]
+              momij bench --model <dir> [--backend mlx|oracle|seedless] [--flash-head] [-p 128] [-g 256] [-n 3]
               momij seedless-bench [--model <dir>]
-              momij generate --model <dir> --prompt <text> [--backend mlx|oracle] [--suffix-spec]
+              momij generate --model <dir> --prompt <text> [--backend mlx|oracle|seedless] [--suffix-spec]
               momij serve --model <dir> [--backend mlx|oracle] [--port 8742] [--host 127.0.0.1]
             """
         )
@@ -69,6 +69,19 @@ struct MomijMain {
             print(String(format: "backend=oracle flash_head=%@ prompt_tps=%.3f generation_tps=%.3f peak_memory=%.3f",
                          flash ? "true" : "false",
                          r["prompt_tps"] ?? 0, r["generation_tps"] ?? 0, r["peak_memory"] ?? 0))
+        } else if backend == "seedless" {
+            let store = try WeightStore(modelDir: model)
+            let fullLen = max(p + g + 64, 2048)
+            let eng = try SeedlessDecodeEngine(store: store, fullMaxLen: fullLen)
+            let r = try eng.benchmark(promptTokens: p, genTokens: g, trials: n, profile: true)
+            let ph = r.phase
+            print(String(format: "backend=seedless prompt_tps=%.3f generation_tps=%.3f", r.promptTps, r.genTps))
+            print(String(format: "  phase_ms/tok embed=%.3f layers=%.3f head=%.3f  (sum=%.3f)",
+                         ph.embed, ph.layers, ph.head,
+                         ph.embed + ph.layers + ph.head))
+            if let rel = try? SeedlessDecodeEngine.parityL0(store: store) {
+                print(String(format: "  parity L0 rel_l2=%.4e", rel))
+            }
         } else {
             MoEProfile.reset()
             let store = try WeightStore(modelDir: model)

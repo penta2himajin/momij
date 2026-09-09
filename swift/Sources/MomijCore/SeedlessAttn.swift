@@ -3,7 +3,7 @@ import Metal
 import MLX
 
 /// One Maple layer (attn + MoE) on Seedless Metal with resident KV cache.
-/// Decode-only: `pos < maxLen` (no SWA rotate yet).
+/// Tracks absolute `offset` for RoPE; SWA rotates when offset >= maxLen.
 public final class SeedlessLayerBlock {
     public let layer: Int
     public let H: Int
@@ -17,7 +17,9 @@ public final class SeedlessLayerBlock {
     public let headDim: Int
     public let ropeDim: Int
     public let maxLen: Int
-    public private(set) var pos: Int = 0
+    public let isSliding: Bool
+    /// Absolute tokens written (RoPE index for next write).
+    public private(set) var offset: Int = 0
 
     let hBuf: MTLBuffer
     let inNorm: MTLBuffer
@@ -69,9 +71,9 @@ public final class SeedlessLayerBlock {
         numHeads = cfg.numAttentionHeads
         numKV = cfg.numKeyValueHeads
         headDim = cfg.headDim
-        let useRope = cfg.isSliding(layer)
-        ropeDim = useRope ? Int(Float(cfg.headDim) * cfg.partialRotaryFactor) : 0
-        self.maxLen = maxLen ?? (cfg.isSliding(layer) ? cfg.slidingWindow : 512)
+        isSliding = cfg.isSliding(layer)
+        ropeDim = isSliding ? cfg.ropeDim : 0
+        self.maxLen = maxLen ?? (isSliding ? cfg.slidingWindow : 2048)
 
         let p = "model.layers.\(layer)"
         let attn = "\(p).self_attn"
@@ -95,7 +97,6 @@ public final class SeedlessLayerBlock {
         let dS = store.req("\(moe).down_proj.scales").asType(.float16)
         let dB = store.req("\(moe).down_proj.biases").asType(.float16)
 
-        // Broadcast q/k norm weights to [numHeads+numKV, headDim] like MapleAttention.
         let qPart = MLX.broadcast(qNorm.reshaped([1, headDim]), to: [numHeads, headDim])
         let kPart = MLX.broadcast(kNorm.reshaped([1, headDim]), to: [numKV, headDim])
         let qkWArr = MLX.contiguous(MLX.concatenated([qPart, kPart], axis: 0)).asType(.float16)
@@ -161,13 +162,20 @@ public final class SeedlessLayerBlock {
     }
 
     public func resetCache() {
-        pos = 0
+        offset = 0
         memset(kCache.contents(), 0, numKV * maxLen * headDim * 2)
         memset(vCache.contents(), 0, numKV * maxLen * headDim * 2)
     }
 
-    public func encode(into enc: MTLComputeCommandEncoder, at pos: Int) throws {
-        precondition(pos < maxLen, "SWA rotate not implemented; pos must be < maxLen")
+    /// Encode one decode step at current `offset`, then advance offset.
+    public func encodeStep(into enc: MTLComputeCommandEncoder) throws {
+        if !isSliding && offset >= maxLen {
+            throw SeedlessError.unsupportedShape(N: offset, K: maxLen, gs: 0)
+        }
+        let rotate = isSliding && offset >= maxLen
+        let writePos = rotate ? maxLen - 1 : offset
+        let seqLen = rotate ? maxLen : offset + 1
+        let ropePos = offset
         try SeedlessMetal.encodeLayerBlock(
             into: enc, h: hBuf, inNorm: inNorm, postNorm: postNorm, gateW: gateW,
             qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
@@ -181,11 +189,35 @@ public final class SeedlessLayerBlock {
             ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
             H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs,
             numHeads: numHeads, numKV: numKV, headDim: headDim, ropeDim: ropeDim,
-            pos: pos, maxLen: maxLen, seqLen: pos + 1)
+            ropePos: ropePos, writePos: writePos, maxLen: maxLen, seqLen: seqLen, rotateFirst: rotate)
+        offset += 1
+    }
+
+    /// Encode without advancing offset (microbench helper).
+    public func encode(into enc: MTLComputeCommandEncoder, at pos: Int) throws {
+        let rotate = isSliding && pos >= maxLen
+        let writePos = rotate ? maxLen - 1 : pos
+        let seqLen = rotate ? maxLen : pos + 1
+        try SeedlessMetal.encodeLayerBlock(
+            into: enc, h: hBuf, inNorm: inNorm, postNorm: postNorm, gateW: gateW,
+            qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
+            oW: oW, oS: oS, oB: oB,
+            qkW: qkW, invFreq: invFreq, densInds: densInds,
+            upGateW: upGateW, upGateS: upGateS, upGateB: upGateB,
+            downW: downW, downS: downS, downB: downB,
+            xAttn: xAttn, qkvOut: qkvOut, qkOut: qkOut, attnTmp: attnTmp, attnOut: attnOut,
+            kCache: kCache, vCache: vCache,
+            xMoe: xMoe, logits: logits, inds: inds, scores: scores,
+            ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
+            H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs,
+            numHeads: numHeads, numKV: numKV, headDim: headDim, ropeDim: ropeDim,
+            ropePos: pos, writePos: writePos, maxLen: maxLen, seqLen: seqLen, rotateFirst: rotate)
     }
 
     public func encodeAttnOnly(into enc: MTLComputeCommandEncoder, at pos: Int) throws {
-        precondition(pos < maxLen)
+        let rotate = isSliding && pos >= maxLen
+        let writePos = rotate ? maxLen - 1 : pos
+        let seqLen = rotate ? maxLen : pos + 1
         SeedlessMetal.encodeRms(into: enc, h: hBuf, w: inNorm, out: xAttn, H: H, eps: eps)
         try SeedlessMetal.encodeAttnBlock(
             into: enc, xNorm: xAttn,
@@ -195,25 +227,27 @@ public final class SeedlessLayerBlock {
             qkvOut: qkvOut, qkOut: qkOut, attnTmp: attnTmp, attnOut: attnOut,
             kCache: kCache, vCache: vCache,
             H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
-            ropeDim: ropeDim, pos: pos, maxLen: maxLen, seqLen: pos + 1, eps: eps, gs: gs)
+            ropeDim: ropeDim, ropePos: pos, writePos: writePos, maxLen: maxLen, seqLen: seqLen,
+            eps: eps, gs: gs, rotateFirst: rotate)
         SeedlessMetal.encodeResid(into: enc, h: hBuf, delta: attnOut, H: H)
     }
 }
 
-/// Full decoder stack of attn+MoE layers (Milestone B→C MoE+attn).
+/// Full decoder stack of attn+MoE layers.
 public final class SeedlessLayerStack {
     public let layers: [SeedlessLayerBlock]
     public let hBuf: MTLBuffer
     public let H: Int
 
-    public init(store: WeightStore, device: MTLDevice) throws {
+    public init(store: WeightStore, device: MTLDevice, fullMaxLen: Int = 2048) throws {
         let n = store.config.numHiddenLayers
         H = store.config.hiddenSize
         hBuf = device.makeBuffer(length: H * 2, options: .storageModeShared)!
         var built: [SeedlessLayerBlock] = []
         built.reserveCapacity(n)
         for i in 0 ..< n {
-            built.append(try SeedlessLayerBlock(store: store, layer: i, device: device, sharedH: hBuf))
+            let ml = store.config.isSliding(i) ? store.config.slidingWindow : fullMaxLen
+            built.append(try SeedlessLayerBlock(store: store, layer: i, device: device, sharedH: hBuf, maxLen: ml))
         }
         layers = built
     }
@@ -223,8 +257,28 @@ public final class SeedlessLayerStack {
         for i in 0 ..< H { p[i] = v }
     }
 
+    public func copyH(from src: UnsafePointer<Float16>) {
+        hBuf.contents().copyMemory(from: src, byteCount: H * 2)
+    }
+
     public func resetCaches() {
         for l in layers { l.resetCache() }
+    }
+
+    /// Commit each layer CB, wait once on last. Optionally encode `tail` into the last CB.
+    public func stepCommitWait(tail: ((MTLComputeCommandEncoder) -> Void)? = nil) throws {
+        guard let q = SeedlessMetal.queue else { throw SeedlessError.notReady }
+        var last: MTLCommandBuffer?
+        for (i, layer) in layers.enumerated() {
+            let cb = q.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            try layer.encodeStep(into: enc)
+            if i + 1 == layers.count, let tail { tail(enc) }
+            enc.endEncoding()
+            cb.commit()
+            last = cb
+        }
+        last?.waitUntilCompleted()
     }
 
     public func encodeAll(into enc: MTLComputeCommandEncoder, pos: Int) throws {

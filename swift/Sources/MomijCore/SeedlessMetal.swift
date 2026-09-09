@@ -19,6 +19,7 @@ public enum SeedlessMetal {
     nonisolated(unsafe) static var routeTop8Pipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var qkNormRopePipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var writeKVPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var shiftKVPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var sdpaPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var stopBuf: MTLBuffer?
     nonisolated(unsafe) public static var ready = false
@@ -46,6 +47,7 @@ public enum SeedlessMetal {
         routeTop8Pipeline = try pipe("maple_route_top8")
         qkNormRopePipeline = try pipe("maple_qk_norm_rope")
         writeKVPipeline = try pipe("maple_write_kv")
+        shiftKVPipeline = try pipe("maple_shift_kv")
         sdpaPipeline = try pipe("maple_sdpa_d128")
         ready = true
     }
@@ -276,8 +278,7 @@ public enum SeedlessMetal {
                             threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
     }
 
-    /// Decode attn body: xNorm[H] → attnOut[H]. Writes K/V at `pos` into caches.
-    /// qkvW layout: single matrix as E=1 for gqmm2 (inds=[0]).
+    /// Decode attn body. `ropePos` = absolute RoPE index; `writePos` = cache slot; `seqLen` = SDPA N.
     public static func encodeAttnBlock(
         into enc: MTLComputeCommandEncoder,
         xNorm: MTLBuffer,
@@ -287,7 +288,8 @@ public enum SeedlessMetal {
         qkvOut: MTLBuffer, qkOut: MTLBuffer, attnTmp: MTLBuffer, attnOut: MTLBuffer,
         kCache: MTLBuffer, vCache: MTLBuffer,
         H: Int, numHeads: Int, numKV: Int, headDim: Int,
-        ropeDim: Int, pos: Int, maxLen: Int, seqLen: Int, eps: Float, gs: Int = 128
+        ropeDim: Int, ropePos: Int, writePos: Int, maxLen: Int, seqLen: Int,
+        eps: Float, gs: Int = 128, rotateFirst: Bool = false
     ) throws {
         try ensureCompiled()
         guard let qkPipe = qkNormRopePipeline, let writeKV = writeKVPipeline, let sdpa = sdpaPipeline
@@ -295,18 +297,32 @@ public enum SeedlessMetal {
 
         let qDim = numHeads * headDim
         let kvDim = numKV * headDim
-        let qkvN = qDim + 2 * kvDim  // 3072
+        let qkvN = qDim + 2 * kvDim
+
+        if rotateFirst {
+            guard let shift = shiftKVPipeline else { throw SeedlessError.notReady }
+            var kv32 = Int32(numKV), d32 = Int32(headDim), ml32 = Int32(maxLen)
+            for cache in [kCache, vCache] {
+                enc.setComputePipelineState(shift)
+                enc.setBuffer(cache, offset: 0, index: 0)
+                enc.setBytes(&kv32, length: 4, index: 1)
+                enc.setBytes(&d32, length: 4, index: 2)
+                enc.setBytes(&ml32, length: 4, index: 3)
+                enc.dispatchThreads(
+                    MTLSize(width: headDim, height: max(maxLen - 1, 1), depth: numKV),
+                    threadsPerThreadgroup: MTLSize(width: min(32, headDim), height: 1, depth: 1))
+            }
+        }
 
         try gqmm2(x: xNorm, w: qkvW, scales: qkvS, biases: qkvB, inds: densInds, out: qkvOut,
                   Ktop: 1, K: H, N: qkvN, gs: gs, lhsPerExpert: false, into: enc)
 
-        // qk_norm_rope on first (numHeads+numKV) heads of qkv → qkOut
         enc.setComputePipelineState(qkPipe)
         enc.setBuffer(qkvOut, offset: 0, index: 0)
         enc.setBuffer(qkW, offset: 0, index: 1)
         enc.setBuffer(qkOut, offset: 0, index: 2)
         enc.setBuffer(invFreq, offset: 0, index: 3)
-        var posF = Float(pos), epsV = eps, rope = Int32(ropeDim)
+        var posF = Float(ropePos), epsV = eps, rope = Int32(ropeDim)
         enc.setBytes(&posF, length: 4, index: 4)
         enc.setBytes(&epsV, length: 4, index: 5)
         enc.setBytes(&rope, length: 4, index: 6)
@@ -314,10 +330,9 @@ public enum SeedlessMetal {
         enc.dispatchThreadgroups(MTLSize(width: 1, height: nQK, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
-        // write K (qkOut after Q) and V (raw from qkvOut after qk)
-        var kv32 = Int32(numKV), d32 = Int32(headDim), ml32 = Int32(maxLen), p32 = Int32(pos)
+        var kv32 = Int32(numKV), d32 = Int32(headDim), ml32 = Int32(maxLen), p32 = Int32(writePos)
         enc.setComputePipelineState(writeKV)
-        enc.setBuffer(qkOut, offset: qDim * 2, index: 0)  // K starts after Q
+        enc.setBuffer(qkOut, offset: qDim * 2, index: 0)
         enc.setBuffer(kCache, offset: 0, index: 1)
         enc.setBytes(&kv32, length: 4, index: 2)
         enc.setBytes(&d32, length: 4, index: 3)
@@ -327,7 +342,7 @@ public enum SeedlessMetal {
                             threadsPerThreadgroup: MTLSize(width: min(256, kvDim), height: 1, depth: 1))
 
         enc.setComputePipelineState(writeKV)
-        enc.setBuffer(qkvOut, offset: (qDim + kvDim) * 2, index: 0)  // V after Q+K
+        enc.setBuffer(qkvOut, offset: (qDim + kvDim) * 2, index: 0)
         enc.setBuffer(vCache, offset: 0, index: 1)
         enc.setBytes(&kv32, length: 4, index: 2)
         enc.setBytes(&d32, length: 4, index: 3)
@@ -336,7 +351,6 @@ public enum SeedlessMetal {
         enc.dispatchThreads(MTLSize(width: kvDim, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(256, kvDim), height: 1, depth: 1))
 
-        // SDPA: Q from qkOut[0..<qDim], K/V caches, N=seqLen
         enc.setComputePipelineState(sdpa)
         enc.setBuffer(qkOut, offset: 0, index: 0)
         enc.setBuffer(kCache, offset: 0, index: 1)
@@ -353,7 +367,6 @@ public enum SeedlessMetal {
         enc.setBytes(&vhs, length: 4, index: 8)
         enc.setBytes(&vss, length: 4, index: 9)
         enc.setBytes(&sc, length: 4, index: 10)
-        // 32 simdgroups × 32 lanes = 1024
         enc.dispatchThreadgroups(MTLSize(width: numHeads, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
 
@@ -361,7 +374,7 @@ public enum SeedlessMetal {
                   Ktop: 1, K: qDim, N: H, gs: gs, lhsPerExpert: false, into: enc)
     }
 
-    /// One full layer decode: input_rms → attn → resid → MoE block (post_rms+experts+resid).
+    /// One full layer decode: input_rms → attn → resid → MoE block.
     public static func encodeLayerBlock(
         into enc: MTLComputeCommandEncoder,
         h: MTLBuffer, inNorm: MTLBuffer, postNorm: MTLBuffer, gateW: MTLBuffer,
@@ -376,7 +389,7 @@ public enum SeedlessMetal {
         ugOut: MTLBuffer, act: MTLBuffer, downOut: MTLBuffer, moeOut: MTLBuffer,
         H: Int, I: Int, E: Int, Ktop: Int, eps: Float, gs: Int,
         numHeads: Int, numKV: Int, headDim: Int, ropeDim: Int,
-        pos: Int, maxLen: Int, seqLen: Int
+        ropePos: Int, writePos: Int, maxLen: Int, seqLen: Int, rotateFirst: Bool
     ) throws {
         encodeRms(into: enc, h: h, w: inNorm, out: xAttn, H: H, eps: eps)
         try encodeAttnBlock(
@@ -387,7 +400,8 @@ public enum SeedlessMetal {
             qkvOut: qkvOut, qkOut: qkOut, attnTmp: attnTmp, attnOut: attnOut,
             kCache: kCache, vCache: vCache,
             H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
-            ropeDim: ropeDim, pos: pos, maxLen: maxLen, seqLen: seqLen, eps: eps, gs: gs)
+            ropeDim: ropeDim, ropePos: ropePos, writePos: writePos, maxLen: maxLen, seqLen: seqLen,
+            eps: eps, gs: gs, rotateFirst: rotateFirst)
         encodeResid(into: enc, h: h, delta: attnOut, H: H)
         try encodeMoEBlock(
             into: enc, h: h, normW: postNorm, gateW: gateW,
@@ -845,6 +859,20 @@ public enum SeedlessMetal {
         if (i >= (uint)(KV * D)) return;
         uint h = i / (uint)D, d = i % (uint)D;
         cache[(size_t)h * (size_t)maxLen * (size_t)D + (size_t)pos * (size_t)D + d] = src[h * D + d];
+    }
+
+    // Drop oldest token: cache[h, s, :] <- cache[h, s+1, :] for s in 0..maxLen-2.
+    kernel void maple_shift_kv(
+        device half* cache [[buffer(0)]],
+        constant int& KV [[buffer(1)]],
+        constant int& D [[buffer(2)]],
+        constant int& maxLen [[buffer(3)]],
+        uint3 gid [[thread_position_in_grid]])
+    {
+        uint d = gid.x, seq = gid.y, h = gid.z;
+        if (h >= (uint)KV || d >= (uint)D || seq + 1 >= (uint)maxLen) return;
+        size_t base = (size_t)h * (size_t)maxLen * (size_t)D;
+        cache[base + (size_t)seq * (size_t)D + d] = cache[base + (size_t)(seq + 1) * (size_t)D + d];
     }
 
     // Online-softmax SDPA decode, D=V=128 (Qwisp sdpa templated down from 256).

@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import Metal
 import MLX
@@ -76,6 +77,35 @@ public final class SeedlessMoELayer {
     }
 }
 
+/// Phase timers for hybrid MoE (env `MOMIJ_PROFILE_MOE=1`). Printed once via `dumpIfEnabled()`.
+public enum MoEProfile {
+    nonisolated(unsafe) public static var enabled =
+        ProcessInfo.processInfo.environment["MOMIJ_PROFILE_MOE"] == "1"
+    nonisolated(unsafe) public static var calls = 0
+    nonisolated(unsafe) public static var routerNs: UInt64 = 0
+    nonisolated(unsafe) public static var hostInNs: UInt64 = 0
+    nonisolated(unsafe) public static var metalNs: UInt64 = 0
+    nonisolated(unsafe) public static var hostOutNs: UInt64 = 0
+    nonisolated(unsafe) public static var mlxMoENs: UInt64 = 0
+    nonisolated(unsafe) public static var mlxMoECalls = 0
+
+    public static func reset() {
+        calls = 0; routerNs = 0; hostInNs = 0; metalNs = 0; hostOutNs = 0
+        mlxMoENs = 0; mlxMoECalls = 0
+    }
+
+    public static func dumpIfEnabled() {
+        guard enabled, calls + mlxMoECalls > 0 else { return }
+        let n = max(calls, 1)
+        let m = max(mlxMoECalls, 1)
+        func ms(_ ns: UInt64, _ c: Int) -> Double { Double(ns) / Double(c) / 1e6 }
+        fputs(String(format:
+            "[moe-profile] hybrid_calls=%d router_ms=%.3f host_in_ms=%.3f metal_ms=%.3f host_out_ms=%.3f | mlx_calls=%d mlx_moe_ms=%.3f\n",
+            calls, ms(routerNs, n), ms(hostInNs, n), ms(metalNs, n), ms(hostOutNs, n),
+            mlxMoECalls, ms(mlxMoENs, m)), stderr)
+    }
+}
+
 /// Maple MoE with optional Seedless Metal expert path (router stays MLX).
 /// Enable with `MOMIJ_SEEDLESS_MOE=1` for B=L=1 decode tokens.
 public struct MapleMoEHybrid {
@@ -99,9 +129,18 @@ public struct MapleMoEHybrid {
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let B = x.dim(0), L = x.dim(1), H = x.dim(2)
         guard let metal, B == 1, L == 1, Self.enabled else {
+            if MoEProfile.enabled {
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                let y = mlx(x)
+                eval(y)
+                MoEProfile.mlxMoENs += DispatchTime.now().uptimeNanoseconds - t0
+                MoEProfile.mlxMoECalls += 1
+                return y
+            }
             return mlx(x)
         }
 
+        let t0 = DispatchTime.now().uptimeNanoseconds
         let flat = x.reshaped([H]).asType(.float16)
         let logits = MLX.matmul(flat.asType(.float32), gateW.transposed(1, 0).asType(.float32))
         let gates = MLX.softmax(logits, axis: -1, precise: true)
@@ -110,15 +149,27 @@ public struct MapleMoEHybrid {
         var scoresArr = MLX.takeAlong(gates, indsArr, axis: -1)
         scoresArr = scoresArr / scoresArr.sum()
         MLX.eval([flat, indsArr, scoresArr])
+        let t1 = DispatchTime.now().uptimeNanoseconds
 
         // Bulk host copy — per-element .item() is ~1000× slower here.
         let xHost = flat.asArray(Float16.self)
         let indHost = indsArr.asArray(Int32.self)
         let scoreHost = scoresArr.asArray(Float.self)
+        let t2 = DispatchTime.now().uptimeNanoseconds
 
         do {
             let yHost = try metal.run(x: xHost, inds: indHost, scores: scoreHost)
-            return MLXArray(yHost).reshaped([1, 1, H])
+            let t3 = DispatchTime.now().uptimeNanoseconds
+            let out = MLXArray(yHost).reshaped([1, 1, H])
+            let t4 = DispatchTime.now().uptimeNanoseconds
+            if MoEProfile.enabled {
+                MoEProfile.calls += 1
+                MoEProfile.routerNs += t1 - t0
+                MoEProfile.hostInNs += t2 - t1
+                MoEProfile.metalNs += t3 - t2
+                MoEProfile.hostOutNs += t4 - t3
+            }
+            return out
         } catch {
             fputs("[momij] seedless moe fallback: \(error)\n", stderr)
             return mlx(x)

@@ -70,11 +70,13 @@ struct MomijMain {
                          flash ? "true" : "false",
                          r["prompt_tps"] ?? 0, r["generation_tps"] ?? 0, r["peak_memory"] ?? 0))
         } else {
+            MoEProfile.reset()
             let store = try WeightStore(modelDir: model)
             let engine = MapleEngine(store: store)
             let r = engine.benchmark(promptTokens: p, genTokens: g, trials: n)
             print(String(format: "backend=mlx prompt_tps=%.3f generation_tps=%.3f peak_memory=%.3f",
                          r.promptTps, r.genTps, r.peakGB))
+            MoEProfile.dumpIfEnabled()
         }
     }
 

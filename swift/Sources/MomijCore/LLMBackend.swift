@@ -177,12 +177,27 @@ public final class OracleBackend: LLMBackend, @unchecked Sendable {
     }
 
     public func benchmark(promptTokens: Int, genTokens: Int, trials: Int) throws -> [String: Double] {
-        let resp = try request([
+        var body: [String: Any] = [
             "cmd": "benchmark",
             "prompt_tokens": promptTokens,
             "generation_tokens": genTokens,
             "num_trials": trials,
-        ])
+        ]
+        if ProcessInfo.processInfo.environment["MOMIJ_PROFILE_MOE"] == "1" {
+            body["profile"] = true
+        }
+        let resp = try request(body)
+        if let prof = resp["profile"] as? [String: Any] {
+            let router = (prof["router_ms"] as? Double) ?? 0
+            let sw = (prof["switch_ms"] as? Double) ?? 0
+            let agg = (prof["agg_ms"] as? Double) ?? 0
+            let moe = (prof["moe_ms"] as? Double) ?? 0
+            let attn = (prof["attn_ms"] as? Double) ?? 0
+            let n = Int((prof["decode_moe_calls"] as? Double) ?? 0)
+            fputs(String(format:
+                "[moe-profile] oracle sync decode_moe=%d router_ms=%.3f switch_ms=%.3f agg_ms=%.3f moe_ms=%.3f attn_ms=%.3f\n",
+                n, router, sw, agg, moe, attn), stderr)
+        }
         return [
             "prompt_tps": resp["prompt_tps"] as? Double ?? 0,
             "generation_tps": resp["generation_tps"] as? Double ?? 0,

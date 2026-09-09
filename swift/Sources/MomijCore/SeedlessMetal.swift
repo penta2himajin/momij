@@ -17,6 +17,9 @@ public enum SeedlessMetal {
     nonisolated(unsafe) static var residPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var gateGemvPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var routeTop8Pipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var qkNormRopePipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var writeKVPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var sdpaPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var stopBuf: MTLBuffer?
     nonisolated(unsafe) public static var ready = false
 
@@ -41,6 +44,9 @@ public enum SeedlessMetal {
         residPipeline = try pipe("maple_resid_add")
         gateGemvPipeline = try pipe("maple_gate_gemv")
         routeTop8Pipeline = try pipe("maple_route_top8")
+        qkNormRopePipeline = try pipe("maple_qk_norm_rope")
+        writeKVPipeline = try pipe("maple_write_kv")
+        sdpaPipeline = try pipe("maple_sdpa_d128")
         ready = true
     }
 
@@ -256,6 +262,140 @@ public enum SeedlessMetal {
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
+    }
+
+    public static func encodeResid(
+        into enc: MTLComputeCommandEncoder, h: MTLBuffer, delta: MTLBuffer, H: Int
+    ) {
+        enc.setComputePipelineState(residPipeline!)
+        enc.setBuffer(h, offset: 0, index: 0)
+        enc.setBuffer(delta, offset: 0, index: 1)
+        var h32 = Int32(H)
+        enc.setBytes(&h32, length: 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
+    }
+
+    /// Decode attn body: xNorm[H] → attnOut[H]. Writes K/V at `pos` into caches.
+    /// qkvW layout: single matrix as E=1 for gqmm2 (inds=[0]).
+    public static func encodeAttnBlock(
+        into enc: MTLComputeCommandEncoder,
+        xNorm: MTLBuffer,
+        qkvW: MTLBuffer, qkvS: MTLBuffer, qkvB: MTLBuffer,
+        oW: MTLBuffer, oS: MTLBuffer, oB: MTLBuffer,
+        qkW: MTLBuffer, invFreq: MTLBuffer, densInds: MTLBuffer,
+        qkvOut: MTLBuffer, qkOut: MTLBuffer, attnTmp: MTLBuffer, attnOut: MTLBuffer,
+        kCache: MTLBuffer, vCache: MTLBuffer,
+        H: Int, numHeads: Int, numKV: Int, headDim: Int,
+        ropeDim: Int, pos: Int, maxLen: Int, seqLen: Int, eps: Float, gs: Int = 128
+    ) throws {
+        try ensureCompiled()
+        guard let qkPipe = qkNormRopePipeline, let writeKV = writeKVPipeline, let sdpa = sdpaPipeline
+        else { throw SeedlessError.notReady }
+
+        let qDim = numHeads * headDim
+        let kvDim = numKV * headDim
+        let qkvN = qDim + 2 * kvDim  // 3072
+
+        try gqmm2(x: xNorm, w: qkvW, scales: qkvS, biases: qkvB, inds: densInds, out: qkvOut,
+                  Ktop: 1, K: H, N: qkvN, gs: gs, lhsPerExpert: false, into: enc)
+
+        // qk_norm_rope on first (numHeads+numKV) heads of qkv → qkOut
+        enc.setComputePipelineState(qkPipe)
+        enc.setBuffer(qkvOut, offset: 0, index: 0)
+        enc.setBuffer(qkW, offset: 0, index: 1)
+        enc.setBuffer(qkOut, offset: 0, index: 2)
+        enc.setBuffer(invFreq, offset: 0, index: 3)
+        var posF = Float(pos), epsV = eps, rope = Int32(ropeDim)
+        enc.setBytes(&posF, length: 4, index: 4)
+        enc.setBytes(&epsV, length: 4, index: 5)
+        enc.setBytes(&rope, length: 4, index: 6)
+        let nQK = numHeads + numKV
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: nQK, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+        // write K (qkOut after Q) and V (raw from qkvOut after qk)
+        var kv32 = Int32(numKV), d32 = Int32(headDim), ml32 = Int32(maxLen), p32 = Int32(pos)
+        enc.setComputePipelineState(writeKV)
+        enc.setBuffer(qkOut, offset: qDim * 2, index: 0)  // K starts after Q
+        enc.setBuffer(kCache, offset: 0, index: 1)
+        enc.setBytes(&kv32, length: 4, index: 2)
+        enc.setBytes(&d32, length: 4, index: 3)
+        enc.setBytes(&ml32, length: 4, index: 4)
+        enc.setBytes(&p32, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: kvDim, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(256, kvDim), height: 1, depth: 1))
+
+        enc.setComputePipelineState(writeKV)
+        enc.setBuffer(qkvOut, offset: (qDim + kvDim) * 2, index: 0)  // V after Q+K
+        enc.setBuffer(vCache, offset: 0, index: 1)
+        enc.setBytes(&kv32, length: 4, index: 2)
+        enc.setBytes(&d32, length: 4, index: 3)
+        enc.setBytes(&ml32, length: 4, index: 4)
+        enc.setBytes(&p32, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: kvDim, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(256, kvDim), height: 1, depth: 1))
+
+        // SDPA: Q from qkOut[0..<qDim], K/V caches, N=seqLen
+        enc.setComputePipelineState(sdpa)
+        enc.setBuffer(qkOut, offset: 0, index: 0)
+        enc.setBuffer(kCache, offset: 0, index: 1)
+        enc.setBuffer(vCache, offset: 0, index: 2)
+        enc.setBuffer(attnTmp, offset: 0, index: 3)
+        var gqa = Int32(numHeads / numKV), n32 = Int32(seqLen)
+        var khs = Int32(maxLen * headDim), kss = Int32(headDim)
+        var vhs = Int32(maxLen * headDim), vss = Int32(headDim)
+        var sc = Float(pow(Double(headDim), -0.5))
+        enc.setBytes(&gqa, length: 4, index: 4)
+        enc.setBytes(&n32, length: 4, index: 5)
+        enc.setBytes(&khs, length: 4, index: 6)
+        enc.setBytes(&kss, length: 4, index: 7)
+        enc.setBytes(&vhs, length: 4, index: 8)
+        enc.setBytes(&vss, length: 4, index: 9)
+        enc.setBytes(&sc, length: 4, index: 10)
+        // 32 simdgroups × 32 lanes = 1024
+        enc.dispatchThreadgroups(MTLSize(width: numHeads, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
+
+        try gqmm2(x: attnTmp, w: oW, scales: oS, biases: oB, inds: densInds, out: attnOut,
+                  Ktop: 1, K: qDim, N: H, gs: gs, lhsPerExpert: false, into: enc)
+    }
+
+    /// One full layer decode: input_rms → attn → resid → MoE block (post_rms+experts+resid).
+    public static func encodeLayerBlock(
+        into enc: MTLComputeCommandEncoder,
+        h: MTLBuffer, inNorm: MTLBuffer, postNorm: MTLBuffer, gateW: MTLBuffer,
+        qkvW: MTLBuffer, qkvS: MTLBuffer, qkvB: MTLBuffer,
+        oW: MTLBuffer, oS: MTLBuffer, oB: MTLBuffer,
+        qkW: MTLBuffer, invFreq: MTLBuffer, densInds: MTLBuffer,
+        upGateW: MTLBuffer, upGateS: MTLBuffer, upGateB: MTLBuffer,
+        downW: MTLBuffer, downS: MTLBuffer, downB: MTLBuffer,
+        xAttn: MTLBuffer, qkvOut: MTLBuffer, qkOut: MTLBuffer, attnTmp: MTLBuffer, attnOut: MTLBuffer,
+        kCache: MTLBuffer, vCache: MTLBuffer,
+        xMoe: MTLBuffer, logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
+        ugOut: MTLBuffer, act: MTLBuffer, downOut: MTLBuffer, moeOut: MTLBuffer,
+        H: Int, I: Int, E: Int, Ktop: Int, eps: Float, gs: Int,
+        numHeads: Int, numKV: Int, headDim: Int, ropeDim: Int,
+        pos: Int, maxLen: Int, seqLen: Int
+    ) throws {
+        encodeRms(into: enc, h: h, w: inNorm, out: xAttn, H: H, eps: eps)
+        try encodeAttnBlock(
+            into: enc, xNorm: xAttn,
+            qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
+            oW: oW, oS: oS, oB: oB,
+            qkW: qkW, invFreq: invFreq, densInds: densInds,
+            qkvOut: qkvOut, qkOut: qkOut, attnTmp: attnTmp, attnOut: attnOut,
+            kCache: kCache, vCache: vCache,
+            H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
+            ropeDim: ropeDim, pos: pos, maxLen: maxLen, seqLen: seqLen, eps: eps, gs: gs)
+        encodeResid(into: enc, h: h, delta: attnOut, H: H)
+        try encodeMoEBlock(
+            into: enc, h: h, normW: postNorm, gateW: gateW,
+            upGateW: upGateW, upGateS: upGateS, upGateB: upGateB,
+            downW: downW, downS: downS, downB: downB,
+            xNorm: xMoe, logits: logits, inds: inds, scores: scores,
+            ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
+            H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs)
     }
 
     /// Wall + GPU time for one encoder body. GPU time is `gpuEndTime - gpuStartTime`.
@@ -649,6 +789,132 @@ public enum SeedlessMetal {
             for (int k = 0; k < K; k++) ss += scores[k];
             for (int k = 0; k < K; k++) scores[k] = scores[k] / ss;
         }
+    }
+
+    // Milestone B: decode attention (HEAD_DIM=128, GQA).
+    kernel void maple_qk_norm_rope(
+        device const half* x [[buffer(0)]],      // [nHeads, 128]
+        device const half* w [[buffer(1)]],
+        device half* out [[buffer(2)]],
+        device const float* inv_freq [[buffer(3)]],
+        constant float& pos [[buffer(4)]],
+        constant float& eps [[buffer(5)]],
+        constant int& ropeDim [[buffer(6)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        constexpr int HEAD_DIM = 128;
+        constexpr int per_lane = HEAD_DIM / 32;
+        uint head = tid.y;
+        uint lane = tid.x;
+        const device half* xh = x + head * HEAD_DIM;
+        const device half* wh = w + head * HEAD_DIM;
+        device half* oh = out + head * HEAD_DIM;
+        float ss = 0.0f;
+        for (int i = 0; i < per_lane; ++i) {
+            float v = float(xh[lane * per_lane + i]);
+            ss += v * v;
+        }
+        ss = simd_sum(ss);
+        float scale = precise::rsqrt(ss / float(HEAD_DIM) + eps);
+        for (int i = 0; i < per_lane; ++i) {
+            int j = int(lane * per_lane + i);
+            float v = float(xh[j]) * scale * float(wh[j]);
+            if (ropeDim > 0 && j < ropeDim) {
+                int rhalf = ropeDim / 2;
+                int p = j < rhalf ? j : j - rhalf;
+                float theta = pos * inv_freq[p];
+                float c = metal::cos(theta);
+                float s = metal::sin(theta);
+                int j2 = j < rhalf ? j + rhalf : j - rhalf;
+                float u = float(xh[j2]) * scale * float(wh[j2]);
+                v = j < rhalf ? (v * c - u * s) : (v * c + u * s);
+            }
+            oh[j] = half(v);
+        }
+    }
+
+    kernel void maple_write_kv(
+        device const half* src [[buffer(0)]],
+        device half* cache [[buffer(1)]],
+        constant int& KV [[buffer(2)]],
+        constant int& D [[buffer(3)]],
+        constant int& maxLen [[buffer(4)]],
+        constant int& pos [[buffer(5)]],
+        uint i [[thread_position_in_grid]])
+    {
+        if (i >= (uint)(KV * D)) return;
+        uint h = i / (uint)D, d = i % (uint)D;
+        cache[(size_t)h * (size_t)maxLen * (size_t)D + (size_t)pos * (size_t)D + d] = src[h * D + d];
+    }
+
+    // Online-softmax SDPA decode, D=V=128 (Qwisp sdpa templated down from 256).
+    kernel void maple_sdpa_d128(
+        device const half* queries [[buffer(0)]],   // [H, 128]
+        device const half* keys    [[buffer(1)]],   // [KV, maxLen, 128]
+        device const half* values  [[buffer(2)]],
+        device half* out           [[buffer(3)]],   // [H, 128]
+        constant int& gqa_factor   [[buffer(4)]],
+        constant int& N            [[buffer(5)]],
+        constant int& k_head_stride[[buffer(6)]],
+        constant int& k_seq_stride [[buffer(7)]],
+        constant int& v_head_stride[[buffer(8)]],
+        constant int& v_seq_stride [[buffer(9)]],
+        constant float& scale      [[buffer(10)]],
+        uint3 tid [[threadgroup_position_in_grid]],
+        uint3 tpg [[threadgroups_per_grid]],
+        uint simd_gid [[simdgroup_index_in_threadgroup]],
+        uint simd_lid [[thread_index_in_simdgroup]])
+    {
+        constexpr int BN = 32, BD = 32, D = 128, V = 128;
+        constexpr int qk_per_thread = D / BD;
+        constexpr int v_per_thread = V / BD;
+        int inner_k_stride = BN * k_seq_stride;
+        int inner_v_stride = BN * v_seq_stride;
+        typedef float U;
+        thread U q[qk_per_thread]; thread U k[qk_per_thread]; thread U o[v_per_thread];
+        threadgroup U outputs[BN * BD];
+        threadgroup U max_scores[BN];
+        threadgroup U sum_exp_scores[BN];
+        const int q_batch_head_idx = tid.x;
+        const int q_seq_idx = tid.y;
+        const int kv_head_idx = q_batch_head_idx / gqa_factor;
+        const int o_offset = q_batch_head_idx * tpg.y + q_seq_idx;
+        queries += o_offset * D + simd_lid * qk_per_thread;
+        keys   += kv_head_idx * k_head_stride + simd_gid * k_seq_stride + simd_lid * qk_per_thread;
+        values += kv_head_idx * v_head_stride + simd_gid * v_seq_stride + simd_lid * v_per_thread;
+        out += o_offset * V + simd_gid * v_per_thread;
+        for (int i = 0; i < qk_per_thread; i++) q[i] = (U)scale * (U)queries[i];
+        for (int i = 0; i < v_per_thread; i++) o[i] = 0;
+        U max_score = -INFINITY;
+        U sum_exp_score = 0;
+        for (int i = simd_gid; i < N; i += BN) {
+            for (int j = 0; j < qk_per_thread; j++) k[j] = (U)keys[j];
+            U score = 0;
+            for (int j = 0; j < qk_per_thread; j++) score += q[j] * k[j];
+            score = simd_sum(score);
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+            for (int j = 0; j < v_per_thread; j++) o[j] = o[j] * factor + exp_score * (U)values[j];
+            keys += inner_k_stride;
+            values += inner_v_stride;
+        }
+        if (simd_lid == 0) { max_scores[simd_gid] = max_score; sum_exp_scores[simd_gid] = sum_exp_score; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        max_score = max_scores[simd_lid];
+        U new_max = simd_max(max_score);
+        U factor = fast::exp(max_score - new_max);
+        sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+        for (int i = 0; i < v_per_thread; i++) {
+            outputs[simd_lid * BD + simd_gid] = o[i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+            o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (simd_lid == 0) { for (int i = 0; i < v_per_thread; i++) out[i] = half(o[i]); }
     }
     """
 }

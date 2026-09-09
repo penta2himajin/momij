@@ -98,7 +98,8 @@ struct MomijMain {
                 let tokFloor = moe1cb / Double(layers)
                 print(String(format: "seedless moe-block-1cb (L0, rms+gate+top8+experts+resid) blocks/s=%.1f  → ~%.1f tok/s floor @%d layers (no attn)",
                              moe1cb, tokFloor, layers))
-                print(try SeedlessEngine.profileMoEStack24(store: store, iters: 16))
+                // Milestone B layer profile is the primary claim; skip MoE-only stack to save RAM/time.
+                print(try SeedlessEngine.profileLayerStack(store: store, iters: 10))
             } catch {
                 fputs("[momij] skip real-weight seedless bind: \(error)\n", stderr)
             }

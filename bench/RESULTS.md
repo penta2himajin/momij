@@ -86,6 +86,21 @@ Cause: short-CB launch/sync tax + batch=1 gather occupancy, **not** host copy (e
 - Real-weight 24L ≈ L0-repeat (2.86 vs 2.60 ms GPU) → earlier L0-stack proxy was not a hazard artifact.
 - MoE-only 1-CB floor **~300 tok/s wall** leaves headroom vs oracle e2e ~180 **before** attn/embed/lm_head; next is Milestone B (attn in the same CB).
 
+## 2026-09-09 Seedless Milestone B — attn+MoE (pos=0)
+
+Kernels: `maple_qk_norm_rope`, `maple_write_kv`, `maple_sdpa_d128` + existing `gqmm2` for fused qkv/o. `SeedlessLayerStack` loads all 24 real layers.
+
+| Probe | wall ms | GPU ms | busy | tok/s (wall / gpu) |
+|---|---|---|---|---|
+| moe-only L0 | 0.72 | 0.43 | 60% | — |
+| attn+resid L0 | 0.60 | 0.29 | 49% | — |
+| layer L0 (attn+MoE) | 1.20 | 0.92 | 76% | — |
+| 24L **one encoder** | 17.4 | 6.3 | 36% | 58 / 158 — CPU encode-bound |
+| **24L commit→1 wait** | **5.49** | **5.07** | **92%** | **182 / 197** |
+| 24L × per-layer wait | 10.5 | 4.4 | 42% | 95 / 225 |
+
+Claim: packing 24 full layers into **one** encoder is wrong for wall time (encode tax). Right pattern is **per-layer CB commit, single final wait** → MoE+attn decode floor **~182 tok/s wall** at pos=0 (N=1), matching oracle e2e band before embed/lm_head/growing KV. Next: wire into `MapleEngine`, SWA rotate, longer `pos`.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

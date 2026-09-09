@@ -117,6 +117,43 @@ final class SeedlessMoEStackTests: XCTestCase {
     }
 }
 
+final class SeedlessAttnEncodeTests: XCTestCase {
+    func testEncodeAttnBlockCompiles() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 2048, heads = 16, kv = 4, d = 128, gs = 128
+        let qDim = heads * d, kvDim = kv * d, qkvN = qDim + 2 * kvDim
+        func buf(_ n: Int, _ bpe: Int = 2) -> MTLBuffer {
+            device.makeBuffer(length: n * bpe, options: .storageModeShared)!
+        }
+        let dens = buf(1, 4)
+        dens.contents().storeBytes(of: Int32(0), as: Int32.self)
+        let x = buf(H), qkvW = buf(qkvN * (H / 16), 4), qkvS = buf(qkvN * (H / gs)), qkvB = buf(qkvN * (H / gs))
+        let oW = buf(H * (qDim / 16), 4), oS = buf(H * (qDim / gs)), oB = buf(H * (qDim / gs))
+        let qkW = buf((heads + kv) * d), inv = buf(32, 4)
+        let qkvOut = buf(qkvN), qkOut = buf(qDim + kvDim), attnTmp = buf(qDim), attnOut = buf(H)
+        let maxLen = 8
+        let kCache = buf(kv * maxLen * d), vCache = buf(kv * maxLen * d)
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        try SeedlessMetal.encodeAttnBlock(
+            into: enc, xNorm: x,
+            qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
+            oW: oW, oS: oS, oB: oB,
+            qkW: qkW, invFreq: inv, densInds: dens,
+            qkvOut: qkvOut, qkOut: qkOut, attnTmp: attnTmp, attnOut: attnOut,
+            kCache: kCache, vCache: vCache,
+            H: H, numHeads: heads, numKV: kv, headDim: d,
+            ropeDim: 64, pos: 0, maxLen: maxLen, seqLen: 1, eps: 1e-6, gs: gs)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        XCTAssertTrue(attnOut.contents().bindMemory(to: Float16.self, capacity: 1)[0].isFinite)
+    }
+}
+
 final class ConfigTests: XCTestCase {
     func testConfigCodingKeys() throws {
         let json = """

@@ -21,9 +21,9 @@ Phase profile: [bench/RESULTS.md](../bench/RESULTS.md) (2026-09-09).
    Oracle is **not** 1-CB Seedless. Residual ~20–25% → move to Seedless rather than more MLX glue.
 2. **Drop host-bridged hybrid as the decode hot path**  
    Keep Metal experts for 1-CB; do not ship `MOMIJ_SEEDLESS_MOE` host roundtrip.
-3. **P0 Seedless: full 1-CB decode** ← **in progress (Milestone A landed)**  
-   A: one-layer MoE+norm 1-CB (no host inds/scores). B: +attn. C: 24-layer 1-CB → `MapleEngine`.  
-   If 1-CB ceiling stays ≪ oracle after B/C, keep **Python MLX (oracle base)** as a parallel speedup track.
+3. **P0 Seedless: full decode without mid-token host sync** ← **Milestone B landed**  
+   A/C MoE 1-CB done. B: attn+MoE with **per-layer commit → one wait** (~182 tok/s @pos=0).  
+   Next: wire into `MapleEngine`, SWA rotate, growing `pos`; if e2e stalls, revisit Python-MLX track.
 4. **Then raise expert/attn kernels** against the 1-CB ceiling (BW ~970 tok/s).
 5. **P1 serve**: SuffixSpec, continuous batch, oMLX drop-in hardening.
 6. **P1 draft (later)**: P-EAGLE/DFlash only after draft ≫2.5× target on AS.
@@ -32,10 +32,10 @@ Phase profile: [bench/RESULTS.md](../bench/RESULTS.md) (2026-09-09).
 
 | Lever | Status in momij | Notes |
 |---|---|---|
-| Raw Metal 1-CB decode (Seedless) | **Milestone A+C MoE**: `SeedlessMoEStack` 24L real 1-CB | MoE-only **~300 tok/s wall / ~350 GPU** (no attn); per-layer wait was ~95. Next = +attn in same CB |
+| Raw Metal 1-CB decode (Seedless) | **Milestone B**: attn+MoE `SeedlessLayerStack` | **commit→1wait ~182 tok/s wall** @pos=0; giant single-encoder is encode-bound (~58). Next: engine wire + SWA/pos |
 | Fused ternary expert block | real-weight ~1600–2300 steps/s | building block inside 1-CB |
 | MLX exact greedy | `MapleEngine` ~143 tok/s | oracle-aligned fused kernels; residual vs Python MLX |
-| Oracle (= mlx-lm-deepgrove) | MLX graph + metal_kernel (not 1-CB) | ~182 tok/s; still fallback if full decode 1-CB under-delivers |
+| Oracle (= mlx-lm-deepgrove) | MLX graph + metal_kernel (not 1-CB) | ~182 tok/s; Seedless MoE+attn now matches this band at cold pos=0 |
 
 ## P1 — serve / agentic
 

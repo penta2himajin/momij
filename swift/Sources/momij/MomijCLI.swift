@@ -73,19 +73,23 @@ struct MomijMain {
             let store = try WeightStore(modelDir: model)
             let fullLen = max(p + g + 64, 2048)
             let eng = try SeedlessDecodeEngine(store: store, fullMaxLen: fullLen)
-            let r = try eng.benchmark(promptTokens: p, genTokens: g, trials: n, profile: true)
-            let ph = r.phase
-            print(String(format: "backend=seedless layers_per_cb=%d flash_head=%@ fuse=%@ probes=%d prompt_tps=%.3f generation_tps=%.3f",
-                         eng.layersPerCB,
-                         eng.useFlashHead ? "true" : "false",
-                         eng.flashFused ? "true" : "false",
-                         eng.flashProbes,
-                         r.promptTps, r.genTps))
-            print(String(format: "  phase_ms/tok embed=%.3f layers=%.3f head=%.3f  (sum=%.3f)",
-                         ph.embed, ph.layers, ph.head,
-                         ph.embed + ph.layers + ph.head))
-            if let rel = try? SeedlessDecodeEngine.parityL0(store: store) {
-                print(String(format: "  parity L0 rel_l2=%.4e", rel))
+            if has(args, "--suffix-spec") {
+                print(try eng.benchmarkSuffixSpec(promptTokens: p, genTokens: g, trials: n, draftK: 8))
+            } else {
+                let r = try eng.benchmark(promptTokens: p, genTokens: g, trials: n, profile: true)
+                let ph = r.phase
+                print(String(format: "backend=seedless layers_per_cb=%d flash_head=%@ fuse=%@ probes=%d prompt_tps=%.3f generation_tps=%.3f",
+                             eng.layersPerCB,
+                             eng.useFlashHead ? "true" : "false",
+                             eng.flashFused ? "true" : "false",
+                             eng.flashProbes,
+                             r.promptTps, r.genTps))
+                print(String(format: "  phase_ms/tok embed=%.3f layers=%.3f head=%.3f  (sum=%.3f)",
+                             ph.embed, ph.layers, ph.head,
+                             ph.embed + ph.layers + ph.head))
+                if let rel = try? SeedlessDecodeEngine.parityL0(store: store) {
+                    print(String(format: "  parity L0 rel_l2=%.4e", rel))
+                }
             }
         } else {
             MoEProfile.reset()
@@ -123,6 +127,10 @@ struct MomijMain {
                 }
                 if has(args, "--sweep-cb") {
                     print(try SeedlessDecodeEngine.sweepLayersPerCB(store: store, prompt: 64, gen: 64))
+                }
+                if has(args, "--suffix-spec") {
+                    let eng = try SeedlessDecodeEngine(store: store, fullMaxLen: 2048)
+                    print(try eng.benchmarkSuffixSpec(promptTokens: 128, genTokens: 128, trials: 3, draftK: 8))
                 }
             } catch {
                 fputs("[momij] skip real-weight seedless bind: \(error)\n", stderr)

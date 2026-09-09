@@ -158,6 +158,147 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         return out
     }
 
+    /// SuffixSpec decode: free draft from history, early-exit greedy verify.
+    /// Lossless vs `generate`. Sequential verify ≈ greedy speed; early exit + gate
+    /// avoid wasted steps on cold drafts. Batched verify (future) is required for
+    /// peak ≫ greedy.
+    public func generateSuffixSpec(
+        prompt: [Int], maxTokens: Int, draftK: Int = 8, eos: Int? = 151_645
+    ) throws -> (tokens: [Int], accepted: Int, attempts: Int, gated: Int) {
+        guard !prompt.isEmpty, maxTokens > 0 else { return ([], 0, 0, 0) }
+        reset()
+        var y = prompt[0]
+        for i in 0 ..< prompt.count {
+            if i + 1 < prompt.count {
+                _ = try step(prompt[i])
+            } else {
+                y = try step(prompt[i])
+            }
+        }
+        return try generateSuffixSpecFromPrefill(
+            first: y, promptIds: prompt, maxTokens: maxTokens, draftK: draftK, eos: eos)
+    }
+
+    /// Compare greedy vs SuffixSpec effective tok/s on a repeating prompt (high draft hit rate).
+    public func benchmarkSuffixSpec(
+        promptTokens: Int, genTokens: Int, trials: Int, draftK: Int = 8
+    ) throws -> String {
+        var prompt: [Int] = []
+        let motif = [101, 102, 103, 104, 105, 106, 107, 108]
+        while prompt.count < promptTokens {
+            prompt.append(contentsOf: motif)
+        }
+        prompt = Array(prompt.prefix(promptTokens))
+
+        _ = try generate(prompt: Array(prompt.prefix(min(32, promptTokens))), maxTokens: 4, eos: nil)
+
+        var greedyTps: [Double] = []
+        var specTps: [Double] = []
+        var acc = 0, att = 0, gat = 0
+        var equal = true
+        for _ in 0 ..< trials {
+            // Match `benchmark`: time gen only (prefill untimed).
+            reset()
+            var last = prompt[0]
+            for i in 0 ..< prompt.count {
+                if i + 1 < prompt.count {
+                    _ = try step(prompt[i])
+                } else {
+                    last = try step(prompt[i])
+                }
+            }
+            let t0 = CFAbsoluteTimeGetCurrent()
+            var y = last
+            var gOut: [Int] = []
+            for _ in 0 ..< genTokens {
+                gOut.append(y)
+                y = try step(y)
+            }
+            greedyTps.append(Double(gOut.count) / max(CFAbsoluteTimeGetCurrent() - t0, 1e-9))
+
+            let r = try generateSuffixSpec(
+                prompt: prompt, maxTokens: genTokens, draftK: draftK, eos: nil)
+            // Retimed: regenerate with timed gen-only
+            reset()
+            last = prompt[0]
+            for i in 0 ..< prompt.count {
+                if i + 1 < prompt.count {
+                    _ = try step(prompt[i])
+                } else {
+                    last = try step(prompt[i])
+                }
+            }
+            let t1 = CFAbsoluteTimeGetCurrent()
+            let r2 = try generateSuffixSpecFromPrefill(
+                first: last, promptIds: prompt, maxTokens: genTokens, draftK: draftK, eos: nil)
+            specTps.append(Double(r2.tokens.count) / max(CFAbsoluteTimeGetCurrent() - t1, 1e-9))
+            acc += r2.accepted; att += r2.attempts; gat += r2.gated
+            if gOut != r.tokens { equal = false }
+            _ = r
+        }
+        let g = greedyTps.reduce(0, +) / Double(trials)
+        let s = specTps.reduce(0, +) / Double(trials)
+        let aps = att > 0 ? Double(acc) / Double(att) : 0
+        return String(
+            format: "suffix-spec bench (repeat-motif, draftK=%d, n=%d): greedy=%.1f tok/s  spec=%.1f tok/s  accept/attempt=%.2f  attempts=%d gated=%d  lossless=%@",
+            draftK, trials, g, s, aps, att, gat, equal ? "true" : "false")
+    }
+
+    /// Prefill already done; `first` is the first generated token; `promptIds` is the prompt.
+    private func generateSuffixSpecFromPrefill(
+        first: Int, promptIds: [Int], maxTokens: Int, draftK: Int, eos: Int?
+    ) throws -> (tokens: [Int], accepted: Int, attempts: Int, gated: Int) {
+        var ids = promptIds
+        var y = first
+        var out: [Int] = [y]
+        ids.append(y)
+        var acceptedTotal = 0
+        var attempts = 0
+        var gated = 0
+        var acceptWindow: [Int] = []
+        let gateOn = ProcessInfo.processInfo.environment["MOMIJ_SPEC_GATE"] != "0"
+        let gateWindow = 8
+
+        while out.count < maxTokens {
+            if let eos, y == eos { break }
+            let remain = maxTokens - out.count
+            let draft = SuffixSpec.suffixDraft(history: ids, k: min(draftK, remain))
+            let meanAccept = acceptWindow.isEmpty ? 1.0
+                : Double(acceptWindow.reduce(0, +)) / Double(acceptWindow.count)
+            let suspend = gateOn && acceptWindow.count >= gateWindow && meanAccept < 1.0
+
+            if draft.isEmpty || suspend {
+                if !draft.isEmpty { gated += 1 }
+                y = try step(y)
+                out.append(y)
+                ids.append(y)
+                continue
+            }
+
+            attempts += 1
+            var accepted = 0
+            var cur = y
+            for d in draft {
+                let q = try step(cur)
+                out.append(q)
+                ids.append(q)
+                y = q
+                if q == d {
+                    accepted += 1
+                    cur = q
+                    if let eos, q == eos { break }
+                    if out.count >= maxTokens { break }
+                } else {
+                    break
+                }
+            }
+            acceptedTotal += accepted
+            acceptWindow.append(accepted)
+            if acceptWindow.count > gateWindow { acceptWindow.removeFirst() }
+        }
+        return (out, acceptedTotal, attempts, gated)
+    }
+
     public func benchmark(promptTokens: Int, genTokens: Int, trials: Int, profile: Bool = true)
         throws -> (promptTps: Double, genTps: Double, phase: PhaseMs)
     {

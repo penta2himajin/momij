@@ -163,6 +163,15 @@ Profile of separate gather CB (probes=96): CPU top-k ~0.07 ms, gather **GPU ~0.0
 
 Not the failed serial full-E×K top-k. Chunk serial rounds are only over 256, merge over ~nChunks×K candidates. Unit-tested incl. adversarial “all top-K in chunk 0”.
 
+## 2026-09-09 SuffixSpec (C) — Seedless wiring
+
+`SeedlessDecodeEngine.generateSuffixSpec` + `benchmarkSuffixSpec` (`momij bench --backend seedless --suffix-spec` / `seedless-bench --suffix-spec`).
+
+- Early-exit greedy verify + rolling gate (`MOMIJ_SPEC_GATE=0` to disable).
+- Lossless vs greedy (same token stream).
+- Sequential verify **does not beat greedy tok/s** (each accepted token still costs one forward). Peak ≫ greedy needs **batched/parallel verify** (Qwisp Tell style) — deferred as C2.
+- KV snapshot helpers (`snapshotCaches` / `restoreCaches`) landed for a future pipelined verify.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

@@ -29,8 +29,6 @@ public final class SeedlessFlashHead {
     let candScoresBuf: MTLBuffer
     let candIndsBuf: MTLBuffer
     private var topScratch: [Int]
-    /// Host copy of last fused probe inds (for token_map after wait).
-    private var lastTopClusters: [Int]
 
     public init?(store: WeightStore, device: MTLDevice) {
         let cfg = store.config
@@ -118,7 +116,6 @@ public final class SeedlessFlashHead {
         candIndsBuf = device.makeBuffer(
             length: nCand * MemoryLayout<Int32>.size, options: .storageModeShared)!
         topScratch = Array(repeating: 0, count: nClusters)
-        lastTopClusters = Array(repeating: 0, count: nProbes)
         forceRows = forceFlat
     }
 
@@ -129,22 +126,36 @@ public final class SeedlessFlashHead {
 
     /// Hierarchical GPU top-k + gather into the current encoder (no extra CB).
     public func encodeFusedAfterCentroids(into enc: MTLComputeCommandEncoder, h: MTLBuffer) {
+        encodeFusedAfterCentroids(into: enc, h: h, inds: indsBuf, logits: logitsBuf)
+    }
+
+    public func encodeFusedAfterCentroids(
+        into enc: MTLComputeCommandEncoder, h: MTLBuffer, inds: MTLBuffer, logits: MTLBuffer
+    ) {
         SeedlessMetal.encodeFlashTopK(
-            into: enc, scores: scoresBuf, inds: indsBuf,
+            into: enc, scores: scoresBuf, inds: inds,
             candScores: candScoresBuf, candInds: candIndsBuf,
             E: nClusters, K: nProbes)
         SeedlessMetal.encodeQmm4Gather(
             into: enc,
             w: headWBuf, scales: headSBuf, biases: headBBuf, x: h,
-            inds: indsBuf, y: logitsBuf,
+            inds: inds, y: logits,
             nProbes: nProbes, N: clusterSize, K: H, gs: headGroupSize)
     }
 
     /// After fused layer CB wait: read inds+logits, argmax, force tokens.
     public func greedyAfterFusedGather(hostH: UnsafePointer<Float16>) -> Int {
-        let ip = indsBuf.contents().bindMemory(to: Int32.self, capacity: nProbes)
-        for i in 0 ..< nProbes { lastTopClusters[i] = Int(ip[i]) }
-        return argmaxWithForce(topClusters: lastTopClusters, hostH: hostH)
+        greedyAfterFusedGather(hostH: hostH, inds: indsBuf, logits: logitsBuf)
+    }
+
+    public func greedyAfterFusedGather(
+        hostH: UnsafePointer<Float16>, inds: MTLBuffer, logits: MTLBuffer
+    ) -> Int {
+        let ip = inds.contents().bindMemory(to: Int32.self, capacity: nProbes)
+        var top: [Int] = []
+        top.reserveCapacity(nProbes)
+        for i in 0 ..< nProbes { top.append(Int(ip[i])) }
+        return argmaxWithForce(topClusters: top, hostH: hostH, logits: logits)
     }
 
     /// After layer CB wait (centroids ready): CPU top-k → Metal gather → argmax.
@@ -225,8 +236,10 @@ public final class SeedlessFlashHead {
 
     private func argmaxWithForce(
         topClusters: [Int], hostH: UnsafePointer<Float16>,
-        forceBestId: Int = -1, forceBestScore: Float = -Float.infinity
+        forceBestId: Int = -1, forceBestScore: Float = -Float.infinity,
+        logits: MTLBuffer? = nil
     ) -> Int {
+        let logitsBuf = logits ?? self.logitsBuf
         let nLogits = nProbes * clusterSize
         let lp = logitsBuf.contents().bindMemory(to: Float.self, capacity: nLogits)
         var bestScore = -Float.infinity

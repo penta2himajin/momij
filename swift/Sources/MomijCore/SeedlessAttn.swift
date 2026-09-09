@@ -167,6 +167,13 @@ public final class SeedlessLayerBlock {
         memset(vCache.contents(), 0, numKV * maxLen * headDim * 2)
     }
 
+    func restoreCache(offset: Int, k: Data, v: Data) {
+        self.offset = offset
+        precondition(k.count == kCache.length && v.count == vCache.length)
+        k.withUnsafeBytes { kCache.contents().copyMemory(from: $0.baseAddress!, byteCount: k.count) }
+        v.withUnsafeBytes { vCache.contents().copyMemory(from: $0.baseAddress!, byteCount: v.count) }
+    }
+
     /// Encode one decode step at current `offset`, then advance offset.
     public func encodeStep(into enc: MTLComputeCommandEncoder) throws {
         if !isSliding && offset >= maxLen {
@@ -268,6 +275,13 @@ public final class SeedlessLayerStack {
     /// Commit layer CBs in groups of `layersPerCB`, wait once on last.
     /// Optionally encode `tail` into the last CB. `layersPerCB` balances CPU encode vs GPU fill.
     public func stepCommitWait(layersPerCB: Int = 1, tail: ((MTLComputeCommandEncoder) -> Void)? = nil) throws {
+        let last = try stepCommit(layersPerCB: layersPerCB, tail: tail)
+        last?.waitUntilCompleted()
+    }
+
+    /// Like `stepCommitWait` but does not wait — caller waits on the returned buffer.
+    @discardableResult
+    public func stepCommit(layersPerCB: Int = 1, tail: ((MTLComputeCommandEncoder) -> Void)? = nil) throws -> MTLCommandBuffer? {
         guard let q = SeedlessMetal.queue else { throw SeedlessError.notReady }
         let g = max(1, layersPerCB)
         var last: MTLCommandBuffer?
@@ -285,7 +299,36 @@ public final class SeedlessLayerStack {
             last = cb
             i = end
         }
-        last?.waitUntilCompleted()
+        return last
+    }
+
+    /// Host-side KV + offset snapshot for SuffixSpec reject rollback.
+    public struct CacheSnapshot {
+        public let offsets: [Int]
+        public let kData: [Data]
+        public let vData: [Data]
+    }
+
+    public func snapshotCaches() -> CacheSnapshot {
+        var offsets: [Int] = []
+        var kData: [Data] = []
+        var vData: [Data] = []
+        offsets.reserveCapacity(layers.count)
+        kData.reserveCapacity(layers.count)
+        vData.reserveCapacity(layers.count)
+        for l in layers {
+            offsets.append(l.offset)
+            kData.append(Data(bytes: l.kCache.contents(), count: l.kCache.length))
+            vData.append(Data(bytes: l.vCache.contents(), count: l.vCache.length))
+        }
+        return CacheSnapshot(offsets: offsets, kData: kData, vData: vData)
+    }
+
+    public func restoreCaches(_ snap: CacheSnapshot) {
+        precondition(snap.offsets.count == layers.count)
+        for (i, l) in layers.enumerated() {
+            l.restoreCache(offset: snap.offsets[i], k: snap.kData[i], v: snap.vData[i])
+        }
     }
 
     public func encodeAll(into enc: MTLComputeCommandEncoder, pos: Int) throws {

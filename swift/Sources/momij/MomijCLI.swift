@@ -81,16 +81,15 @@ struct MomijMain {
     static func runSeedlessBench(_ args: [String]) throws {
         let model = flag(args, "--model") ?? defaultModel()
         try SeedlessMetal.ensureCompiled()
-        let qmv = try SeedlessMetal.benchQmv2(iters: 100)
-        print(String(format: "seedless qmv2 (H=2048→N=512) kernel/s=%.1f", qmv))
-        // E=4 keeps the naive fused kernel in a usable range; full fuse tuning is next.
-        let fused = try SeedlessMetal.benchFusedExpert(E: 4, iters: 20)
-        print(String(format: "seedless fused-expert (E=4,K=8) kernel/s=%.1f", fused))
+        let qmv = try SeedlessMetal.benchQmv2(iters: 200)
+        print(String(format: "seedless gqmm2 (H=2048→N=512,Ktop=1) kernel/s=%.1f", qmv))
+        let fused = try SeedlessMetal.benchFusedExpert(E: 256, iters: 100)
+        print(String(format: "seedless fused-expert (E=256,K=8) steps/s=%.1f", fused))
         if FileManager.default.fileExists(atPath: model) {
             do {
                 let store = try WeightStore(modelDir: model)
-                let real = try SeedlessEngine.benchRealExpert(store: store, iters: 10)
-                print(String(format: "seedless fused-expert real-shapes kernel/s=%.1f", real))
+                let real = try SeedlessEngine.benchRealExpert(store: store, iters: 50)
+                print(String(format: "seedless fused-expert real-weights steps/s=%.1f", real))
             } catch {
                 fputs("[momij] skip real-weight seedless bind: \(error)\n", stderr)
             }

@@ -38,7 +38,7 @@ public struct MapleMoE {
         let B = x.dim(0), L = x.dim(1), H = x.dim(2)
         let flat = x.reshaped([B * L, H])
         // dense router in fp32 for stability (matches maple fused_router spirit)
-        let logits = MLX.matmul(flat.asType(.float32), gateW.transposed(0, 1).asType(.float32))
+        let logits = MLX.matmul(flat.asType(.float32), gateW.transposed(1, 0).asType(.float32))
         let gates = MLX.softmax(logits, axis: -1, precise: true)
         let order = MLX.argPartition(gates, kth: numExperts - topK, axis: -1)
         let inds = order[0..., (numExperts - topK)...].asType(.uint32)
@@ -49,11 +49,10 @@ public struct MapleMoE {
         let ug = MLX.gatherQuantizedMM(
             xe, upGateW, scales: upGateS, biases: upGateB, rhsIndices: inds,
             transpose: true, groupSize: groupSize, bits: bits, mode: .affine,
-            sortedIndices: false)
-        let half = ug.dim(-1) / 2
-        let up = ug[0..., 0..., 0..., 0..., 0 ..< half]
-        let gate = ug[0..., 0..., 0..., 0..., half...]
-        let h = clampedSwiglu(gate: gate, up: up)
+            sortedIndices: false)  // [T, K, 1, 2I]
+        // maple.py: x_up, x_gate = split(up_gate, 2, axis=-1)
+        let parts = ug.split(parts: 2, axis: -1)
+        let h = clampedSwiglu(gate: parts[1], up: parts[0])
         let d = MLX.gatherQuantizedMM(
             h, downW, scales: downS, biases: downB, rhsIndices: inds,
             transpose: true, groupSize: groupSize, bits: bits, mode: .affine,

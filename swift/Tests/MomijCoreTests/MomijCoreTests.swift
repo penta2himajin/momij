@@ -37,6 +37,21 @@ final class SuffixSpecTests: XCTestCase {
     }
 }
 
+final class SeedlessMetalTests: XCTestCase {
+    func testGqmm2CompilesAndRuns() throws {
+        try SeedlessMetal.ensureCompiled()
+        let rate = try SeedlessMetal.benchQmv2(iters: 20)
+        XCTAssertGreaterThan(rate, 10, "gqmm2 should exceed 10 kernel/s, got \(rate)")
+    }
+
+    func testFusedExpertFasterThanNaiveFloor() throws {
+        try SeedlessMetal.ensureCompiled()
+        let rate = try SeedlessMetal.benchFusedExpert(E: 256, iters: 30)
+        // Naive nested kernel was ~0.7/s; tiled gather path should be >> 10/s.
+        XCTAssertGreaterThan(rate, 10, "fused expert should exceed 10 steps/s, got \(rate)")
+    }
+}
+
 final class ConfigTests: XCTestCase {
     func testConfigCodingKeys() throws {
         let json = """

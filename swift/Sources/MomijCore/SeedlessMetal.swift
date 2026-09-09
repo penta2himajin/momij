@@ -4,78 +4,192 @@ import MLX
 
 /// Raw Metal kernels for Maple ternary (2-bit affine) decode hot path.
 ///
-/// Pattern mirrors Qwisp Seedless: source string → `makeLibrary` → pipeline.
-/// First milestone: specialized 2-bit GEMV + fused expert SwiGLU block.
+/// `gqmm2_rows` is ported from Qwisp Seedless (MLX gather_qmv_fast bits=2 layout)
+/// with `group_size` 64|128. Fused expert = up_gate gather → clamped SwiGLU →
+/// down gather → score reduce, encoded on one command buffer.
 public enum SeedlessMetal {
     nonisolated(unsafe) static var device: MTLDevice?
     nonisolated(unsafe) static var queue: MTLCommandQueue?
-    nonisolated(unsafe) static var qmv2Pipeline: MTLComputePipelineState?
-    nonisolated(unsafe) static var fusedExpertPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var gqmm2Pipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var swigluPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var scoreReducePipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var stopBuf: MTLBuffer?
     nonisolated(unsafe) public static var ready = false
 
     public static func ensureCompiled() throws {
         if ready { return }
-        guard let dev = MTLCreateSystemDefaultDevice() else {
-            throw SeedlessError.noMetal
-        }
+        guard let dev = MTLCreateSystemDefaultDevice(),
+              let q = dev.makeCommandQueue() else { throw SeedlessError.noMetal }
         device = dev
-        queue = dev.makeCommandQueue()
-        let opts = MTLCompileOptions()
-        if #available(macOS 15.0, *) {
-            opts.mathMode = .safe
-        } else {
-            opts.fastMathEnabled = false
-        }
-        let src = metalSource
-        let lib = try dev.makeLibrary(source: src, options: opts)
-        qmv2Pipeline = try dev.makeComputePipelineState(function: lib.makeFunction(name: "maple_qmv2")!)
-        fusedExpertPipeline = try dev.makeComputePipelineState(function: lib.makeFunction(name: "maple_fused_expert_topk")!)
+        queue = q
+        stopBuf = dev.makeBuffer(length: 4, options: .storageModeShared)
+        stopBuf?.contents().storeBytes(of: Int32(0), as: Int32.self)
+
+        let opts = mlxMatchCompileOpts()
+        let lib = try dev.makeLibrary(source: metalSource, options: opts)
+        gqmm2Pipeline = try dev.makeComputePipelineState(function: lib.makeFunction(name: "gqmm2_rows")!)
+        swigluPipeline = try dev.makeComputePipelineState(function: lib.makeFunction(name: "maple_clamped_swiglu")!)
+        scoreReducePipeline = try dev.makeComputePipelineState(function: lib.makeFunction(name: "maple_score_reduce")!)
         ready = true
     }
 
-    /// Microbench: 2-bit qmv H→N with random-ish buffers. Returns kernel tok-equivalent /s
-    /// where one "token" = one qmv of shape (H→N) — for MoE expert sizing use N=512, H=2048.
+    static func mlxMatchCompileOpts() -> MTLCompileOptions {
+        let opts = MTLCompileOptions()
+        if #available(macOS 15.0, *) { opts.mathMode = .safe }
+        else { opts.fastMathEnabled = false }
+        return opts
+    }
+
+    static func mtlBuf(_ a: MLXArray, _ device: MTLDevice) -> MTLBuffer? {
+        if let b = a.asMTLBuffer(device: device, noCopy: true) { return b }
+        return a.asMTLBuffer(device: device, noCopy: false)
+    }
+
+    // MARK: - Public API
+
+    /// 2-bit gather-qmv: x[1,K], w[E,N,K/16], scales/biases[E,N,K/gs], inds[Ktop] → y[Ktop,N]
+    public static func gqmm2(
+        x: MTLBuffer, w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer, inds: MTLBuffer,
+        out: MTLBuffer,
+        Ktop: Int, K: Int, N: Int, gs: Int = 128, lhsPerExpert: Bool = false,
+        into encoder: MTLComputeCommandEncoder? = nil,
+        commandQueue: MTLCommandQueue? = nil
+    ) throws {
+        try ensureCompiled()
+        guard let pipe = gqmm2Pipeline, let stop = stopBuf else { throw SeedlessError.notReady }
+        guard N % 8 == 0, K % 512 == 0, gs == 64 || gs == 128 else {
+            throw SeedlessError.unsupportedShape(N: N, K: K, gs: gs)
+        }
+
+        let ownsCB = encoder == nil
+        let q = commandQueue ?? queue!
+        let cb = ownsCB ? q.makeCommandBuffer()! : nil
+        let enc = encoder ?? cb!.makeComputeCommandEncoder()!
+
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(w, offset: 0, index: 0)
+        enc.setBuffer(scales, offset: 0, index: 1)
+        enc.setBuffer(biases, offset: 0, index: 2)
+        enc.setBuffer(x, offset: 0, index: 3)
+        enc.setBuffer(inds, offset: 0, index: 4)
+        enc.setBuffer(out, offset: 0, index: 5)
+        var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
+        enc.setBytes(&kk, length: 4, index: 6)
+        enc.setBytes(&nn, length: 4, index: 7)
+        enc.setBytes(&kt, length: 4, index: 8)
+        enc.setBuffer(stop, offset: 0, index: 9)
+        var lp = UInt32(lhsPerExpert ? 1 : 0)
+        enc.setBytes(&lp, length: 4, index: 10)
+        var gsv = Int32(gs)
+        enc.setBytes(&gsv, length: 4, index: 11)
+        // grid: width=1, height=N/8, depth=M*Ktop (M=1)
+        enc.dispatchThreadgroups(
+            MTLSize(width: 1, height: N / 8, depth: Ktop),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+
+        if ownsCB {
+            enc.endEncoding()
+            cb!.commit()
+            cb!.waitUntilCompleted()
+        }
+    }
+
+    /// One-token fused MoE expert block on a single command buffer.
+    /// up_gate: [E, 2I, packedH], down: [E, H, packedI]
+    public static func fusedExpertStep(
+        x: MTLBuffer,
+        upGateW: MTLBuffer, upGateS: MTLBuffer, upGateB: MTLBuffer,
+        downW: MTLBuffer, downS: MTLBuffer, downB: MTLBuffer,
+        inds: MTLBuffer, scores: MTLBuffer,
+        // scratch: ugOut[Ktop, 2I], act[Ktop, I], downOut[Ktop, H], y[H]
+        ugOut: MTLBuffer, act: MTLBuffer, downOut: MTLBuffer, y: MTLBuffer,
+        H: Int, I: Int, Ktop: Int, gs: Int = 128
+    ) throws {
+        try ensureCompiled()
+        guard let q = queue, let swiglu = swigluPipeline, let reduce = scoreReducePipeline, let stop = stopBuf
+        else { throw SeedlessError.notReady }
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+
+        // 1) up_gate gather → [Ktop, 2I]
+        try gqmm2(x: x, w: upGateW, scales: upGateS, biases: upGateB, inds: inds, out: ugOut,
+                  Ktop: Ktop, K: H, N: 2 * I, gs: gs, lhsPerExpert: false, into: enc)
+
+        // 2) clamped swiglu → act[Ktop, I]
+        enc.setComputePipelineState(swiglu)
+        enc.setBuffer(ugOut, offset: 0, index: 0)
+        enc.setBuffer(act, offset: 0, index: 1)
+        var i32 = Int32(I), kt32 = Int32(Ktop)
+        enc.setBytes(&i32, length: 4, index: 2)
+        enc.setBytes(&kt32, length: 4, index: 3)
+        enc.dispatchThreads(MTLSize(width: I, height: Ktop, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(256, I), height: 1, depth: 1))
+
+        // 3) down gather (lhs per expert slot) → [Ktop, H]
+        try gqmm2(x: act, w: downW, scales: downS, biases: downB, inds: inds, out: downOut,
+                  Ktop: Ktop, K: I, N: H, gs: gs, lhsPerExpert: true, into: enc)
+
+        // 4) score reduce → y[H]
+        enc.setComputePipelineState(reduce)
+        enc.setBuffer(downOut, offset: 0, index: 0)
+        enc.setBuffer(scores, offset: 0, index: 1)
+        enc.setBuffer(y, offset: 0, index: 2)
+        var h32 = Int32(H)
+        enc.setBytes(&h32, length: 4, index: 3)
+        enc.setBytes(&kt32, length: 4, index: 4)
+        enc.setBuffer(stop, offset: 0, index: 5)
+        enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
+
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+    }
+
+    // MARK: - Benches
+
     public static func benchQmv2(H: Int = 2048, N: Int = 512, iters: Int = 200) throws -> Double {
         try ensureCompiled()
-        guard let device, let queue, let pipe = qmv2Pipeline else { throw SeedlessError.notReady }
-        let groupSize = 128
+        guard let device, let queue else { throw SeedlessError.notReady }
+        let gs = 128
         let packedK = H * 2 / 32
-        let nGroups = H / groupSize
+        let nGroups = H / gs
+        let E = 8, Ktop = 1
 
-        let xBuf = device.makeBuffer(length: H * 2, options: .storageModeShared)!
-        let wBuf = device.makeBuffer(length: N * packedK * 4, options: .storageModeShared)!
-        let sBuf = device.makeBuffer(length: N * nGroups * 2, options: .storageModeShared)!
-        let bBuf = device.makeBuffer(length: N * nGroups * 2, options: .storageModeShared)!
-        let yBuf = device.makeBuffer(length: N * 2, options: .storageModeShared)!
+        let x = device.makeBuffer(length: H * 2, options: .storageModeShared)!
+        let w = device.makeBuffer(length: E * N * packedK * 4, options: .storageModeShared)!
+        let s = device.makeBuffer(length: E * N * nGroups * 2, options: .storageModeShared)!
+        let b = device.makeBuffer(length: E * N * nGroups * 2, options: .storageModeShared)!
+        let inds = device.makeBuffer(length: Ktop * 4, options: .storageModeShared)!
+        inds.contents().storeBytes(of: Int32(0), as: Int32.self)
+        let y = device.makeBuffer(length: Ktop * N * 2, options: .storageModeShared)!
 
-        // warmup
         for _ in 0 ..< 5 {
-            encodeQmv(queue: queue, pipe: pipe, x: xBuf, w: wBuf, s: sBuf, b: bBuf, y: yBuf,
-                      H: H, N: N, packedK: packedK, nGroups: nGroups, groupSize: groupSize)
+            try gqmm2(x: x, w: w, scales: s, biases: b, inds: inds, out: y,
+                      Ktop: Ktop, K: H, N: N, gs: gs)
         }
         let t0 = CFAbsoluteTimeGetCurrent()
         for _ in 0 ..< iters {
-            encodeQmv(queue: queue, pipe: pipe, x: xBuf, w: wBuf, s: sBuf, b: bBuf, y: yBuf,
-                      H: H, N: N, packedK: packedK, nGroups: nGroups, groupSize: groupSize)
+            try gqmm2(x: x, w: w, scales: s, biases: b, inds: inds, out: y,
+                      Ktop: Ktop, K: H, N: N, gs: gs)
         }
-        let dt = CFAbsoluteTimeGetCurrent() - t0
-        return Double(iters) / dt
+        _ = queue  // silence
+        return Double(iters) / (CFAbsoluteTimeGetCurrent() - t0)
     }
 
-    /// Fused top-8 expert block microbench (up_gate + swiglu + down reduce) for one token.
     public static func benchFusedExpert(
         H: Int = 2048, I: Int = 512, E: Int = 256, Ktop: Int = 8, iters: Int = 100
     ) throws -> Double {
         try ensureCompiled()
-        guard let device, let queue, let pipe = fusedExpertPipeline else { throw SeedlessError.notReady }
-        let groupSize = 128
+        guard let device else { throw SeedlessError.notReady }
+        let gs = 128
         let packedH = H * 2 / 32
         let packedI = I * 2 / 32
-        let nGroupsH = H / groupSize
-        let nGroupsI = I / groupSize
+        let nGroupsH = H / gs
+        let nGroupsI = I / gs
 
-        let xBuf = device.makeBuffer(length: H * 2, options: .storageModeShared)!
-        // up_gate: [E, 2I, packedH]
+        let x = device.makeBuffer(length: H * 2, options: .storageModeShared)!
         let ugW = device.makeBuffer(length: E * 2 * I * packedH * 4, options: .storageModeShared)!
         let ugS = device.makeBuffer(length: E * 2 * I * nGroupsH * 2, options: .storageModeShared)!
         let ugB = device.makeBuffer(length: E * 2 * I * nGroupsH * 2, options: .storageModeShared)!
@@ -84,233 +198,175 @@ public enum SeedlessMetal {
         let dB = device.makeBuffer(length: E * H * nGroupsI * 2, options: .storageModeShared)!
         let inds = device.makeBuffer(length: Ktop * 4, options: .storageModeShared)!
         let scores = device.makeBuffer(length: Ktop * 4, options: .storageModeShared)!
-        let yBuf = device.makeBuffer(length: H * 2, options: .storageModeShared)!
-
-        let ip = inds.contents().bindMemory(to: UInt32.self, capacity: Ktop)
+        let ip = inds.contents().bindMemory(to: Int32.self, capacity: Ktop)
         let sp = scores.contents().bindMemory(to: Float.self, capacity: Ktop)
-        for i in 0 ..< Ktop { ip[i] = UInt32(i); sp[i] = 1.0 / Float(Ktop) }
+        for i in 0 ..< Ktop { ip[i] = Int32(i % E); sp[i] = 1.0 / Float(Ktop) }
+
+        let ugOut = device.makeBuffer(length: Ktop * 2 * I * 2, options: .storageModeShared)!
+        let act = device.makeBuffer(length: Ktop * I * 2, options: .storageModeShared)!
+        let downOut = device.makeBuffer(length: Ktop * H * 2, options: .storageModeShared)!
+        let y = device.makeBuffer(length: H * 2, options: .storageModeShared)!
 
         for _ in 0 ..< 3 {
-            encodeFused(queue: queue, pipe: pipe,
-                        x: xBuf, ugW: ugW, ugS: ugS, ugB: ugB,
-                        dW: dW, dS: dS, dB: dB, inds: inds, scores: scores, y: yBuf,
-                        H: H, I: I, E: E, Ktop: Ktop, packedH: packedH, packedI: packedI,
-                        nGroupsH: nGroupsH, nGroupsI: nGroupsI, groupSize: groupSize)
+            try fusedExpertStep(
+                x: x, upGateW: ugW, upGateS: ugS, upGateB: ugB,
+                downW: dW, downS: dS, downB: dB, inds: inds, scores: scores,
+                ugOut: ugOut, act: act, downOut: downOut, y: y,
+                H: H, I: I, Ktop: Ktop, gs: gs)
         }
         let t0 = CFAbsoluteTimeGetCurrent()
         for _ in 0 ..< iters {
-            encodeFused(queue: queue, pipe: pipe,
-                        x: xBuf, ugW: ugW, ugS: ugS, ugB: ugB,
-                        dW: dW, dS: dS, dB: dB, inds: inds, scores: scores, y: yBuf,
-                        H: H, I: I, E: E, Ktop: Ktop, packedH: packedH, packedI: packedI,
-                        nGroupsH: nGroupsH, nGroupsI: nGroupsI, groupSize: groupSize)
+            try fusedExpertStep(
+                x: x, upGateW: ugW, upGateS: ugS, upGateB: ugB,
+                downW: dW, downS: dS, downB: dB, inds: inds, scores: scores,
+                ugOut: ugOut, act: act, downOut: downOut, y: y,
+                H: H, I: I, Ktop: Ktop, gs: gs)
         }
-        let dt = CFAbsoluteTimeGetCurrent() - t0
-        return Double(iters) / dt
+        return Double(iters) / (CFAbsoluteTimeGetCurrent() - t0)
     }
 
-    private static func encodeQmv(
-        queue: MTLCommandQueue, pipe: MTLComputePipelineState,
-        x: MTLBuffer, w: MTLBuffer, s: MTLBuffer, b: MTLBuffer, y: MTLBuffer,
-        H: Int, N: Int, packedK: Int, nGroups: Int, groupSize: Int
-    ) {
-        let cb = queue.makeCommandBuffer()!
-        let enc = cb.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(pipe)
-        enc.setBuffer(x, offset: 0, index: 0)
-        enc.setBuffer(w, offset: 0, index: 1)
-        enc.setBuffer(s, offset: 0, index: 2)
-        enc.setBuffer(b, offset: 0, index: 3)
-        enc.setBuffer(y, offset: 0, index: 4)
-        var params: [UInt32] = [UInt32(H), UInt32(N), UInt32(packedK), UInt32(nGroups), UInt32(groupSize)]
-        enc.setBytes(&params, length: params.count * 4, index: 5)
-        let tg = min(pipe.maxTotalThreadsPerThreadgroup, 256)
-        enc.dispatchThreads(MTLSize(width: N, height: 1, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
-        enc.endEncoding()
-        cb.commit()
-        cb.waitUntilCompleted()
-    }
-
-    private static func encodeFused(
-        queue: MTLCommandQueue, pipe: MTLComputePipelineState,
-        x: MTLBuffer, ugW: MTLBuffer, ugS: MTLBuffer, ugB: MTLBuffer,
-        dW: MTLBuffer, dS: MTLBuffer, dB: MTLBuffer,
-        inds: MTLBuffer, scores: MTLBuffer, y: MTLBuffer,
-        H: Int, I: Int, E: Int, Ktop: Int,
-        packedH: Int, packedI: Int, nGroupsH: Int, nGroupsI: Int, groupSize: Int
-    ) {
-        let cb = queue.makeCommandBuffer()!
-        let enc = cb.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(pipe)
-        enc.setBuffer(x, offset: 0, index: 0)
-        enc.setBuffer(ugW, offset: 0, index: 1)
-        enc.setBuffer(ugS, offset: 0, index: 2)
-        enc.setBuffer(ugB, offset: 0, index: 3)
-        enc.setBuffer(dW, offset: 0, index: 4)
-        enc.setBuffer(dS, offset: 0, index: 5)
-        enc.setBuffer(dB, offset: 0, index: 6)
-        enc.setBuffer(inds, offset: 0, index: 7)
-        enc.setBuffer(scores, offset: 0, index: 8)
-        enc.setBuffer(y, offset: 0, index: 9)
-        var params: [UInt32] = [
-            UInt32(H), UInt32(I), UInt32(E), UInt32(Ktop),
-            UInt32(packedH), UInt32(packedI), UInt32(nGroupsH), UInt32(nGroupsI), UInt32(groupSize),
-        ]
-        enc.setBytes(&params, length: params.count * 4, index: 10)
-        let tg = min(pipe.maxTotalThreadsPerThreadgroup, 256)
-        enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
-        enc.endEncoding()
-        cb.commit()
-        cb.waitUntilCompleted()
-    }
+    // MARK: - Metal source
 
     private static let metalSource = """
     #include <metal_stdlib>
     using namespace metal;
+    #define SIMD_SIZE 32
 
-    // 2-bit affine: codes {0,1,2,3} → value = code * scale + bias (Maple uses bias=-scale, α=scale)
-    inline float deq2(uint word, uint lane, half scale, half bias) {
-        uint code = (word >> (lane * 2)) & 3u;
-        return float(code) * float(scale) + float(bias);
+    inline float ld16_b2(const device half* x, thread float* xt) {
+        float sum = 0.0f;
+        for (int i = 0; i < 16; i += 4) {
+            sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+            xt[i]   = x[i];
+            xt[i+1] = x[i+1] / 4.0f;
+            xt[i+2] = x[i+2] / 16.0f;
+            xt[i+3] = x[i+3] / 64.0f;
+        }
+        return sum;
+    }
+    inline float qd2(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+        float accum = 0.0f;
+        for (int i = 0; i < 4; i++) {
+            accum += (float)(w[i] & 0x03) * xt[4*i]
+                   + (float)(w[i] & 0x0c) * xt[4*i+1]
+                   + (float)(w[i] & 0x30) * xt[4*i+2]
+                   + (float)(w[i] & 0xc0) * xt[4*i+3];
+        }
+        return scale * accum + sum * bias;
     }
 
-    kernel void maple_qmv2(
-        device const half* x [[buffer(0)]],
-        device const uint* w [[buffer(1)]],
-        device const half* scales [[buffer(2)]],
-        device const half* biases [[buffer(3)]],
-        device half* y [[buffer(4)]],
-        constant uint* P [[buffer(5)]],
+    // Qwisp gqmm2_rows (bits=2 affine gather-qmv). gs=64|128.
+    kernel void gqmm2_rows(
+        device const uint32_t* w      [[buffer(0)]],
+        device const half*     scales [[buffer(1)]],
+        device const half*     biases [[buffer(2)]],
+        device const half*     x      [[buffer(3)]],
+        device const int*      inds   [[buffer(4)]],
+        device half*           y      [[buffer(5)]],
+        constant int& in_vec_size  [[buffer(6)]],
+        constant int& out_vec_size [[buffer(7)]],
+        constant int& ktop         [[buffer(8)]],
+        device const int* stopFlag [[buffer(9)]],
+        constant uint& lhsPer      [[buffer(10)]],
+        constant int&  gsz         [[buffer(11)]],
+        uint3 tid      [[threadgroup_position_in_grid]],
+        uint  simd_gid [[simdgroup_index_in_threadgroup]],
+        uint  simd_lid [[thread_index_in_simdgroup]])
+    {
+        if (stopFlag[0] != 0) return;
+        constexpr int packs_per_thread = 1, num_simdgroups = 2, results_per_simdgroup = 4;
+        constexpr int pack_factor = 16, bytes_per_pack = 4, values_per_thread = 16;
+        constexpr int block_size = 512;
+        const int scale_step_per_thread = gsz / values_per_thread;
+        const device uint8_t* ws = (const device uint8_t*)w;
+        thread float x_thread[16];
+        thread float result[4] = {0};
+        const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+        const int in_vec_size_g = in_vec_size / gsz;
+        uint mk = tid.z;
+        uint e = (uint)inds[mk];
+        ws     += (size_t)e * out_vec_size * in_vec_size_w;
+        scales += (size_t)e * out_vec_size * in_vec_size_g;
+        biases += (size_t)e * out_vec_size * in_vec_size_g;
+        const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+        ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+        scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+        biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+        x += (size_t)(lhsPer ? mk : mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
+        y += (size_t)mk * out_vec_size + out_row;
+        for (int k = 0; k < in_vec_size; k += block_size) {
+            float sum = ld16_b2(x, x_thread);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                const device half* sl = scales + row * in_vec_size_g;
+                const device half* bl = biases + row * in_vec_size_g;
+                result[row] += qd2(wl, x_thread, sl[0], bl[0], sum);
+            }
+            ws += block_size * bytes_per_pack / pack_factor;
+            scales += block_size / gsz; biases += block_size / gsz; x += block_size;
+        }
+        for (int row = 0; row < results_per_simdgroup; row++) {
+            result[row] = simd_sum(result[row]);
+            if (simd_lid == 0) y[row] = (half)result[row];
+        }
+    }
+
+    kernel void maple_clamped_swiglu(
+        device const half* ug [[buffer(0)]],  // [Ktop, 2I] = up || gate
+        device half* act       [[buffer(1)]],  // [Ktop, I]
+        constant int& I        [[buffer(2)]],
+        constant int& Ktop     [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        uint j = gid.x, ki = gid.y;
+        if (j >= (uint)I || ki >= (uint)Ktop) return;
+        float up = ug[ki * (2 * I) + j];
+        float gate = ug[ki * (2 * I) + I + j];
+        gate = metal::min(gate, 7.0f);
+        up = metal::clamp(up, -7.0f, 7.0f);
+        float silu = gate / (1.0f + metal::exp(-gate));
+        act[ki * I + j] = half(silu * up);
+    }
+
+    kernel void maple_score_reduce(
+        device const half* down [[buffer(0)]],   // [Ktop, H]
+        device const float* scores [[buffer(1)]], // [Ktop]
+        device half* y [[buffer(2)]],             // [H]
+        constant int& H [[buffer(3)]],
+        constant int& Ktop [[buffer(4)]],
+        device const int* stopFlag [[buffer(5)]],
         uint gid [[thread_position_in_grid]])
     {
-        uint H = P[0], N = P[1], packedK = P[2], nGroups = P[3], groupSize = P[4];
-        if (gid >= N) return;
+        if (stopFlag[0] != 0) return;
+        if (gid >= (uint)H) return;
         float acc = 0.0f;
-        device const uint* row = w + gid * packedK;
-        device const half* sc = scales + gid * nGroups;
-        device const half* bi = biases + gid * nGroups;
-        for (uint g = 0; g < nGroups; ++g) {
-            half s = sc[g], b = bi[g];
-            uint base = g * groupSize;
-            for (uint i = 0; i < groupSize; i += 16) {
-                uint word = row[(base + i) / 16];
-                for (uint lane = 0; lane < 16; ++lane) {
-                    uint k = base + i + lane;
-                    if (k < H) acc += float(x[k]) * deq2(word, lane, s, b);
-                }
-            }
+        for (int ki = 0; ki < Ktop; ++ki) {
+            acc += float(down[ki * H + gid]) * scores[ki];
         }
         y[gid] = half(acc);
-    }
-
-    // Per-output-dim fused expert: for each h in H, sum_k score[k] * down(swiglu(up_gate(x)))[h]
-    // Simplified single-threadgroup-unaware version (correctness-first microbench).
-    kernel void maple_fused_expert_topk(
-        device const half* x [[buffer(0)]],
-        device const uint* ugW [[buffer(1)]],
-        device const half* ugS [[buffer(2)]],
-        device const half* ugB [[buffer(3)]],
-        device const uint* dW [[buffer(4)]],
-        device const half* dS [[buffer(5)]],
-        device const half* dB [[buffer(6)]],
-        device const uint* inds [[buffer(7)]],
-        device const float* scores [[buffer(8)]],
-        device half* y [[buffer(9)]],
-        constant uint* P [[buffer(10)]],
-        uint gid [[thread_position_in_grid]])
-    {
-        uint H = P[0], I = P[1], E = P[2], Ktop = P[3];
-        uint packedH = P[4], packedI = P[5], nGroupsH = P[6], nGroupsI = P[7], groupSize = P[8];
-        (void)E;
-        if (gid >= H) return;
-
-        float out = 0.0f;
-        for (uint ki = 0; ki < Ktop; ++ki) {
-            uint e = inds[ki];
-            float score = scores[ki];
-
-            // compute hidden act[j] = swiglu(up, gate) for all j, then down row gid
-            // Memory: up_gate row for expert e, output dim j: [E, 2I, packedH]
-            thread float act[512]; // I<=512
-            for (uint j = 0; j < I; ++j) {
-                // up at out j, gate at out I+j
-                float up = 0.0f, gate = 0.0f;
-                for (uint pass = 0; pass < 2; ++pass) {
-                    uint outDim = pass == 0 ? j : (I + j);
-                    device const uint* row = ugW + ((e * (2 * I) + outDim) * packedH);
-                    device const half* sc = ugS + ((e * (2 * I) + outDim) * nGroupsH);
-                    device const half* bi = ugB + ((e * (2 * I) + outDim) * nGroupsH);
-                    float acc = 0.0f;
-                    for (uint g = 0; g < nGroupsH; ++g) {
-                        half s = sc[g], b = bi[g];
-                        uint base = g * groupSize;
-                        for (uint i = 0; i < groupSize; i += 16) {
-                            uint word = row[(base + i) / 16];
-                            for (uint lane = 0; lane < 16; ++lane) {
-                                uint k = base + i + lane;
-                                if (k < H) acc += float(x[k]) * deq2(word, lane, s, b);
-                            }
-                        }
-                    }
-                    if (pass == 0) up = acc; else gate = acc;
-                }
-                gate = metal::min(gate, 7.0f);
-                up = metal::clamp(up, -7.0f, 7.0f);
-                float silu = gate / (1.0f + metal::exp(-gate));
-                act[j] = silu * up;
-            }
-
-            // down proj row gid: [E, H, packedI]
-            device const uint* drow = dW + ((e * H + gid) * packedI);
-            device const half* dsc = dS + ((e * H + gid) * nGroupsI);
-            device const half* dbi = dB + ((e * H + gid) * nGroupsI);
-            float acc = 0.0f;
-            for (uint g = 0; g < nGroupsI; ++g) {
-                half s = dsc[g], b = dbi[g];
-                uint base = g * groupSize;
-                for (uint i = 0; i < groupSize; i += 16) {
-                    uint word = drow[(base + i) / 16];
-                    for (uint lane = 0; lane < 16; ++lane) {
-                        uint k = base + i + lane;
-                        if (k < I) acc += act[k] * deq2(word, lane, s, b);
-                    }
-                }
-            }
-            out += score * acc;
-        }
-        y[gid] = half(out);
     }
     """
 }
 
 public enum SeedlessError: Error, CustomStringConvertible {
     case noMetal, notReady
+    case unsupportedShape(N: Int, K: Int, gs: Int)
     public var description: String {
         switch self {
         case .noMetal: return "no Metal device"
         case .notReady: return "SeedlessMetal not compiled"
+        case let .unsupportedShape(N, K, gs): return "unsupported shape N=\(N) K=\(K) gs=\(gs)"
         }
     }
 }
 
-/// Bind MLX weights into Seedless and run fused expert on real Maple layer-0 tensors.
+/// Bind Maple layer-0 expert weights into Seedless fused path and microbench.
 public enum SeedlessEngine {
     public static func benchRealExpert(store: WeightStore, iters: Int = 50) throws -> Double {
         try SeedlessMetal.ensureCompiled()
-        guard let device = SeedlessMetal.device,
-              let queue = SeedlessMetal.queue,
-              let pipe = SeedlessMetal.fusedExpertPipeline
-        else { throw SeedlessError.notReady }
-
+        guard let device = SeedlessMetal.device else { throw SeedlessError.notReady }
         let cfg = store.config
-        let H = cfg.hiddenSize, I = cfg.moeIntermediateSize, E = cfg.numExperts, Ktop = cfg.numExpertsPerTok
-        let groupSize = cfg.expertGroupSize
-        let packedH = H * 2 / 32
-        let packedI = I * 2 / 32
-        let nGroupsH = H / groupSize
-        let nGroupsI = I / groupSize
+        let H = cfg.hiddenSize, I = cfg.moeIntermediateSize, Ktop = cfg.numExpertsPerTok
+        let gs = cfg.expertGroupSize
 
         let ugW = store.req("model.layers.0.mlp.switch_mlp.up_gate_proj.weight")
         let ugS = store.req("model.layers.0.mlp.switch_mlp.up_gate_proj.scales")
@@ -320,9 +376,45 @@ public enum SeedlessEngine {
         let dB = store.req("model.layers.0.mlp.switch_mlp.down_proj.biases")
         MLX.eval([ugW, ugS, ugB, dW, dS, dB])
 
-        // Copy MLX buffer bytes into MTLBuffer via asData — use unsafe pointer from MLX if available.
-        // For milestone: fall back to synthetic bench sizing with real shapes.
-        _ = (ugW, ugS, ugB, dW, dS, dB, device, queue, pipe, packedH, packedI, nGroupsH, nGroupsI, E, Ktop)
-        return try SeedlessMetal.benchFusedExpert(H: H, I: I, E: min(E, 16), Ktop: Ktop, iters: iters)
+        guard let bugW = SeedlessMetal.mtlBuf(ugW, device),
+              let bugS = SeedlessMetal.mtlBuf(ugS.asType(.float16), device),
+              let bugB = SeedlessMetal.mtlBuf(ugB.asType(.float16), device),
+              let bdW = SeedlessMetal.mtlBuf(dW, device),
+              let bdS = SeedlessMetal.mtlBuf(dS.asType(.float16), device),
+              let bdB = SeedlessMetal.mtlBuf(dB.asType(.float16), device)
+        else { throw SeedlessError.notReady }
+
+        let x = device.makeBuffer(length: H * 2, options: .storageModeShared)!
+        // fill x with ones
+        let xp = x.contents().bindMemory(to: Float16.self, capacity: H)
+        for i in 0 ..< H { xp[i] = 0.01 }
+
+        let inds = device.makeBuffer(length: Ktop * 4, options: .storageModeShared)!
+        let scores = device.makeBuffer(length: Ktop * 4, options: .storageModeShared)!
+        let ip = inds.contents().bindMemory(to: Int32.self, capacity: Ktop)
+        let sp = scores.contents().bindMemory(to: Float.self, capacity: Ktop)
+        for i in 0 ..< Ktop { ip[i] = Int32(i); sp[i] = 1.0 / Float(Ktop) }
+
+        let ugOut = device.makeBuffer(length: Ktop * 2 * I * 2, options: .storageModeShared)!
+        let act = device.makeBuffer(length: Ktop * I * 2, options: .storageModeShared)!
+        let downOut = device.makeBuffer(length: Ktop * H * 2, options: .storageModeShared)!
+        let y = device.makeBuffer(length: H * 2, options: .storageModeShared)!
+
+        for _ in 0 ..< 3 {
+            try SeedlessMetal.fusedExpertStep(
+                x: x, upGateW: bugW, upGateS: bugS, upGateB: bugB,
+                downW: bdW, downS: bdS, downB: bdB, inds: inds, scores: scores,
+                ugOut: ugOut, act: act, downOut: downOut, y: y,
+                H: H, I: I, Ktop: Ktop, gs: gs)
+        }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        for _ in 0 ..< iters {
+            try SeedlessMetal.fusedExpertStep(
+                x: x, upGateW: bugW, upGateS: bugS, upGateB: bugB,
+                downW: bdW, downS: bdS, downB: bdB, inds: inds, scores: scores,
+                ugOut: ugOut, act: act, downOut: downOut, y: y,
+                H: H, I: I, Ktop: Ktop, gs: gs)
+        }
+        return Double(iters) / (CFAbsoluteTimeGetCurrent() - t0)
     }
 }

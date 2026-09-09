@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXFast
 import MLXNN
+import Metal
 
 /// MLX-path Maple engine (exact greedy). Correctness baseline alongside Seedless.
 public final class MapleEngine: @unchecked Sendable {
@@ -15,12 +16,12 @@ public final class MapleEngine: @unchecked Sendable {
 
     private struct Layer {
         let attn: MapleAttention
-        let moe: MapleMoE
+        let moe: MapleMoEHybrid
         let inNorm: MLXArray
         let postNorm: MLXArray
     }
 
-    public init(store: WeightStore) {
+    public init(store: WeightStore, enableSeedlessMoE: Bool = MapleMoEHybrid.enabled) {
         self.store = store
         self.config = store.config
         let embW = store.req("model.word_embeddings.weight")
@@ -38,6 +39,16 @@ public final class MapleEngine: @unchecked Sendable {
             biases: store.req("lm_head.biases"),
             bits: config.headBits,
             groupSize: config.headGroupSize)
+
+        var metalDevice: MTLDevice? = nil
+        if enableSeedlessMoE {
+            do {
+                try SeedlessMetal.ensureCompiled()
+                metalDevice = SeedlessMetal.device
+            } catch {
+                fputs("[momij] seedless init failed: \(error)\n", stderr)
+            }
+        }
 
         for i in 0 ..< config.numHiddenLayers {
             let p = "model.layers.\(i)"
@@ -66,17 +77,25 @@ public final class MapleEngine: @unchecked Sendable {
                 kNorm: store.req("\(p).self_attn.k_norm.weight"))
             let moePrefix = "\(p).mlp.switch_mlp"
             let upGate = "\(moePrefix).up_gate_proj"
-            let moe = MapleMoE(
+            let gateW = store.req("\(p).mlp.gate.weight")
+            let mlxMoE = MapleMoE(
                 topK: config.numExpertsPerTok,
                 numExperts: config.numExperts,
                 bits: bits, groupSize: gs,
-                gateW: store.req("\(p).mlp.gate.weight"),
+                gateW: gateW,
                 upGateW: store.req("\(upGate).weight"),
                 upGateS: store.req("\(upGate).scales"),
                 upGateB: store.req("\(upGate).biases"),
                 downW: store.req("\(moePrefix).down_proj.weight"),
                 downS: store.req("\(moePrefix).down_proj.scales"),
                 downB: store.req("\(moePrefix).down_proj.biases"))
+            var metalLayer: SeedlessMoELayer? = nil
+            if let device = metalDevice {
+                metalLayer = try? SeedlessMoELayer(store: store, layer: i, device: device)
+            }
+            let moe = MapleMoEHybrid(
+                mlx: mlxMoE, metal: metalLayer, gateW: gateW,
+                topK: config.numExpertsPerTok, numExperts: config.numExperts)
             layers.append(Layer(
                 attn: attn, moe: moe,
                 inNorm: store.req("\(p).input_layernorm.weight"),

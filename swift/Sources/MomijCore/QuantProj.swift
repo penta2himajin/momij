@@ -12,7 +12,7 @@ public enum QuantProj {
                 x, w, scales: s, biases: b,
                 transpose: true, groupSize: gs, bits: bits, mode: .affine)
         case let .dense(w):
-            return MLX.matmul(x, w.transposed(0, 1))
+            return MLX.matmul(x, w.transposed(1, 0))
         }
     }
 }

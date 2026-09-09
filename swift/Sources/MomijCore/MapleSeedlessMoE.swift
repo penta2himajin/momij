@@ -111,14 +111,10 @@ public struct MapleMoEHybrid {
         scoresArr = scoresArr / scoresArr.sum()
         MLX.eval([flat, indsArr, scoresArr])
 
-        var xHost = [Float16](repeating: 0, count: H)
-        var indHost = [Int32](repeating: 0, count: topK)
-        var scoreHost = [Float](repeating: 0, count: topK)
-        for i in 0 ..< H { xHost[i] = flat[i].item(Float16.self) }
-        for i in 0 ..< topK {
-            indHost[i] = indsArr[i].item(Int32.self)
-            scoreHost[i] = scoresArr[i].item(Float.self)
-        }
+        // Bulk host copy — per-element .item() is ~1000× slower here.
+        let xHost = flat.asArray(Float16.self)
+        let indHost = indsArr.asArray(Int32.self)
+        let scoreHost = scoresArr.asArray(Float.self)
 
         do {
             let yHost = try metal.run(x: xHost, inds: indHost, scores: scoreHost)

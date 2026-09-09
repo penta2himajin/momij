@@ -13,6 +13,10 @@ public enum SeedlessMetal {
     nonisolated(unsafe) static var gqmm2Pipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var swigluPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var scoreReducePipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var rmsPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var residPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var gateGemvPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var routeTop8Pipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var stopBuf: MTLBuffer?
     nonisolated(unsafe) public static var ready = false
 
@@ -27,9 +31,16 @@ public enum SeedlessMetal {
 
         let opts = mlxMatchCompileOpts()
         let lib = try dev.makeLibrary(source: metalSource, options: opts)
-        gqmm2Pipeline = try dev.makeComputePipelineState(function: lib.makeFunction(name: "gqmm2_rows")!)
-        swigluPipeline = try dev.makeComputePipelineState(function: lib.makeFunction(name: "maple_clamped_swiglu")!)
-        scoreReducePipeline = try dev.makeComputePipelineState(function: lib.makeFunction(name: "maple_score_reduce")!)
+        func pipe(_ name: String) throws -> MTLComputePipelineState {
+            try dev.makeComputePipelineState(function: lib.makeFunction(name: name)!)
+        }
+        gqmm2Pipeline = try pipe("gqmm2_rows")
+        swigluPipeline = try pipe("maple_clamped_swiglu")
+        scoreReducePipeline = try pipe("maple_score_reduce")
+        rmsPipeline = try pipe("maple_rms_norm")
+        residPipeline = try pipe("maple_resid_add")
+        gateGemvPipeline = try pipe("maple_gate_gemv")
+        routeTop8Pipeline = try pipe("maple_route_top8")
         ready = true
     }
 
@@ -94,29 +105,23 @@ public enum SeedlessMetal {
         }
     }
 
-    /// One-token fused MoE expert block on a single command buffer.
-    /// up_gate: [E, 2I, packedH], down: [E, H, packedI]
-    public static func fusedExpertStep(
+    /// Encode fused expert block into an existing encoder (no commit/wait).
+    public static func encodeFusedExpert(
+        into enc: MTLComputeCommandEncoder,
         x: MTLBuffer,
         upGateW: MTLBuffer, upGateS: MTLBuffer, upGateB: MTLBuffer,
         downW: MTLBuffer, downS: MTLBuffer, downB: MTLBuffer,
         inds: MTLBuffer, scores: MTLBuffer,
-        // scratch: ugOut[Ktop, 2I], act[Ktop, I], downOut[Ktop, H], y[H]
         ugOut: MTLBuffer, act: MTLBuffer, downOut: MTLBuffer, y: MTLBuffer,
         H: Int, I: Int, Ktop: Int, gs: Int = 128
     ) throws {
         try ensureCompiled()
-        guard let q = queue, let swiglu = swigluPipeline, let reduce = scoreReducePipeline, let stop = stopBuf
+        guard let swiglu = swigluPipeline, let reduce = scoreReducePipeline, let stop = stopBuf
         else { throw SeedlessError.notReady }
 
-        let cb = q.makeCommandBuffer()!
-        let enc = cb.makeComputeCommandEncoder()!
-
-        // 1) up_gate gather → [Ktop, 2I]
         try gqmm2(x: x, w: upGateW, scales: upGateS, biases: upGateB, inds: inds, out: ugOut,
                   Ktop: Ktop, K: H, N: 2 * I, gs: gs, lhsPerExpert: false, into: enc)
 
-        // 2) clamped swiglu → act[Ktop, I]
         enc.setComputePipelineState(swiglu)
         enc.setBuffer(ugOut, offset: 0, index: 0)
         enc.setBuffer(act, offset: 0, index: 1)
@@ -126,11 +131,9 @@ public enum SeedlessMetal {
         enc.dispatchThreads(MTLSize(width: I, height: Ktop, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(256, I), height: 1, depth: 1))
 
-        // 3) down gather (lhs per expert slot) → [Ktop, H]
         try gqmm2(x: act, w: downW, scales: downS, biases: downB, inds: inds, out: downOut,
                   Ktop: Ktop, K: I, N: H, gs: gs, lhsPerExpert: true, into: enc)
 
-        // 4) score reduce → y[H]
         enc.setComputePipelineState(reduce)
         enc.setBuffer(downOut, offset: 0, index: 0)
         enc.setBuffer(scores, offset: 0, index: 1)
@@ -141,10 +144,180 @@ public enum SeedlessMetal {
         enc.setBuffer(stop, offset: 0, index: 5)
         enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
+    }
 
+    /// One-token fused MoE expert block on a single command buffer (wait once).
+    public static func fusedExpertStep(
+        x: MTLBuffer,
+        upGateW: MTLBuffer, upGateS: MTLBuffer, upGateB: MTLBuffer,
+        downW: MTLBuffer, downS: MTLBuffer, downB: MTLBuffer,
+        inds: MTLBuffer, scores: MTLBuffer,
+        ugOut: MTLBuffer, act: MTLBuffer, downOut: MTLBuffer, y: MTLBuffer,
+        H: Int, I: Int, Ktop: Int, gs: Int = 128
+    ) throws {
+        try ensureCompiled()
+        guard let q = queue else { throw SeedlessError.notReady }
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        try encodeFusedExpert(
+            into: enc, x: x,
+            upGateW: upGateW, upGateS: upGateS, upGateB: upGateB,
+            downW: downW, downS: downS, downB: downB,
+            inds: inds, scores: scores,
+            ugOut: ugOut, act: act, downOut: downOut, y: y,
+            H: H, I: I, Ktop: Ktop, gs: gs)
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
+    }
+
+    /// Encode one MoE block into an existing encoder (no commit/wait).
+    public static func encodeMoEBlock(
+        into enc: MTLComputeCommandEncoder,
+        h: MTLBuffer, normW: MTLBuffer, gateW: MTLBuffer,
+        upGateW: MTLBuffer, upGateS: MTLBuffer, upGateB: MTLBuffer,
+        downW: MTLBuffer, downS: MTLBuffer, downB: MTLBuffer,
+        xNorm: MTLBuffer, logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
+        ugOut: MTLBuffer, act: MTLBuffer, downOut: MTLBuffer, moeOut: MTLBuffer,
+        H: Int, I: Int, E: Int, Ktop: Int, eps: Float, gs: Int = 128
+    ) throws {
+        try ensureCompiled()
+        guard let rms = rmsPipeline, let resid = residPipeline,
+              let gemv = gateGemvPipeline, let route = routeTop8Pipeline,
+              let stop = stopBuf
+        else { throw SeedlessError.notReady }
+
+        enc.setComputePipelineState(rms)
+        enc.setBuffer(h, offset: 0, index: 0)
+        enc.setBuffer(normW, offset: 0, index: 1)
+        enc.setBuffer(xNorm, offset: 0, index: 2)
+        var epsV = eps, h32 = Int32(H)
+        enc.setBytes(&epsV, length: 4, index: 3)
+        enc.setBytes(&h32, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+
+        enc.setComputePipelineState(gemv)
+        enc.setBuffer(gateW, offset: 0, index: 0)
+        enc.setBuffer(xNorm, offset: 0, index: 1)
+        enc.setBuffer(logits, offset: 0, index: 2)
+        var e32 = Int32(E)
+        enc.setBytes(&e32, length: 4, index: 3)
+        enc.setBytes(&h32, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: E, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+
+        enc.setComputePipelineState(route)
+        enc.setBuffer(logits, offset: 0, index: 0)
+        enc.setBuffer(inds, offset: 0, index: 1)
+        enc.setBuffer(scores, offset: 0, index: 2)
+        enc.setBytes(&e32, length: 4, index: 3)
+        var k32 = Int32(Ktop)
+        enc.setBytes(&k32, length: 4, index: 4)
+        enc.setBuffer(stop, offset: 0, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+
+        try encodeFusedExpert(
+            into: enc, x: xNorm,
+            upGateW: upGateW, upGateS: upGateS, upGateB: upGateB,
+            downW: downW, downS: downS, downB: downB,
+            inds: inds, scores: scores,
+            ugOut: ugOut, act: act, downOut: downOut, y: moeOut,
+            H: H, I: I, Ktop: Ktop, gs: gs)
+
+        enc.setComputePipelineState(resid)
+        enc.setBuffer(h, offset: 0, index: 0)
+        enc.setBuffer(moeOut, offset: 0, index: 1)
+        enc.setBytes(&h32, length: 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
+    }
+
+    public static func moeBlockOneCB(
+        h: MTLBuffer, normW: MTLBuffer, gateW: MTLBuffer,
+        upGateW: MTLBuffer, upGateS: MTLBuffer, upGateB: MTLBuffer,
+        downW: MTLBuffer, downS: MTLBuffer, downB: MTLBuffer,
+        xNorm: MTLBuffer, logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
+        ugOut: MTLBuffer, act: MTLBuffer, downOut: MTLBuffer, moeOut: MTLBuffer,
+        H: Int, I: Int, E: Int, Ktop: Int, eps: Float, gs: Int = 128
+    ) throws {
+        try ensureCompiled()
+        guard let q = queue else { throw SeedlessError.notReady }
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        try encodeMoEBlock(
+            into: enc, h: h, normW: normW, gateW: gateW,
+            upGateW: upGateW, upGateS: upGateS, upGateB: upGateB,
+            downW: downW, downS: downS, downB: downB,
+            xNorm: xNorm, logits: logits, inds: inds, scores: scores,
+            ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
+            H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+    }
+
+    /// Wall + GPU time for one encoder body. GPU time is `gpuEndTime - gpuStartTime`.
+    static func timeCB(_ body: (MTLComputeCommandEncoder) throws -> Void) throws -> (wallMs: Double, gpuMs: Double) {
+        try ensureCompiled()
+        guard let q = queue else { throw SeedlessError.notReady }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        try body(enc)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        let wallMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        let gpuMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000
+        return (wallMs, gpuMs)
+    }
+
+    static func encodeRms(
+        into enc: MTLComputeCommandEncoder, h: MTLBuffer, w: MTLBuffer, out: MTLBuffer,
+        H: Int, eps: Float
+    ) {
+        enc.setComputePipelineState(rmsPipeline!)
+        enc.setBuffer(h, offset: 0, index: 0)
+        enc.setBuffer(w, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        var epsV = eps, h32 = Int32(H)
+        enc.setBytes(&epsV, length: 4, index: 3)
+        enc.setBytes(&h32, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
+    static func encodeGate(
+        into enc: MTLComputeCommandEncoder, w: MTLBuffer, x: MTLBuffer, y: MTLBuffer,
+        E: Int, H: Int
+    ) {
+        enc.setComputePipelineState(gateGemvPipeline!)
+        enc.setBuffer(w, offset: 0, index: 0)
+        enc.setBuffer(x, offset: 0, index: 1)
+        enc.setBuffer(y, offset: 0, index: 2)
+        var e32 = Int32(E), h32 = Int32(H)
+        enc.setBytes(&e32, length: 4, index: 3)
+        enc.setBytes(&h32, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: E, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
+    static func encodeRoute(
+        into enc: MTLComputeCommandEncoder, logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
+        E: Int, Ktop: Int
+    ) {
+        enc.setComputePipelineState(routeTop8Pipeline!)
+        enc.setBuffer(logits, offset: 0, index: 0)
+        enc.setBuffer(inds, offset: 0, index: 1)
+        enc.setBuffer(scores, offset: 0, index: 2)
+        var e32 = Int32(E), k32 = Int32(Ktop)
+        enc.setBytes(&e32, length: 4, index: 3)
+        enc.setBytes(&k32, length: 4, index: 4)
+        enc.setBuffer(stopBuf, offset: 0, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
     // MARK: - Benches
@@ -343,6 +516,139 @@ public enum SeedlessMetal {
             acc += float(down[ki * H + gid]) * scores[ki];
         }
         y[gid] = half(acc);
+    }
+
+    // Milestone A helpers: RMSNorm / residual / dense gate / top-8 route.
+    kernel void maple_rms_norm(
+        device const half* x [[buffer(0)]],
+        device const half* w [[buffer(1)]],
+        device half* out [[buffer(2)]],
+        constant float& eps [[buffer(3)]],
+        constant int& H [[buffer(4)]],
+        uint lid [[thread_position_in_threadgroup]],
+        uint tgs [[threads_per_threadgroup]])
+    {
+        threadgroup float red[256];
+        float acc = 0.0f;
+        for (uint i = lid; i < (uint)H; i += tgs) {
+            float xi = float(x[i]);
+            acc += xi * xi;
+        }
+        red[lid] = acc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tgs / 2; s > 0; s >>= 1) {
+            if (lid < s) red[lid] += red[lid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float inv = precise::rsqrt(red[0] / float(H) + eps);
+        for (uint i = lid; i < (uint)H; i += tgs) {
+            out[i] = half(float(x[i]) * inv * float(w[i]));
+        }
+    }
+
+    kernel void maple_resid_add(
+        device half* h [[buffer(0)]],
+        device const half* delta [[buffer(1)]],
+        constant int& H [[buffer(2)]],
+        uint gid [[thread_position_in_grid]])
+    {
+        if (gid >= (uint)H) return;
+        h[gid] = half(float(h[gid]) + float(delta[gid]));
+    }
+
+    // Dense gate: y[e] = sum_k W[e,k] * x[k]  (1 TG / expert, parallel reduce)
+    kernel void maple_gate_gemv(
+        device const half* W [[buffer(0)]],  // [E, H]
+        device const half* x [[buffer(1)]],  // [H]
+        device float* y [[buffer(2)]],       // [E]
+        constant int& E [[buffer(3)]],
+        constant int& H [[buffer(4)]],
+        uint e [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint tgs [[threads_per_threadgroup]])
+    {
+        if (e >= (uint)E) return;
+        threadgroup float red[256];
+        const device half* row = W + (size_t)e * (size_t)H;
+        float acc = 0.0f;
+        for (uint k = tid; k < (uint)H; k += tgs) {
+            acc += float(row[k]) * float(x[k]);
+        }
+        red[tid] = acc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tgs / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) y[e] = red[0];
+    }
+
+    // Softmax + top-K with renorm. E<=256, K<=8. scores are float (for score_reduce).
+    kernel void maple_route_top8(
+        device const float* logits [[buffer(0)]],
+        device int* inds [[buffer(1)]],
+        device float* scores [[buffer(2)]],
+        constant int& E [[buffer(3)]],
+        constant int& K [[buffer(4)]],
+        device const int* stopFlag [[buffer(5)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint tgs [[threads_per_threadgroup]])
+    {
+        if (stopFlag[0] != 0) return;
+        threadgroup float red[256];
+        threadgroup int redi[256];
+        threadgroup float gates[256];
+        threadgroup float work[256];
+        threadgroup float bcast[1];
+        float lg = (tid < (uint)E) ? logits[tid] : -INFINITY;
+        red[tid] = lg;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tgs / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] = max(red[tid], red[tid + s]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) bcast[0] = red[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float m = bcast[0];
+        float e = (tid < (uint)E) ? precise::exp(lg - m) : 0.0f;
+        red[tid] = e;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tgs / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) bcast[0] = red[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float Z = bcast[0];
+        if (tid < (uint)E) { gates[tid] = e / Z; work[tid] = lg; }
+        else { work[tid] = -INFINITY; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int k = 0; k < K; k++) {
+            red[tid] = work[tid];
+            redi[tid] = (int)tid;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs / 2; s > 0; s >>= 1) {
+                if (tid < s) {
+                    if (red[tid + s] > red[tid]) {
+                        red[tid] = red[tid + s];
+                        redi[tid] = redi[tid + s];
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) {
+                int bi = redi[0];
+                inds[k] = bi;
+                scores[k] = gates[bi];
+                work[bi] = -INFINITY;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) {
+            float ss = 0.0f;
+            for (int k = 0; k < K; k++) ss += scores[k];
+            for (int k = 0; k < K; k++) scores[k] = scores[k] / ss;
+        }
     }
     """
 }

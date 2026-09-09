@@ -92,6 +92,13 @@ struct MomijMain {
                 let store = try WeightStore(modelDir: model)
                 let real = try SeedlessEngine.benchRealExpert(store: store, iters: 50)
                 print(String(format: "seedless fused-expert real-weights steps/s=%.1f", real))
+                let moe1cb = try SeedlessEngine.benchMoEBlock(store: store, layer: 0, iters: 50)
+                // Extrapolate 24 layers × 1 CB each ≈ decode floor (attn not included yet).
+                let layers = store.config.numHiddenLayers
+                let tokFloor = moe1cb / Double(layers)
+                print(String(format: "seedless moe-block-1cb (L0, rms+gate+top8+experts+resid) blocks/s=%.1f  → ~%.1f tok/s floor @%d layers (no attn)",
+                             moe1cb, tokFloor, layers))
+                print(try SeedlessEngine.profileMoEStack24(store: store, iters: 16))
             } catch {
                 fputs("[momij] skip real-weight seedless bind: \(error)\n", stderr)
             }

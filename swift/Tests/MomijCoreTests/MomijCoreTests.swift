@@ -50,6 +50,71 @@ final class SeedlessMetalTests: XCTestCase {
         // Naive nested kernel was ~0.7/s; tiled gather path should be >> 10/s.
         XCTAssertGreaterThan(rate, 10, "fused expert should exceed 10 steps/s, got \(rate)")
     }
+
+    func testMoEBlockOneCBCompilesAndRuns() throws {
+        try SeedlessMetal.ensureCompiled()
+        XCTAssertTrue(SeedlessMetal.ready)
+        // Synthetic buffers: verify encode path doesn't throw on Maple shapes.
+        guard let device = SeedlessMetal.device else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 2048, I = 512, E = 256, Ktop = 8, gs = 128
+        func buf(_ n: Int, _ bpe: Int = 2) -> MTLBuffer {
+            device.makeBuffer(length: n * bpe, options: .storageModeShared)!
+        }
+        // Minimal packed weight stubs (zeros) — shape-valid for dispatch.
+        let packedUG = (2 * I) * (H / 16)  // uint32 packs per expert row layout approx unused for empty
+        _ = packedUG
+        let x = buf(H), normW = buf(H), gateW = buf(E * H)
+        let ugW = buf(E * 2 * I * (H / 16), 4), ugS = buf(E * 2 * I * (H / gs)), ugB = buf(E * 2 * I * (H / gs))
+        let dW = buf(E * H * (I / 16), 4), dS = buf(E * H * (I / gs)), dB = buf(E * H * (I / gs))
+        let xNorm = buf(H), logits = buf(E, 4), inds = buf(Ktop, 4), scores = buf(Ktop, 4)
+        let ugOut = buf(Ktop * 2 * I), act = buf(Ktop * I), downOut = buf(Ktop * H), moeOut = buf(H)
+        try SeedlessMetal.moeBlockOneCB(
+            h: x, normW: normW, gateW: gateW,
+            upGateW: ugW, upGateS: ugS, upGateB: ugB,
+            downW: dW, downS: dS, downB: dB,
+            xNorm: xNorm, logits: logits, inds: inds, scores: scores,
+            ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
+            H: H, I: I, E: E, Ktop: Ktop, eps: 1e-6, gs: gs)
+        let yp = x.contents().bindMemory(to: Float16.self, capacity: H)
+        XCTAssertTrue(yp[0].isFinite)
+    }
+}
+
+final class SeedlessMoEStackTests: XCTestCase {
+    func testEncodeAllCompilesOnSyntheticTwoLayers() throws {
+        // Smoke: encodeMoEBlock twice into one CB with distinct scratch buffers.
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 2048, I = 512, E = 256, Ktop = 8, gs = 128
+        func buf(_ n: Int, _ bpe: Int = 2) -> MTLBuffer {
+            device.makeBuffer(length: n * bpe, options: .storageModeShared)!
+        }
+        let h = buf(H)
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        for _ in 0 ..< 2 {
+            let normW = buf(H), gateW = buf(E * H)
+            let ugW = buf(E * 2 * I * (H / 16), 4), ugS = buf(E * 2 * I * (H / gs)), ugB = buf(E * 2 * I * (H / gs))
+            let dW = buf(E * H * (I / 16), 4), dS = buf(E * H * (I / gs)), dB = buf(E * H * (I / gs))
+            let xNorm = buf(H), logits = buf(E, 4), inds = buf(Ktop, 4), scores = buf(Ktop, 4)
+            let ugOut = buf(Ktop * 2 * I), act = buf(Ktop * I), downOut = buf(Ktop * H), moeOut = buf(H)
+            try SeedlessMetal.encodeMoEBlock(
+                into: enc, h: h, normW: normW, gateW: gateW,
+                upGateW: ugW, upGateS: ugS, upGateB: ugB,
+                downW: dW, downS: dS, downB: dB,
+                xNorm: xNorm, logits: logits, inds: inds, scores: scores,
+                ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
+                H: H, I: I, E: E, Ktop: Ktop, eps: 1e-6, gs: gs)
+        }
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        XCTAssertTrue(h.contents().bindMemory(to: Float16.self, capacity: 1)[0].isFinite)
+    }
 }
 
 final class ConfigTests: XCTestCase {

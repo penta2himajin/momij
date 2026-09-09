@@ -40,8 +40,51 @@ Interpretation (measured, not guessed):
 ```
 seedless gqmm2 (H=2048→N=512,Ktop=1) kernel/s ≈ 2800
 seedless fused-expert (E=256,K=8) steps/s ≈ 1700
-seedless fused-expert real-weights steps/s ≈ 1760
+seedless fused-expert real-weights steps/s ≈ 1600–2300
 ```
+
+## 2026-09-09 Seedless Milestone A — MoE block 1-CB
+
+`SeedlessMetal.moeBlockOneCB`: postNorm RMS + dense gate (TG-reduce) + top-8 + fused experts + resid, **one wait**. No host inds/scores roundtrip.
+
+```
+seedless moe-block-1cb (L0) blocks/s ≈ 1400  →  ~58 tok/s floor @24 layers (MoE only, no attn)
+```
+
+## 2026-09-09 Seedless Milestone A — why ~50 tok/s (profile)
+
+M1 Max, AC, omlx stop. GPU time = `MTLCommandBuffer.gpuEndTime - gpuStartTime`. Timed loops have **no host memcpy**.
+
+| Probe | wall ms | GPU ms | busy |
+|---|---|---|---|
+| empty CB wait | 0.023 | 0 | — |
+| full MoE block (1 CB) | 0.786 | 0.521 | 66% |
+| rms / gate / route (own CB) | 0.31 / 0.36 / 0.41 | 0.078 / 0.128 / 0.183 | launch-dominated |
+| fused expert | 0.506 | 0.285 | 56% |
+| gqmm2 up / down | 0.41 / 0.41 | 0.191 / 0.192 | 46% |
+| **24× same block, 1 CB** | **4.29** | **3.94** | **92%** |
+
+Streamed ≈ 8.1 MB/layer (8 experts × 2-bit up+down + dense gate) → **15.6 GB/s** on 1-layer GPU time, **~50 GB/s** on 24L-1CB (M1 Max peak ~400). Not bandwidth-bound.
+
+MoE-only tok/s floor @24L: per-layer wait **~53** · 1-layer GPU **~80** · 24L-1CB **~254**.
+
+Cause: short-CB launch/sync tax + batch=1 gather occupancy, **not** host copy (empty wait 23 µs) and **not** missing 1-CB on a single layer. Oracle e2e ~182 tok/s is a fused MLX graph; same kernels under per-op sync were already in the same band as hybrid.
+
+## 2026-09-09 Seedless 24L MoE 1-CB re-measure (real weights)
+
+`SeedlessMoEStack`: all 24 layers' real weights, **per-layer private scratch**, shared residual `h`, encode into **one** CB. Same process — relative numbers are the claim.
+
+| Probe | wall ms | GPU ms | busy | MoE-only tok/s (wall / gpu) |
+|---|---|---|---|---|
+| 1L (L0) | 0.43 | 0.12 | 29% | — |
+| 24× L0 repeat, 1 CB | 2.94 | 2.60 | 88% | 340 / 385 |
+| **24L real, 1 CB** | **3.34** | **2.86** | **86%** | **300 / 349** |
+| 24L × per-layer wait | 10.57 | 3.71 | 35% | 95 / 269 |
+
+- Streamed ≈ 195 MB/token → **68 GB/s** on 24L-real GPU (peak ~400) — still occupancy/dispatch, not BW.
+- Per-layer wait wall is **~3.2×** 1-CB wall; GPU busy rises 35% → 86% when layers share one CB.
+- Real-weight 24L ≈ L0-repeat (2.86 vs 2.60 ms GPU) → earlier L0-stack proxy was not a hazard artifact.
+- MoE-only 1-CB floor **~300 tok/s wall** leaves headroom vs oracle e2e ~180 **before** attn/embed/lm_head; next is Milestone B (attn in the same CB).
 
 ## Baseline (oracle / mlx-lm-deepgrove)
 

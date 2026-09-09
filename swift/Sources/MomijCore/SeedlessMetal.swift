@@ -9,6 +9,7 @@ import MLX
 /// down gather → score reduce on one command buffer. Optional `gqmm2_up_swiglu`
 /// (`MOMIJ_FUSE_UP_SWIGLU=1`) fuses the first two; default keeps them separate (faster e2e).
 /// Experimental (default off): `MOMIJ_GQMM2_SPLITK=1` (micro↑ e2e↓), `MOMIJ_GQMM2_W16=1` (mild).
+/// Inner-K software pipeline (`gqmm2_rows_pf`) measured regress on packed CB — not shipped.
 public enum SeedlessMetal {
     nonisolated(unsafe) static var device: MTLDevice?
     nonisolated(unsafe) static var queue: MTLCommandQueue?
@@ -35,6 +36,7 @@ public enum SeedlessMetal {
     nonisolated(unsafe) static var shiftKVPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var sdpaPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var embedTokenPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var flashArgmaxTokenPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var stopBuf: MTLBuffer?
     nonisolated(unsafe) public static var ready = false
 
@@ -72,6 +74,7 @@ public enum SeedlessMetal {
         shiftKVPipeline = try pipe("maple_shift_kv")
         sdpaPipeline = try pipe("maple_sdpa_d128")
         embedTokenPipeline = try pipe("maple_embed_token")
+        flashArgmaxTokenPipeline = try pipe("maple_flash_argmax_token")
         ready = true
     }
 
@@ -132,7 +135,9 @@ public enum SeedlessMetal {
     ) throws {
         try ensureCompiled()
         guard let stop = stopBuf else { throw SeedlessError.notReady }
-        let rowsPerTG = ((w16 ?? useW16) && !(splitK ?? useSplitK)) ? 16 : 8
+        let doSK = splitK ?? useSplitK
+        let doW16 = !doSK && (w16 ?? useW16)
+        let rowsPerTG = doW16 ? 16 : 8
         guard N % rowsPerTG == 0, K % gqmm2BlockSize == 0, gs == 64 || gs == 128 else {
             throw SeedlessError.unsupportedShape(N: N, K: K, gs: gs)
         }
@@ -141,7 +146,6 @@ public enum SeedlessMetal {
         let q = commandQueue ?? queue!
         let cb = ownsCB ? q.makeCommandBuffer()! : nil
         let enc = encoder ?? cb!.makeComputeCommandEncoder()!
-        let doSK = splitK ?? useSplitK
 
         if doSK {
             guard let sk = gqmm2SplitKPipeline, let red = gqmm2ReduceSKPipeline else {
@@ -182,8 +186,7 @@ public enum SeedlessMetal {
                 MTLSize(width: N, height: Ktop, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: min(256, N), height: 1, depth: 1))
         } else {
-            let useWide = w16 ?? useW16
-            guard let pipe = useWide ? gqmm2W16Pipeline : gqmm2Pipeline else {
+            guard let pipe = doW16 ? gqmm2W16Pipeline : gqmm2Pipeline else {
                 throw SeedlessError.notReady
             }
             enc.setComputePipelineState(pipe)
@@ -202,10 +205,9 @@ public enum SeedlessMetal {
             enc.setBytes(&lp, length: 4, index: 10)
             var gsv = Int32(gs)
             enc.setBytes(&gsv, length: 4, index: 11)
-            let tptg = useWide ? 128 : 64
-            let rows = useWide ? 16 : 8
+            let tptg = doW16 ? 128 : 64
             enc.dispatchThreadgroups(
-                MTLSize(width: 1, height: N / rows, depth: Ktop),
+                MTLSize(width: 1, height: N / rowsPerTG, depth: Ktop),
                 threadsPerThreadgroup: MTLSize(width: tptg, height: 1, depth: 1))
         }
 
@@ -617,6 +619,27 @@ public enum SeedlessMetal {
         enc.setBytes(&r32, length: 4, index: 4)
         enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
+    }
+
+    /// Argmax over FlashHead gathered logits → token id via `tokenMap[inds[p]*C + row]`.
+    /// Writes `ids[outRow]`. No force-token override (CPU can reconcile after wait).
+    static func encodeFlashArgmaxToken(
+        into enc: MTLComputeCommandEncoder,
+        logits: MTLBuffer, inds: MTLBuffer, tokenMap: MTLBuffer, ids: MTLBuffer,
+        nProbes: Int, clusterSize: Int, outRow: Int
+    ) {
+        enc.setComputePipelineState(flashArgmaxTokenPipeline!)
+        enc.setBuffer(logits, offset: 0, index: 0)
+        enc.setBuffer(inds, offset: 0, index: 1)
+        enc.setBuffer(tokenMap, offset: 0, index: 2)
+        enc.setBuffer(ids, offset: 0, index: 3)
+        var np = Int32(nProbes), cs = Int32(clusterSize), or = Int32(outRow)
+        enc.setBytes(&np, length: 4, index: 4)
+        enc.setBytes(&cs, length: 4, index: 5)
+        enc.setBytes(&or, length: 4, index: 6)
+        enc.setBuffer(stopBuf, offset: 0, index: 7)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
     static func encodeGate(
@@ -1567,6 +1590,50 @@ public enum SeedlessMetal {
         if (gid >= (uint)H) return;
         int tok = ids[row];
         out[gid] = table[(size_t)tok * (size_t)H + gid];
+    }
+
+    // FlashHead gather logits → token id (no force-token). One TG reduction.
+    kernel void maple_flash_argmax_token(
+        device const float* logits [[buffer(0)]],
+        device const int* inds [[buffer(1)]],
+        device const int* tokenMap [[buffer(2)]],
+        device int* ids [[buffer(3)]],
+        constant int& nProbes [[buffer(4)]],
+        constant int& clusterSize [[buffer(5)]],
+        constant int& outRow [[buffer(6)]],
+        device const int* stopFlag [[buffer(7)]],
+        uint lid [[thread_index_in_threadgroup]],
+        uint tptg [[threads_per_threadgroup]])
+    {
+        if (stopFlag[0] != 0) return;
+        int n = nProbes * clusterSize;
+        threadgroup float tgScore[256];
+        threadgroup int tgIdx[256];
+        float best = -INFINITY;
+        int besti = 0;
+        for (int i = (int)lid; i < n; i += (int)tptg) {
+            float v = logits[i];
+            if (v > best) { best = v; besti = i; }
+        }
+        tgScore[lid] = best;
+        tgIdx[lid] = besti;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = tptg / 2; stride > 0; stride >>= 1) {
+            if (lid < stride) {
+                if (tgScore[lid + stride] > tgScore[lid]) {
+                    tgScore[lid] = tgScore[lid + stride];
+                    tgIdx[lid] = tgIdx[lid + stride];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lid == 0) {
+            int local = tgIdx[0];
+            int probe = local / clusterSize;
+            int row = local - probe * clusterSize;
+            int cluster = inds[probe];
+            ids[outRow] = tokenMap[(size_t)cluster * (size_t)clusterSize + (size_t)row];
+        }
     }
     """
 }

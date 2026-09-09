@@ -78,11 +78,12 @@ struct MomijMain {
             } else {
                 let r = try eng.benchmark(promptTokens: p, genTokens: g, trials: n, profile: true)
                 let ph = r.phase
-                print(String(format: "backend=seedless layers_per_cb=%d flash_head=%@ fuse=%@ probes=%d prompt_tps=%.3f generation_tps=%.3f",
+                print(String(format: "backend=seedless layers_per_cb=%d flash_head=%@ fuse=%@ probes=%d chain_k=%d prompt_tps=%.3f generation_tps=%.3f",
                              eng.layersPerCB,
                              eng.useFlashHead ? "true" : "false",
                              eng.flashFused ? "true" : "false",
                              eng.flashProbes,
+                             SeedlessDecodeEngine.envChainK,
                              r.promptTps, r.genTps))
                 print(String(format: "  phase_ms/tok embed=%.3f layers=%.3f head=%.3f  (sum=%.3f)",
                              ph.embed, ph.layers, ph.head,

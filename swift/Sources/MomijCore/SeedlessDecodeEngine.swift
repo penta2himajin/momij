@@ -91,7 +91,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
 
     private func ensureSpecSlots() {
         guard specFeedIds == nil, let device = SeedlessMetal.device, let fh = flashHead else { return }
-        specFeedIds = device.makeBuffer(length: specMaxM * 4, options: .storageModeShared)
+        specFeedIds = device.makeBuffer(length: (specMaxM + 1) * 4, options: .storageModeShared)
         let logitBytes = fh.nProbes * fh.clusterSize * MemoryLayout<Float>.size
         for _ in 0 ..< specMaxM {
             specNormSlots.append(device.makeBuffer(length: H * 2, options: .storageModeShared)!)
@@ -145,6 +145,56 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 hostH: ptr, inds: specIndsSlots[i], logits: specLogitsSlots[i]))
         }
         return evals
+    }
+
+    /// Greedy GPU token-feedback chain: K embeds+layers+FlashHead+argmax in **one wait**.
+    /// No force-token override on GPU (EOS force may diverge vs sequential near stop).
+    /// Env driver: `MOMIJ_CHAIN_K` via `generate`.
+    public func stepGreedyChain(from start: Int, count K: Int) throws -> [Int] {
+        precondition(K > 0 && K <= specMaxM)
+        guard useFlashHead, let fh = flashHead, fh.fuseIntoLayerCB else {
+            var out: [Int] = []
+            var cur = start
+            for _ in 0 ..< K {
+                cur = try step(cur)
+                out.append(cur)
+            }
+            return out
+        }
+        ensureSpecSlots()
+        guard let q = SeedlessMetal.queue, let feedBuf = specFeedIds else {
+            throw SeedlessError.notReady
+        }
+        let ip = feedBuf.contents().bindMemory(to: Int32.self, capacity: K + 1)
+        ip[0] = Int32(start)
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        for i in 0 ..< K {
+            SeedlessMetal.encodeEmbedToken(
+                into: enc, table: embBuf, ids: feedBuf, out: stack.hBuf, H: H, row: i)
+            for layer in stack.layers {
+                try layer.encodeStep(into: enc)
+            }
+            let norm = specNormSlots[i]
+            let inds = specIndsSlots[i]
+            let logits = specLogitsSlots[i]
+            SeedlessMetal.encodeRms(
+                into: enc, h: stack.hBuf, w: normWBuf, out: norm, H: H, eps: config.rmsNormEps)
+            fh.encodeCentroids(into: enc, h: norm)
+            fh.encodeFusedAfterCentroids(into: enc, h: norm, inds: inds, logits: logits)
+            SeedlessMetal.encodeFlashArgmaxToken(
+                into: enc, logits: logits, inds: inds, tokenMap: fh.tokenMapBuf, ids: feedBuf,
+                nProbes: fh.nProbes, clusterSize: fh.clusterSize, outRow: i + 1)
+        }
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        var out: [Int] = []
+        out.reserveCapacity(K)
+        for i in 1 ... K { out.append(Int(ip[i])) }
+        return out
     }
 
     public func reset() { stack.resetCaches() }
@@ -214,14 +264,39 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 last = try step(id)
             }
         }
+        let chainK = Self.envChainK
         var out: [Int] = []
         var y = last
-        for _ in 0 ..< maxTokens {
+        while out.count < maxTokens {
             out.append(y)
             if let eos, y == eos { break }
-            y = try step(y)
+            let remain = maxTokens - out.count
+            if remain == 0 { break }
+            if chainK > 1, useFlashHead, flashFused {
+                let n = min(chainK, remain, specMaxM)
+                let toks = try stepGreedyChain(from: y, count: n)
+                if let eos, let ei = toks.firstIndex(of: eos) {
+                    out.append(contentsOf: toks.prefix(ei + 1))
+                    break
+                }
+                if toks.count == 1 {
+                    y = toks[0]
+                } else {
+                    out.append(contentsOf: toks.dropLast())
+                    y = toks.last!
+                }
+            } else {
+                y = try step(y)
+            }
         }
         return out
+    }
+
+    /// Greedy chain length. `MOMIJ_CHAIN_K` (default 0 = off / sequential).
+    public static var envChainK: Int {
+        guard let s = ProcessInfo.processInfo.environment["MOMIJ_CHAIN_K"], let v = Int(s), v > 0
+        else { return 0 }
+        return v
     }
 
     /// SuffixSpec decode: free draft from history, early-exit greedy verify.
@@ -500,13 +575,23 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             }
             let t1 = CFAbsoluteTimeGetCurrent()
             var y = last
-            for _ in 0 ..< genTokens {
-                y = try step(y, profile: profile)
-                if profile {
-                    accum.embed += lastPhase.embed
-                    accum.layers += lastPhase.layers
-                    accum.head += lastPhase.head
-                    accum.steps += 1
+            let chainK = Self.envChainK
+            var produced = 0
+            while produced < genTokens {
+                if chainK > 1, useFlashHead, flashFused {
+                    let n = min(chainK, genTokens - produced, specMaxM)
+                    let toks = try stepGreedyChain(from: y, count: n)
+                    produced += toks.count
+                    y = toks.last!
+                } else {
+                    y = try step(y, profile: profile)
+                    produced += 1
+                    if profile {
+                        accum.embed += lastPhase.embed
+                        accum.layers += lastPhase.layers
+                        accum.head += lastPhase.head
+                        accum.steps += 1
+                    }
                 }
             }
             let t2 = CFAbsoluteTimeGetCurrent()

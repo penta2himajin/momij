@@ -202,6 +202,29 @@ Lessons:
 3. Default stays stock `gqmm2_rows`. Both variants opt-in + parity-tested.
 4. Next A candidates: software-pipeline inner K loop (no extra dispatch), CB double-buffer for wall, or SDPA/gqmm2 fuse — not another reduce-style split-K.
 
+## 2026-09-10 gqmm2 A — inner-K software pipeline (no-go)
+
+Tried `gqmm2_rows_pf` (double-buffer x + vectorized `half4`/`uint32` loads), parity OK vs stock.
+
+| Probe | default | PF |
+|---|---|---|
+| 24L commit→1w GPU | ~5.5 ms | **~6.0 ms worse** |
+| e2e gen (interleaved×3) | ~173–181 | **~155–161 regress** |
+
+Not shipped (removed from metallib to avoid bloat). Same lesson as split-K: latency-hiding tricks that help single-CB micro do not raise the packed 1-CB floor.
+
+## 2026-09-10 wall: greedy GPU token-feedback chain
+
+Qwisp II-a style: `maple_flash_argmax_token` writes next id into the feed buffer; K steps = one wait (`stepGreedyChain` / `MOMIJ_CHAIN_K`). No force-token on GPU (short `generate` matched sequential on a Hello/24-tok smoke).
+
+| Config (p128/g128, interleaved×3) | gen tok/s |
+|---|---|
+| sequential (default) | ~181–187 (mean **~183**) |
+| `MOMIJ_CHAIN_K=4` | ~165–187 (noisy; mean ~180) |
+| `MOMIJ_CHAIN_K=8` | **~190–198** (mean **~195**) |
+
+Hits the prior GPU-floor band (~194–198). Default stays sequential; use `MOMIJ_CHAIN_K=8` for wall recovery toward stable ~200. Peak 250 still needs a faster GPU floor (kernel), not more chaining.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

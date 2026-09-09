@@ -28,6 +28,8 @@ public final class SeedlessFlashHead {
     let logitsBuf: MTLBuffer
     let candScoresBuf: MTLBuffer
     let candIndsBuf: MTLBuffer
+    /// Device copy of token_map for GPU argmax → token id (greedy chain).
+    public let tokenMapBuf: MTLBuffer
     private var topScratch: [Int]
 
     public init?(store: WeightStore, device: MTLDevice) {
@@ -115,6 +117,10 @@ public final class SeedlessFlashHead {
             length: nCand * MemoryLayout<Float>.size, options: .storageModeShared)!
         candIndsBuf = device.makeBuffer(
             length: nCand * MemoryLayout<Int32>.size, options: .storageModeShared)!
+        let mapBuf = device.makeBuffer(
+            length: tmHost.count * MemoryLayout<Int32>.size, options: .storageModeShared)!
+        tmHost.withUnsafeBytes { mapBuf.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+        tokenMapBuf = mapBuf
         topScratch = Array(repeating: 0, count: nClusters)
         forceRows = forceFlat
     }

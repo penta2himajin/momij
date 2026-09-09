@@ -115,6 +115,9 @@ struct MomijMain {
                              moe1cb, tokFloor, layers))
                 // Milestone B layer profile is the primary claim; skip MoE-only stack to save RAM/time.
                 print(try SeedlessEngine.profileLayerStack(store: store, iters: 8))
+                if has(args, "--profile-moe") {
+                    print(try SeedlessEngine.profileMoEBlock(store: store, layer: 0, iters: 40))
+                }
                 if has(args, "--sweep-cb") {
                     print(try SeedlessDecodeEngine.sweepLayersPerCB(store: store, prompt: 64, gen: 64))
                 }

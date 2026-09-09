@@ -132,6 +132,24 @@ Head dropped from ~1.2 (exact) / ~0.8 (MLX FlashHead) to **~0.48** via Metal gat
 
 Do **not** fuse GPU serial/multi-round top-k into the layer CB (measured regression to ~25–35 tok/s). Next: gqmm2/MoE occupancy, or eliminate the gather CB wait (true single-wait FlashHead with a fast parallel top-k).
 
+## 2026-09-09 up→SwiGLU fusion + ~200 tok/s
+
+M1 Max, fans max, omlx stop, p128/g128 n=5, `layersPerCB=4`, FlashHead probes=96.
+
+Added `gqmm2_up_swiglu` (parity-tested vs gqmm2 + `maple_clamped_swiglu`). Env: `MOMIJ_FUSE_UP_SWIGLU=1` to enable; **default off**.
+
+| Path | gen tok/s (n=5) | notes |
+|---|---|---|
+| default (separate up + SwiGLU) | **198–200** (peak **200.3**) | layers ~4.5–4.9 ms |
+| `MOMIJ_FUSE_UP_SWIGLU=1` | ~193–197 | expert micro ↑ (~2440 vs ~1910 steps/s) but e2e slightly ↓ |
+| exact lm_head | ~185 | head ~1.0 ms |
+
+Lessons:
+
+1. Occupancy kernels with large `threadgroup` caches in the same metallib tanked even legacy gqmm2 (~3×) — reverted; not thermal.
+2. up→SwiGLU fusion helps isolated expert throughput; e2e layers+attn prefer the lighter two-dispatch path.
+3. **~200 gen tok/s** is reachable on this machine without enabling the fused up kernel.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

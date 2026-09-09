@@ -5,12 +5,14 @@ import MLX
 /// Raw Metal kernels for Maple ternary (2-bit affine) decode hot path.
 ///
 /// `gqmm2_rows` is ported from Qwisp Seedless (MLX gather_qmv_fast bits=2 layout)
-/// with `group_size` 64|128. Fused expert = up_gate gather → clamped SwiGLU →
-/// down gather → score reduce, encoded on one command buffer.
+/// with `group_size` 64|128. Expert path = up_gate gather → clamped SwiGLU →
+/// down gather → score reduce on one command buffer. Optional `gqmm2_up_swiglu`
+/// (`MOMIJ_FUSE_UP_SWIGLU=1`) fuses the first two; default keeps them separate (faster e2e).
 public enum SeedlessMetal {
     nonisolated(unsafe) static var device: MTLDevice?
     nonisolated(unsafe) static var queue: MTLCommandQueue?
     nonisolated(unsafe) static var gqmm2Pipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var gqmm2UpSwigluPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var swigluPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var scoreReducePipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var rmsPipeline: MTLComputePipelineState?
@@ -41,6 +43,7 @@ public enum SeedlessMetal {
             try dev.makeComputePipelineState(function: lib.makeFunction(name: name)!)
         }
         gqmm2Pipeline = try pipe("gqmm2_rows")
+        gqmm2UpSwigluPipeline = try pipe("gqmm2_up_swiglu")
         swigluPipeline = try pipe("maple_clamped_swiglu")
         scoreReducePipeline = try pipe("maple_score_reduce")
         rmsPipeline = try pipe("maple_rms_norm")
@@ -69,6 +72,13 @@ public enum SeedlessMetal {
     }
 
     // MARK: - Public API
+
+    /// When true, up gather + clamped SwiGLU run as one kernel.
+    /// Default off: e2e favors the two-dispatch path; set `MOMIJ_FUSE_UP_SWIGLU=1` to enable.
+    public static var fuseUpSwiglu: Bool {
+        guard let raw = getenv("MOMIJ_FUSE_UP_SWIGLU") else { return false }
+        return String(cString: raw) == "1"
+    }
 
     /// 2-bit gather-qmv: x[1,K], w[E,N,K/16], scales/biases[E,N,K/gs], inds[Ktop] → y[Ktop,N]
     public static func gqmm2(
@@ -117,6 +127,64 @@ public enum SeedlessMetal {
         }
     }
 
+    /// Fused up||gate gather-qmv + clamped SwiGLU → act[Ktop, I]. Weight rows = 2I (up||gate).
+    public static func gqmm2UpSwiglu(
+        x: MTLBuffer, w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer, inds: MTLBuffer,
+        out: MTLBuffer,
+        Ktop: Int, K: Int, I: Int, gs: Int = 128,
+        into encoder: MTLComputeCommandEncoder? = nil,
+        commandQueue: MTLCommandQueue? = nil
+    ) throws {
+        try ensureCompiled()
+        guard let pipe = gqmm2UpSwigluPipeline, let stop = stopBuf else { throw SeedlessError.notReady }
+        guard I % 8 == 0, K % 512 == 0, gs == 64 || gs == 128 else {
+            throw SeedlessError.unsupportedShape(N: I, K: K, gs: gs)
+        }
+
+        let ownsCB = encoder == nil
+        let q = commandQueue ?? queue!
+        let cb = ownsCB ? q.makeCommandBuffer()! : nil
+        let enc = encoder ?? cb!.makeComputeCommandEncoder()!
+
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(w, offset: 0, index: 0)
+        enc.setBuffer(scales, offset: 0, index: 1)
+        enc.setBuffer(biases, offset: 0, index: 2)
+        enc.setBuffer(x, offset: 0, index: 3)
+        enc.setBuffer(inds, offset: 0, index: 4)
+        enc.setBuffer(out, offset: 0, index: 5)
+        var kk = Int32(K), ii = Int32(I), kt = Int32(Ktop)
+        enc.setBytes(&kk, length: 4, index: 6)
+        enc.setBytes(&ii, length: 4, index: 7)
+        enc.setBytes(&kt, length: 4, index: 8)
+        enc.setBuffer(stop, offset: 0, index: 9)
+        var gsv = Int32(gs)
+        enc.setBytes(&gsv, length: 4, index: 10)
+        enc.dispatchThreadgroups(
+            MTLSize(width: 1, height: I / 8, depth: Ktop),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+
+        if ownsCB {
+            enc.endEncoding()
+            cb!.commit()
+            cb!.waitUntilCompleted()
+        }
+    }
+
+    public static func encodeClampedSwiglu(
+        into enc: MTLComputeCommandEncoder,
+        ug: MTLBuffer, act: MTLBuffer, I: Int, Ktop: Int
+    ) {
+        enc.setComputePipelineState(swigluPipeline!)
+        enc.setBuffer(ug, offset: 0, index: 0)
+        enc.setBuffer(act, offset: 0, index: 1)
+        var i32 = Int32(I), kt32 = Int32(Ktop)
+        enc.setBytes(&i32, length: 4, index: 2)
+        enc.setBytes(&kt32, length: 4, index: 3)
+        enc.dispatchThreads(MTLSize(width: I, height: Ktop, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(256, I), height: 1, depth: 1))
+    }
+
     /// Encode fused expert block into an existing encoder (no commit/wait).
     public static func encodeFusedExpert(
         into enc: MTLComputeCommandEncoder,
@@ -128,20 +196,17 @@ public enum SeedlessMetal {
         H: Int, I: Int, Ktop: Int, gs: Int = 128
     ) throws {
         try ensureCompiled()
-        guard let swiglu = swigluPipeline, let reduce = scoreReducePipeline, let stop = stopBuf
+        guard let reduce = scoreReducePipeline, let stop = stopBuf
         else { throw SeedlessError.notReady }
 
-        try gqmm2(x: x, w: upGateW, scales: upGateS, biases: upGateB, inds: inds, out: ugOut,
-                  Ktop: Ktop, K: H, N: 2 * I, gs: gs, lhsPerExpert: false, into: enc)
-
-        enc.setComputePipelineState(swiglu)
-        enc.setBuffer(ugOut, offset: 0, index: 0)
-        enc.setBuffer(act, offset: 0, index: 1)
-        var i32 = Int32(I), kt32 = Int32(Ktop)
-        enc.setBytes(&i32, length: 4, index: 2)
-        enc.setBytes(&kt32, length: 4, index: 3)
-        enc.dispatchThreads(MTLSize(width: I, height: Ktop, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: min(256, I), height: 1, depth: 1))
+        if fuseUpSwiglu {
+            try gqmm2UpSwiglu(x: x, w: upGateW, scales: upGateS, biases: upGateB, inds: inds,
+                             out: act, Ktop: Ktop, K: H, I: I, gs: gs, into: enc)
+        } else {
+            try gqmm2(x: x, w: upGateW, scales: upGateS, biases: upGateB, inds: inds, out: ugOut,
+                      Ktop: Ktop, K: H, N: 2 * I, gs: gs, lhsPerExpert: false, into: enc)
+            encodeClampedSwiglu(into: enc, ug: ugOut, act: act, I: I, Ktop: Ktop)
+        }
 
         try gqmm2(x: act, w: downW, scales: downS, biases: downB, inds: inds, out: downOut,
                   Ktop: Ktop, K: I, N: H, gs: gs, lhsPerExpert: true, into: enc)
@@ -151,6 +216,7 @@ public enum SeedlessMetal {
         enc.setBuffer(scores, offset: 0, index: 1)
         enc.setBuffer(y, offset: 0, index: 2)
         var h32 = Int32(H)
+        var kt32 = Int32(Ktop)
         enc.setBytes(&h32, length: 4, index: 3)
         enc.setBytes(&kt32, length: 4, index: 4)
         enc.setBuffer(stop, offset: 0, index: 5)
@@ -681,6 +747,82 @@ public enum SeedlessMetal {
         for (int row = 0; row < results_per_simdgroup; row++) {
             result[row] = simd_sum(result[row]);
             if (simd_lid == 0) y[row] = (half)result[row];
+        }
+    }
+
+    // Up||gate gather-qmv fused with clamped SwiGLU. out_vec_size = I; weight has 2I rows.
+    kernel void gqmm2_up_swiglu(
+        device const uint32_t* w      [[buffer(0)]],
+        device const half*     scales [[buffer(1)]],
+        device const half*     biases [[buffer(2)]],
+        device const half*     x      [[buffer(3)]],
+        device const int*      inds   [[buffer(4)]],
+        device half*           y      [[buffer(5)]],
+        constant int& in_vec_size  [[buffer(6)]],
+        constant int& out_vec_size [[buffer(7)]],
+        constant int& ktop         [[buffer(8)]],
+        device const int* stopFlag [[buffer(9)]],
+        constant int&  gsz         [[buffer(10)]],
+        uint3 tid      [[threadgroup_position_in_grid]],
+        uint  simd_gid [[simdgroup_index_in_threadgroup]],
+        uint  simd_lid [[thread_index_in_simdgroup]])
+    {
+        if (stopFlag[0] != 0) return;
+        constexpr int packs_per_thread = 1, num_simdgroups = 2, results_per_simdgroup = 4;
+        constexpr int pack_factor = 16, bytes_per_pack = 4, values_per_thread = 16;
+        constexpr int block_size = 512;
+        const int scale_step_per_thread = gsz / values_per_thread;
+        const device uint8_t* ws = (const device uint8_t*)w;
+        thread float x_thread[16];
+        thread float result_up[4] = {0};
+        thread float result_gate[4] = {0};
+        const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+        const int in_vec_size_g = in_vec_size / gsz;
+        const int weight_rows = out_vec_size * 2;
+        uint mk = tid.z;
+        uint e = (uint)inds[mk];
+        ws     += (size_t)e * weight_rows * in_vec_size_w;
+        scales += (size_t)e * weight_rows * in_vec_size_g;
+        biases += (size_t)e * weight_rows * in_vec_size_g;
+        const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+        const device uint8_t* ws_up = ws + out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+        const device uint8_t* ws_gate = ws + (out_row + out_vec_size) * in_vec_size_w
+                                      + simd_lid * packs_per_thread * bytes_per_pack;
+        const device half* sc_up = scales + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+        const device half* sc_gate = scales + (out_row + out_vec_size) * in_vec_size_g
+                                    + simd_lid / scale_step_per_thread;
+        const device half* bi_up = biases + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+        const device half* bi_gate = biases + (out_row + out_vec_size) * in_vec_size_g
+                                    + simd_lid / scale_step_per_thread;
+        x += (size_t)(mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
+        y += (size_t)mk * out_vec_size + out_row;
+        for (int k = 0; k < in_vec_size; k += block_size) {
+            float sum = ld16_b2(x, x_thread);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                auto wl_u = (const device uint8_t*)(ws_up + row * in_vec_size_w);
+                auto wl_g = (const device uint8_t*)(ws_gate + row * in_vec_size_w);
+                const device half* slu = sc_up + row * in_vec_size_g;
+                const device half* slg = sc_gate + row * in_vec_size_g;
+                const device half* blu = bi_up + row * in_vec_size_g;
+                const device half* blg = bi_gate + row * in_vec_size_g;
+                result_up[row]   += qd2(wl_u, x_thread, slu[0], blu[0], sum);
+                result_gate[row] += qd2(wl_g, x_thread, slg[0], blg[0], sum);
+            }
+            ws_up += block_size * bytes_per_pack / pack_factor;
+            ws_gate += block_size * bytes_per_pack / pack_factor;
+            sc_up += block_size / gsz; sc_gate += block_size / gsz;
+            bi_up += block_size / gsz; bi_gate += block_size / gsz;
+            x += block_size;
+        }
+        for (int row = 0; row < results_per_simdgroup; row++) {
+            float up = simd_sum(result_up[row]);
+            float gate = simd_sum(result_gate[row]);
+            if (simd_lid == 0) {
+                gate = metal::min(gate, 7.0f);
+                up = metal::clamp(up, -7.0f, 7.0f);
+                float silu = gate / (1.0f + metal::exp(-gate));
+                y[row] = half(silu * up);
+            }
         }
     }
 

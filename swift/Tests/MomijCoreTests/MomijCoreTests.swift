@@ -51,6 +51,65 @@ final class SeedlessMetalTests: XCTestCase {
         XCTAssertGreaterThan(rate, 10, "fused expert should exceed 10 steps/s, got \(rate)")
     }
 
+    func testUpSwigluFusedMatchesSeparate() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 512, I = 128, E = 4, Ktop = 2, gs = 128
+        func fill(_ buf: MTLBuffer) {
+            let n = buf.length
+            let p = buf.contents().bindMemory(to: UInt8.self, capacity: n)
+            for i in 0 ..< n { p[i] = UInt8((i * 17 + 3) & 0xff) }
+        }
+        func fillHalf(_ buf: MTLBuffer, _ v: Float16) {
+            let n = buf.length / 2
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = v }
+        }
+        func buf(_ bytes: Int) -> MTLBuffer {
+            device.makeBuffer(length: bytes, options: .storageModeShared)!
+        }
+        let packedH = H * 2 / 32
+        let nGroupsH = H / gs
+        let x = buf(H * 2); fillHalf(x, 0.01)
+        let ugW = buf(E * 2 * I * packedH * 4); fill(ugW)
+        let ugS = buf(E * 2 * I * nGroupsH * 2); fillHalf(ugS, 0.02)
+        let ugB = buf(E * 2 * I * nGroupsH * 2); fillHalf(ugB, 0.001)
+        let inds = buf(Ktop * 4)
+        let ip = inds.contents().bindMemory(to: Int32.self, capacity: Ktop)
+        ip[0] = 1; ip[1] = 3
+        let ugOut = buf(Ktop * 2 * I * 2)
+        let actSep = buf(Ktop * I * 2)
+        let actFused = buf(Ktop * I * 2)
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        try SeedlessMetal.gqmm2(
+            x: x, w: ugW, scales: ugS, biases: ugB, inds: inds, out: ugOut,
+            Ktop: Ktop, K: H, N: 2 * I, gs: gs, into: enc)
+        SeedlessMetal.encodeClampedSwiglu(into: enc, ug: ugOut, act: actSep, I: I, Ktop: Ktop)
+        try SeedlessMetal.gqmm2UpSwiglu(
+            x: x, w: ugW, scales: ugS, biases: ugB, inds: inds, out: actFused,
+            Ktop: Ktop, K: H, I: I, gs: gs, into: enc)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let a = actSep.contents().bindMemory(to: Float16.self, capacity: Ktop * I)
+        let b = actFused.contents().bindMemory(to: Float16.self, capacity: Ktop * I)
+        var maxAbs: Float = 0
+        var num = 0.0, den = 0.0
+        for i in 0 ..< (Ktop * I) {
+            let d = abs(Float(a[i]) - Float(b[i]))
+            maxAbs = max(maxAbs, d)
+            num += Double(d * d)
+            den += Double(Float(a[i]) * Float(a[i]))
+        }
+        let rel = sqrt(num / max(den, 1e-30))
+        XCTAssertLessThan(rel, 1e-3, "rel_l2=\(rel) maxAbs=\(maxAbs)")
+    }
+
     func testMoEBlockOneCBCompilesAndRuns() throws {
         try SeedlessMetal.ensureCompiled()
         XCTAssertTrue(SeedlessMetal.ready)

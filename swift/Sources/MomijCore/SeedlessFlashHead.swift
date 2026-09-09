@@ -2,8 +2,11 @@ import Foundation
 import Metal
 import MLX
 
-/// FlashHead: Metal centroid gemv fused into the layer CB → CPU top-k → Metal 4-bit
-/// gather (separate short CB) → CPU argmax (+ force dots).
+/// FlashHead: Metal centroid gemv fused into the layer CB → top-k → Metal 4-bit gather.
+///
+/// Default path: CPU top-k after layer wait, then a short gather CB (second wait).
+/// Opt-in `MOMIJ_FLASH_FUSE=1`: hierarchical GPU top-k + gather in the layer CB
+/// (same wait as layers) — avoids serial full-E×K GPU top-k (measured catastrophic).
 public final class SeedlessFlashHead {
     let forceIds: [Int]
     let forceRows: [Float16]
@@ -13,6 +16,8 @@ public final class SeedlessFlashHead {
     let clusterSize: Int
     let headGroupSize: Int
     let H: Int
+    /// When true, encode top-k+gather into the layer CB (see `encodeFusedAfterCentroids`).
+    public let fuseIntoLayerCB: Bool
 
     let centroidsBuf: MTLBuffer
     let scoresBuf: MTLBuffer
@@ -21,7 +26,11 @@ public final class SeedlessFlashHead {
     let headBBuf: MTLBuffer
     let indsBuf: MTLBuffer
     let logitsBuf: MTLBuffer
+    let candScoresBuf: MTLBuffer
+    let candIndsBuf: MTLBuffer
     private var topScratch: [Int]
+    /// Host copy of last fused probe inds (for token_map after wait).
+    private var lastTopClusters: [Int]
 
     public init?(store: WeightStore, device: MTLDevice) {
         let cfg = store.config
@@ -34,9 +43,13 @@ public final class SeedlessFlashHead {
         clusterSize = meta.clusterSize
         H = cfg.hiddenSize
         let envProbes = ProcessInfo.processInfo.environment["MOMIJ_FLASH_PROBES"].flatMap(Int.init)
-        // Default 96: best measured band on M1 Max; set 512 for checkpoint-faithful FlashHead.
-        nProbes = min(envProbes ?? 96, nClusters)
+        // Default 64: best measured stable band on M1 Max (96 similar quality, more gather tax).
+        nProbes = min(envProbes ?? 64, nClusters)
         headGroupSize = meta.headGroupSize
+        // Default on: hierarchical GPU top-k + gather in the layer CB kills the ~0.3ms
+        // second-wait tax (measured ~208 tok/s vs ~180). Set MOMIJ_FLASH_FUSE=0 to disable.
+        // Not the failed serial full-E×K top-k; chunk→merge only.
+        fuseIntoLayerCB = ProcessInfo.processInfo.environment["MOMIJ_FLASH_FUSE"] != "0"
 
         let cw = store.req("lm_head_flash.centroids.weight")
         let cs = store.req("lm_head_flash.centroids.scales")
@@ -97,7 +110,15 @@ public final class SeedlessFlashHead {
             length: nProbes * MemoryLayout<Int32>.size, options: .storageModeShared)!
         logitsBuf = device.makeBuffer(
             length: nProbes * clusterSize * MemoryLayout<Float>.size, options: .storageModeShared)!
+        let nChunks = (nClusters + SeedlessMetal.flashTopKChunk - 1) / SeedlessMetal.flashTopKChunk
+        let localTop = min(nProbes, SeedlessMetal.flashTopKChunk)
+        let nCand = nChunks * localTop
+        candScoresBuf = device.makeBuffer(
+            length: nCand * MemoryLayout<Float>.size, options: .storageModeShared)!
+        candIndsBuf = device.makeBuffer(
+            length: nCand * MemoryLayout<Int32>.size, options: .storageModeShared)!
         topScratch = Array(repeating: 0, count: nClusters)
+        lastTopClusters = Array(repeating: 0, count: nProbes)
         forceRows = forceFlat
     }
 
@@ -106,16 +127,43 @@ public final class SeedlessFlashHead {
             into: enc, w: centroidsBuf, x: h, y: scoresBuf, E: nClusters, H: H)
     }
 
+    /// Hierarchical GPU top-k + gather into the current encoder (no extra CB).
+    public func encodeFusedAfterCentroids(into enc: MTLComputeCommandEncoder, h: MTLBuffer) {
+        SeedlessMetal.encodeFlashTopK(
+            into: enc, scores: scoresBuf, inds: indsBuf,
+            candScores: candScoresBuf, candInds: candIndsBuf,
+            E: nClusters, K: nProbes)
+        SeedlessMetal.encodeQmm4Gather(
+            into: enc,
+            w: headWBuf, scales: headSBuf, biases: headBBuf, x: h,
+            inds: indsBuf, y: logitsBuf,
+            nProbes: nProbes, N: clusterSize, K: H, gs: headGroupSize)
+    }
+
+    /// After fused layer CB wait: read inds+logits, argmax, force tokens.
+    public func greedyAfterFusedGather(hostH: UnsafePointer<Float16>) -> Int {
+        let ip = indsBuf.contents().bindMemory(to: Int32.self, capacity: nProbes)
+        for i in 0 ..< nProbes { lastTopClusters[i] = Int(ip[i]) }
+        return argmaxWithForce(topClusters: lastTopClusters, hostH: hostH)
+    }
+
     /// After layer CB wait (centroids ready): CPU top-k → Metal gather → argmax.
+    /// Set `MOMIJ_FLASH_PROFILE=1` to print per-phase ms (first few calls).
     public func greedyAfterCentroids(hBuf: MTLBuffer, hostH: UnsafePointer<Float16>) -> Int {
+        let profile = ProcessInfo.processInfo.environment["MOMIJ_FLASH_PROFILE"] == "1"
+        var tTop = 0.0, tArgmax = 0.0, tForce = 0.0
+        let t0 = profile ? CFAbsoluteTimeGetCurrent() : 0
+
         let scores = scoresBuf.contents().bindMemory(to: Float.self, capacity: nClusters)
         for i in 0 ..< nClusters { topScratch[i] = i }
         topScratch.select(nProbes, sortedBy: { scores[$0] < scores[$1] })
         let topClusters = Array(topScratch.suffix(nProbes))
         let ip = indsBuf.contents().bindMemory(to: Int32.self, capacity: nProbes)
         for (j, idx) in topClusters.enumerated() { ip[j] = Int32(idx) }
+        if profile { tTop = (CFAbsoluteTimeGetCurrent() - t0) * 1000 }
 
         guard let q = SeedlessMetal.queue else { return 0 }
+        let t1 = profile ? CFAbsoluteTimeGetCurrent() : 0
         let cb = q.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
         SeedlessMetal.encodeQmm4Gather(
@@ -124,9 +172,61 @@ public final class SeedlessFlashHead {
             inds: indsBuf, y: logitsBuf,
             nProbes: nProbes, N: clusterSize, K: H, gs: headGroupSize)
         enc.endEncoding()
+        var tEnc = 0.0, tCommit = 0.0
+        if profile { tEnc = (CFAbsoluteTimeGetCurrent() - t1) * 1000 }
+        let tC0 = profile ? CFAbsoluteTimeGetCurrent() : 0
         cb.commit()
+        if profile { tCommit = (CFAbsoluteTimeGetCurrent() - tC0) * 1000 }
+        // Overlap force-token dots with gather GPU (CPU top-k stays host-side).
+        var forceBestId = -1
+        var forceBestScore = -Float.infinity
+        let tF0 = profile ? CFAbsoluteTimeGetCurrent() : 0
+        if !forceIds.isEmpty {
+            for fi in 0 ..< forceIds.count {
+                var dot: Float = 0
+                let base = fi * H
+                for k in 0 ..< H {
+                    dot += Float(hostH[k]) * Float(forceRows[base + k])
+                }
+                if dot > forceBestScore {
+                    forceBestScore = dot
+                    forceBestId = forceIds[fi]
+                }
+            }
+        }
+        if profile { tForce = (CFAbsoluteTimeGetCurrent() - tF0) * 1000 }
+        let tW0 = profile ? CFAbsoluteTimeGetCurrent() : 0
         cb.waitUntilCompleted()
+        var tWait = 0.0, tGatherGpu = 0.0
+        if profile {
+            tWait = (CFAbsoluteTimeGetCurrent() - tW0) * 1000
+            if cb.gpuEndTime > cb.gpuStartTime {
+                tGatherGpu = (cb.gpuEndTime - cb.gpuStartTime) * 1000
+            }
+        }
 
+        let t2 = profile ? CFAbsoluteTimeGetCurrent() : 0
+        let id = argmaxWithForce(
+            topClusters: topClusters, hostH: hostH,
+            forceBestId: forceBestId, forceBestScore: forceBestScore)
+        if profile {
+            tArgmax = (CFAbsoluteTimeGetCurrent() - t2) * 1000
+            enum FlashProfGate {
+                nonisolated(unsafe) static var n = 0
+            }
+            if FlashProfGate.n < 8 {
+                FlashProfGate.n += 1
+                print(String(format: "[flash] top=%.3f enc=%.3f commit=%.3f wait=%.3f gpu=%.3f force=%.3f argmax=%.3f",
+                             tTop, tEnc, tCommit, tWait, tGatherGpu, tForce, tArgmax))
+            }
+        }
+        return id
+    }
+
+    private func argmaxWithForce(
+        topClusters: [Int], hostH: UnsafePointer<Float16>,
+        forceBestId: Int = -1, forceBestScore: Float = -Float.infinity
+    ) -> Int {
         let nLogits = nProbes * clusterSize
         let lp = logitsBuf.contents().bindMemory(to: Float.self, capacity: nLogits)
         var bestScore = -Float.infinity
@@ -139,18 +239,23 @@ public final class SeedlessFlashHead {
         let row = bestLocal % clusterSize
         var bestId = Int(tokenMapHost[topClusters[probe] * clusterSize + row])
 
-        if !forceIds.isEmpty {
+        var fId = forceBestId
+        var fScore = forceBestScore
+        if fId < 0, !forceIds.isEmpty {
             for fi in 0 ..< forceIds.count {
                 var dot: Float = 0
                 let base = fi * H
                 for k in 0 ..< H {
                     dot += Float(hostH[k]) * Float(forceRows[base + k])
                 }
-                if dot > bestScore {
-                    bestScore = dot
-                    bestId = forceIds[fi]
+                if dot > fScore {
+                    fScore = dot
+                    fId = forceIds[fi]
                 }
             }
+        }
+        if fId >= 0, fScore > bestScore {
+            bestId = fId
         }
         return bestId
     }

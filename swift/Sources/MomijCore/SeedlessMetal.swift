@@ -20,6 +20,8 @@ public enum SeedlessMetal {
     nonisolated(unsafe) static var gateGemvPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var batchedGemvPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var qmm4GatherPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var flashTopKChunkPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var flashTopKMergePipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var routeTop8Pipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var qkNormRopePipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var writeKVPipeline: MTLComputePipelineState?
@@ -51,6 +53,8 @@ public enum SeedlessMetal {
         gateGemvPipeline = try pipe("maple_gate_gemv")
         batchedGemvPipeline = try pipe("maple_batched_gemv")
         qmm4GatherPipeline = try pipe("maple_qmm4_gather")
+        flashTopKChunkPipeline = try pipe("maple_flash_topk_chunk")
+        flashTopKMergePipeline = try pipe("maple_flash_topk_merge")
         routeTop8Pipeline = try pipe("maple_route_top8")
         qkNormRopePipeline = try pipe("maple_qk_norm_rope")
         writeKVPipeline = try pipe("maple_write_kv")
@@ -571,6 +575,43 @@ public enum SeedlessMetal {
             threadsPerThreadgroup: MTLSize(width: N * 32, height: 1, depth: 1))
     }
 
+    /// Hierarchical FlashHead top-k: chunk local tops → merge.
+    /// `localTop` must be ≥ K for worst-case correctness (all top-K in one chunk).
+    static let flashTopKChunk = 256
+
+    static func encodeFlashTopK(
+        into enc: MTLComputeCommandEncoder,
+        scores: MTLBuffer, inds: MTLBuffer,
+        candScores: MTLBuffer, candInds: MTLBuffer,
+        E: Int, K: Int
+    ) {
+        let localTop = min(K, flashTopKChunk)
+        let nChunks = (E + flashTopKChunk - 1) / flashTopKChunk
+        var e32 = Int32(E), k32 = Int32(K)
+        var chunk = Int32(flashTopKChunk), local = Int32(localTop)
+        enc.setComputePipelineState(flashTopKChunkPipeline!)
+        enc.setBuffer(scores, offset: 0, index: 0)
+        enc.setBuffer(candScores, offset: 0, index: 1)
+        enc.setBuffer(candInds, offset: 0, index: 2)
+        enc.setBytes(&e32, length: 4, index: 3)
+        enc.setBytes(&chunk, length: 4, index: 4)
+        enc.setBytes(&local, length: 4, index: 5)
+        enc.dispatchThreadgroups(
+            MTLSize(width: nChunks, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: flashTopKChunk, height: 1, depth: 1))
+
+        var nCand = Int32(nChunks * localTop)
+        enc.setComputePipelineState(flashTopKMergePipeline!)
+        enc.setBuffer(candScores, offset: 0, index: 0)
+        enc.setBuffer(candInds, offset: 0, index: 1)
+        enc.setBuffer(inds, offset: 0, index: 2)
+        enc.setBytes(&nCand, length: 4, index: 3)
+        enc.setBytes(&k32, length: 4, index: 4)
+        enc.dispatchThreadgroups(
+            MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
     static func encodeRoute(
         into enc: MTLComputeCommandEncoder, logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
         E: Int, Ktop: Int
@@ -981,6 +1022,90 @@ public enum SeedlessMetal {
         }
         acc = simd_sum(acc);
         if (simd_lid == 0) y[probe * (uint)N + row] = acc;
+    }
+
+    // FlashHead top-k stage 1: each chunk (256) emits LOCAL local maxima (masked).
+    // Serial rounds only over the chunk — not over full E — so cost is O(LOCAL * chunk).
+    kernel void maple_flash_topk_chunk(
+        device const float* scores [[buffer(0)]],
+        device float* candScores [[buffer(1)]],
+        device int* candInds [[buffer(2)]],
+        constant int& E [[buffer(3)]],
+        constant int& chunk [[buffer(4)]],
+        constant int& localTop [[buffer(5)]],
+        uint cid [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint tgs [[threads_per_threadgroup]])
+    {
+        threadgroup float red[256];
+        threadgroup int redi[256];
+        threadgroup float work[256];
+        int base = int(cid) * chunk;
+        int idx = base + int(tid);
+        float v = (idx < E) ? scores[idx] : -INFINITY;
+        work[tid] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int p = 0; p < localTop; ++p) {
+            red[tid] = work[tid];
+            redi[tid] = (idx < E) ? idx : -1;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs / 2; s > 0; s >>= 1) {
+                if (tid < s) {
+                    if (red[tid + s] > red[tid]) {
+                        red[tid] = red[tid + s];
+                        redi[tid] = redi[tid + s];
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) {
+                candScores[cid * (uint)localTop + (uint)p] = red[0];
+                candInds[cid * (uint)localTop + (uint)p] = redi[0];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (redi[0] == idx) work[tid] = -INFINITY;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // FlashHead top-k stage 2: merge candidates → K inds (serial K over tiny nCand).
+    kernel void maple_flash_topk_merge(
+        device float* candScores [[buffer(0)]],
+        device int* candInds [[buffer(1)]],
+        device int* inds [[buffer(2)]],
+        constant int& nCand [[buffer(3)]],
+        constant int& K [[buffer(4)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint tgs [[threads_per_threadgroup]])
+    {
+        threadgroup float red[256];
+        threadgroup int redi[256];
+        for (int p = 0; p < K; ++p) {
+            float best = -INFINITY;
+            int besti = -1;
+            for (uint i = tid; i < (uint)nCand; i += tgs) {
+                float v = candScores[i];
+                if (v > best) { best = v; besti = candInds[i]; }
+            }
+            red[tid] = best;
+            redi[tid] = besti;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs / 2; s > 0; s >>= 1) {
+                if (tid < s) {
+                    if (red[tid + s] > red[tid]) {
+                        red[tid] = red[tid + s];
+                        redi[tid] = redi[tid + s];
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) inds[p] = redi[0];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = tid; i < (uint)nCand; i += tgs) {
+                if (candInds[i] == redi[0]) candScores[i] = -INFINITY;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 
     // Softmax + top-K with renorm. E<=256, K<=8. scores are float (for score_reduce).

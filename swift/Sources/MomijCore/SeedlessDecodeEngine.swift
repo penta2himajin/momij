@@ -19,8 +19,10 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     private let lmHead: QuantProj
     private let flashHead: SeedlessFlashHead?
     public let useFlashHead: Bool
-    /// FlashHead cluster probes (env `MOMIJ_FLASH_PROBES`, default 128). 0 if FlashHead off.
+    /// FlashHead cluster probes (env `MOMIJ_FLASH_PROBES`, default 64). 0 if FlashHead off.
     public var flashProbes: Int { flashHead?.nProbes ?? 0 }
+    /// True when `MOMIJ_FLASH_FUSE=1` (topk+gather in layer CB).
+    public var flashFused: Bool { flashHead?.fuseIntoLayerCB ?? false }
     private let finalNormBuf: MTLBuffer
     private let H: Int
 
@@ -90,6 +92,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     private func nextToken() -> Int {
         let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
         if useFlashHead, let fh = flashHead {
+            if fh.fuseIntoLayerCB {
+                return fh.greedyAfterFusedGather(hostH: ptr)
+            }
             return fh.greedyAfterCentroids(hBuf: finalNormBuf, hostH: ptr)
         }
         let h = MLXArray(UnsafeBufferPointer(start: ptr, count: H)).reshaped([H])
@@ -112,6 +117,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 out: finalNormBuf, H: H, eps: config.rmsNormEps)
             if let fh = flashHead {
                 fh.encodeCentroids(into: enc, h: finalNormBuf)
+                if fh.fuseIntoLayerCB {
+                    fh.encodeFusedAfterCentroids(into: enc, h: finalNormBuf)
+                }
             }
         }
         let t2 = CFAbsoluteTimeGetCurrent()

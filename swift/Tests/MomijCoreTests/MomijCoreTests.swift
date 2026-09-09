@@ -110,6 +110,42 @@ final class SeedlessMetalTests: XCTestCase {
         XCTAssertLessThan(rel, 1e-3, "rel_l2=\(rel) maxAbs=\(maxAbs)")
     }
 
+    func testFlashTopKMatchesCPUSelect() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let E = 4748, K = 64
+        let nChunks = (E + SeedlessMetal.flashTopKChunk - 1) / SeedlessMetal.flashTopKChunk
+        let localTop = min(K, SeedlessMetal.flashTopKChunk)
+        let nCand = nChunks * localTop
+        let scores = device.makeBuffer(length: E * 4, options: .storageModeShared)!
+        let inds = device.makeBuffer(length: K * 4, options: .storageModeShared)!
+        let candS = device.makeBuffer(length: nCand * 4, options: .storageModeShared)!
+        let candI = device.makeBuffer(length: nCand * 4, options: .storageModeShared)!
+        let sp = scores.contents().bindMemory(to: Float.self, capacity: E)
+        // Adversarial: put the global top-K entirely in chunk 0.
+        for i in 0 ..< E { sp[i] = Float(i) * 1e-6 }
+        for i in 0 ..< K { sp[i] = 1000.0 + Float(K - i) }
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        SeedlessMetal.encodeFlashTopK(
+            into: enc, scores: scores, inds: inds,
+            candScores: candS, candInds: candI, E: E, K: K)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        var order = Array(0 ..< E)
+        order.sort { sp[$0] > sp[$1] }
+        let want = Set(order.prefix(K))
+        let ip = inds.contents().bindMemory(to: Int32.self, capacity: K)
+        var got = Set<Int>()
+        for i in 0 ..< K { got.insert(Int(ip[i])) }
+        XCTAssertEqual(got, want, "GPU hierarchical top-k must match CPU top-\(K)")
+    }
+
     func testMoEBlockOneCBCompilesAndRuns() throws {
         try SeedlessMetal.ensureCompiled()
         XCTAssertTrue(SeedlessMetal.ready)

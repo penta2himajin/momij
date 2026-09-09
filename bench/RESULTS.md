@@ -150,6 +150,19 @@ Lessons:
 2. up→SwiGLU fusion helps isolated expert throughput; e2e layers+attn prefer the lighter two-dispatch path.
 3. **~200 gen tok/s** is reachable on this machine without enabling the fused up kernel.
 
+## 2026-09-09 FlashHead B: kill second-wait tax
+
+Profile of separate gather CB (probes=96): CPU top-k ~0.07 ms, gather **GPU ~0.08 ms**, gather **wait wall ~0.35 ms** (commit/wait tax dominates). Force-token overlap is negligible (3 tokens).
+
+**Fix (default on):** hierarchical GPU top-k (`maple_flash_topk_chunk` → `merge`, `localTop=K` for worst-case correctness) + `qmm4` gather encoded **into the layer CB** after centroids. Env: `MOMIJ_FLASH_FUSE=0` to restore CPU top-k + second CB. Default probes **64** (`MOMIJ_FLASH_PROBES`).
+
+| Config | gen tok/s | layers ms | head ms |
+|---|---|---|---|
+| fuse on (default), probes=64 | **~187–209** | ~4.8–5.3 | **~0.014** |
+| fuse off, probes=64 | ~177–185 | ~4.8–5.0 | ~0.57–0.66 |
+
+Not the failed serial full-E×K top-k. Chunk serial rounds are only over 256, merge over ~nChunks×K candidates. Unit-tested incl. adversarial “all top-K in chunk 0”.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

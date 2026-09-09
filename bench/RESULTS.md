@@ -255,6 +255,18 @@ A/B `maple_gate_gemv` (256-TG reduce) vs `maple_batched_gemv` (1 simdgroup/row).
 
 Env: `MOMIJ_GATE_SIMD=0` restores TG path. Next: MoE `gqmm2` (up/down) without TG-cache / split-K.
 
+## 2026-09-10 gqmm2_rows_vec — no-go
+
+Tried vectorized `half4` x-load + `uint32` weight pack (`gqmm2_rows_vec`), parity OK.
+
+| Probe | stock | vec |
+|---|---|---|
+| gqmm2 micro | ~3.5k kernel/s | **~2.8k worse** |
+| 24L commit→1w GPU | ~5.05 ms | **~5.67 ms worse** |
+| e2e p128 | ~184 | **~170–178 regress** |
+
+Not shipped (removed from metallib). Same family as PF: micro/load tricks do not raise the packed MoE floor. Remaining MoE levers need a different angle (layout / fewer bytes / Qwisp diff), not load vectorization.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

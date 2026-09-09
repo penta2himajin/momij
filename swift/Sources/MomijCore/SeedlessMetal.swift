@@ -9,7 +9,7 @@ import MLX
 /// down gather → score reduce on one command buffer. Optional `gqmm2_up_swiglu`
 /// (`MOMIJ_FUSE_UP_SWIGLU=1`) fuses the first two; default keeps them separate (faster e2e).
 /// Experimental (default off): `MOMIJ_GQMM2_SPLITK=1` (micro↑ e2e↓), `MOMIJ_GQMM2_W16=1` (mild).
-/// Inner-K software pipeline (`gqmm2_rows_pf`) measured regress on packed CB — not shipped.
+/// `gqmm2_rows_vec` (vectorized loads) and `gqmm2_rows_pf` measured packed-CB regress — not shipped.
 public enum SeedlessMetal {
     nonisolated(unsafe) static var device: MTLDevice?
     nonisolated(unsafe) static var queue: MTLCommandQueue?

@@ -25,6 +25,12 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     public var flashFused: Bool { flashHead?.fuseIntoLayerCB ?? false }
     private let finalNormBuf: MTLBuffer
     private let H: Int
+    /// Max chained verify feeds (draftK+1). Env `MOMIJ_SPEC_MAX_M`, default 9.
+    private let specMaxM: Int
+    private var specFeedIds: MTLBuffer?
+    private var specNormSlots: [MTLBuffer] = []
+    private var specIndsSlots: [MTLBuffer] = []
+    private var specLogitsSlots: [MTLBuffer] = []
 
     public struct PhaseMs: Sendable {
         public var embed = 0.0
@@ -79,6 +85,66 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         embBuf = ebuf
         normWBuf = nbuf
         finalNormBuf = device.makeBuffer(length: H * 2, options: .storageModeShared)!
+        let envM = ProcessInfo.processInfo.environment["MOMIJ_SPEC_MAX_M"].flatMap(Int.init)
+        specMaxM = max(2, envM ?? 9)
+    }
+
+    private func ensureSpecSlots() {
+        guard specFeedIds == nil, let device = SeedlessMetal.device, let fh = flashHead else { return }
+        specFeedIds = device.makeBuffer(length: specMaxM * 4, options: .storageModeShared)
+        let logitBytes = fh.nProbes * fh.clusterSize * MemoryLayout<Float>.size
+        for _ in 0 ..< specMaxM {
+            specNormSlots.append(device.makeBuffer(length: H * 2, options: .storageModeShared)!)
+            specIndsSlots.append(device.makeBuffer(length: fh.nProbes * 4, options: .storageModeShared)!)
+            specLogitsSlots.append(device.makeBuffer(length: logitBytes, options: .storageModeShared)!)
+        }
+    }
+
+    /// C2: draft-driven chain verify in **one CB / one wait** (GPU embed; Qwisp chained style).
+    /// `feeds` = [y] + draft (length D+1). Returns greedy evals[0..<feeds.count].
+    public func stepChainFeeds(_ feeds: [Int]) throws -> [Int] {
+        precondition(!feeds.isEmpty && feeds.count <= specMaxM)
+        guard useFlashHead, let fh = flashHead, fh.fuseIntoLayerCB else {
+            // Fallback: sequential steps.
+            var out: [Int] = []
+            for t in feeds { out.append(try step(t)) }
+            return out
+        }
+        ensureSpecSlots()
+        guard let q = SeedlessMetal.queue, let feedBuf = specFeedIds else {
+            throw SeedlessError.notReady
+        }
+        let ip = feedBuf.contents().bindMemory(to: Int32.self, capacity: feeds.count)
+        for (i, t) in feeds.enumerated() { ip[i] = Int32(t) }
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        for i in 0 ..< feeds.count {
+            SeedlessMetal.encodeEmbedToken(
+                into: enc, table: embBuf, ids: feedBuf, out: stack.hBuf, H: H, row: i)
+            for layer in stack.layers {
+                try layer.encodeStep(into: enc)
+            }
+            let norm = specNormSlots[i]
+            let inds = specIndsSlots[i]
+            let logits = specLogitsSlots[i]
+            SeedlessMetal.encodeRms(
+                into: enc, h: stack.hBuf, w: normWBuf, out: norm, H: H, eps: config.rmsNormEps)
+            fh.encodeCentroids(into: enc, h: norm)
+            fh.encodeFusedAfterCentroids(into: enc, h: norm, inds: inds, logits: logits)
+        }
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        var evals: [Int] = []
+        evals.reserveCapacity(feeds.count)
+        for i in 0 ..< feeds.count {
+            let ptr = specNormSlots[i].contents().bindMemory(to: Float16.self, capacity: H)
+            evals.append(fh.greedyAfterFusedGather(
+                hostH: ptr, inds: specIndsSlots[i], logits: specLogitsSlots[i]))
+        }
+        return evals
     }
 
     public func reset() { stack.resetCaches() }
@@ -239,9 +305,74 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         let g = greedyTps.reduce(0, +) / Double(trials)
         let s = specTps.reduce(0, +) / Double(trials)
         let aps = att > 0 ? Double(acc) / Double(att) : 0
-        return String(
+        let base = String(
             format: "suffix-spec bench (repeat-motif, draftK=%d, n=%d): greedy=%.1f tok/s  spec=%.1f tok/s  accept/attempt=%.2f  attempts=%d gated=%d  lossless=%@",
             draftK, trials, g, s, aps, att, gat, equal ? "true" : "false")
+        let chain = (try? benchmarkChainVerify(steps: 8, trials: 5)) ?? ""
+        return base + (chain.isEmpty ? "" : "\n" + chain)
+    }
+
+    /// Forced full-accept path: same feeds via sequential steps vs one-CB chain.
+    public func benchmarkChainVerify(steps: Int = 8, trials: Int = 5) throws -> String {
+        guard useFlashHead, flashFused else {
+            return "chain-verify: skipped (need FlashHead fuse)"
+        }
+        let K = min(steps, specMaxM)
+        let prompt = Array(repeating: 100, count: 64)
+        _ = try generate(prompt: prompt, maxTokens: 4, eos: nil)
+
+        var seqTps: [Double] = []
+        var chainTps: [Double] = []
+        var match = true
+        for _ in 0 ..< trials {
+            reset()
+            var last = prompt[0]
+            for i in 0 ..< prompt.count {
+                if i + 1 < prompt.count { _ = try step(prompt[i]) }
+                else { last = try step(prompt[i]) }
+            }
+            // Build greedy chain feeds: embed last → o0; embed o0 → o1; ...
+            var feeds: [Int] = [last]
+            var cur = last
+            var expected: [Int] = []
+            for i in 0 ..< K {
+                let q = try step(cur)
+                expected.append(q)
+                cur = q
+                if i + 1 < K { feeds.append(q) }
+            }
+            let snapFeeds = feeds
+            let snapExpected = expected
+
+            // Rewind to post-prefill: re-prefill cleanly
+            reset()
+            last = prompt[0]
+            for i in 0 ..< prompt.count {
+                if i + 1 < prompt.count { _ = try step(prompt[i]) }
+                else { last = try step(prompt[i]) }
+            }
+            let snap = stack.snapshotCaches()
+
+            let t0 = CFAbsoluteTimeGetCurrent()
+            cur = last
+            var seq2: [Int] = []
+            for _ in 0 ..< K {
+                let q = try step(cur)
+                seq2.append(q)
+                cur = q
+            }
+            seqTps.append(Double(K) / max(CFAbsoluteTimeGetCurrent() - t0, 1e-9))
+
+            stack.restoreCaches(snap)
+            let t1 = CFAbsoluteTimeGetCurrent()
+            let chainOut = try stepChainFeeds(snapFeeds)
+            chainTps.append(Double(K) / max(CFAbsoluteTimeGetCurrent() - t1, 1e-9))
+            if chainOut != seq2 || chainOut != snapExpected { match = false }
+        }
+        let s = seqTps.reduce(0, +) / Double(trials)
+        let c = chainTps.reduce(0, +) / Double(trials)
+        return String(format: "chain-verify K=%d: sequential=%.1f tok/s  chain1cb=%.1f tok/s  match=%@  speedup=%.2fx",
+                      K, s, c, match ? "true" : "false", c / max(s, 1e-9))
     }
 
     /// Prefill already done; `first` is the first generated token; `promptIds` is the prompt.
@@ -257,12 +388,16 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         var gated = 0
         var acceptWindow: [Int] = []
         let gateOn = ProcessInfo.processInfo.environment["MOMIJ_SPEC_GATE"] != "0"
+        // Chain verify costs ~D forwards; only use when drafts have been landing.
+        let batchEnv = ProcessInfo.processInfo.environment["MOMIJ_SPEC_BATCH"]
+        let batchForce = batchEnv == "1"
+        let batchOff = batchEnv == "0"
         let gateWindow = 8
 
         while out.count < maxTokens {
             if let eos, y == eos { break }
             let remain = maxTokens - out.count
-            let draft = SuffixSpec.suffixDraft(history: ids, k: min(draftK, remain))
+            let draft = SuffixSpec.suffixDraft(history: ids, k: min(draftK, remain, specMaxM - 1))
             let meanAccept = acceptWindow.isEmpty ? 1.0
                 : Double(acceptWindow.reduce(0, +)) / Double(acceptWindow.count)
             let suspend = gateOn && acceptWindow.count >= gateWindow && meanAccept < 1.0
@@ -276,27 +411,71 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             }
 
             attempts += 1
-            var accepted = 0
-            var cur = y
-            for d in draft {
-                let q = try step(cur)
-                out.append(q)
-                ids.append(q)
-                y = q
-                if q == d {
-                    accepted += 1
-                    cur = q
-                    if let eos, q == eos { break }
-                    if out.count >= maxTokens { break }
-                } else {
-                    break
+            let useBatch = !batchOff && useFlashHead && flashFused
+                && (batchForce || meanAccept >= 1.5)
+            let accepted: Int
+            if useBatch {
+                let r = try verifyDraftChain(y: y, draft: draft)
+                accepted = r.accepted
+                if accepted > 0 {
+                    let chunk = Array(draft.prefix(accepted))
+                    out.append(contentsOf: chunk)
+                    ids.append(contentsOf: chunk)
                 }
+                y = r.next
+                out.append(y)
+                ids.append(y)
+            } else {
+                var acc = 0
+                var cur = y
+                for d in draft {
+                    let q = try step(cur)
+                    out.append(q)
+                    ids.append(q)
+                    y = q
+                    if q == d {
+                        acc += 1
+                        cur = q
+                        if let eos, q == eos { break }
+                        if out.count >= maxTokens { break }
+                    } else {
+                        break
+                    }
+                }
+                accepted = acc
             }
             acceptedTotal += accepted
             acceptWindow.append(accepted)
             if acceptWindow.count > gateWindow { acceptWindow.removeFirst() }
+            if let eos, out.contains(eos) { break }
         }
         return (out, acceptedTotal, attempts, gated)
+    }
+
+    /// Snapshot → one-CB chain verify → restore+replay on partial accept.
+    private func verifyDraftChain(y: Int, draft: [Int]) throws -> (accepted: Int, next: Int) {
+        let feeds = [y] + draft  // M = D+1; evals[i] vs draft[i] for i<D; evals[D] is bonus next
+        let snap = stack.snapshotCaches()
+        let evals = try stepChainFeeds(feeds)
+        var p = 0
+        while p < draft.count, p < evals.count, evals[p] == draft[p] { p += 1 }
+
+        if p == draft.count {
+            // Full accept: KV already at post-M; next = bonus token.
+            return (draft.count, evals[draft.count])
+        }
+
+        // Partial / zero accept: roll back and replay accepted prefix only.
+        stack.restoreCaches(snap)
+        if p == 0 {
+            // Single greedy step from y (must match evals[0]).
+            let q = try step(y)
+            return (0, q)
+        }
+        let replay = [y] + Array(draft.prefix(p))
+        let revals = try stepChainFeeds(replay)
+        // After replay of p+1 feeds, next mismatch token is evals[p] / revals[p].
+        return (p, revals[p])
     }
 
     public func benchmark(promptTokens: Int, genTokens: Int, trials: Int, profile: Bool = true)

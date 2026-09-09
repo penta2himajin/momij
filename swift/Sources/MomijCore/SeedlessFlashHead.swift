@@ -13,7 +13,7 @@ public final class SeedlessFlashHead {
     let tokenMapHost: [Int32]
     let nClusters: Int
     public let nProbes: Int
-    let clusterSize: Int
+    public let clusterSize: Int
     let headGroupSize: Int
     let H: Int
     /// When true, encode top-k+gather into the layer CB (see `encodeFusedAfterCentroids`).

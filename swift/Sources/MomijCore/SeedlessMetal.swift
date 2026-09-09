@@ -27,6 +27,7 @@ public enum SeedlessMetal {
     nonisolated(unsafe) static var writeKVPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var shiftKVPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var sdpaPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var embedTokenPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var stopBuf: MTLBuffer?
     nonisolated(unsafe) public static var ready = false
 
@@ -60,6 +61,7 @@ public enum SeedlessMetal {
         writeKVPipeline = try pipe("maple_write_kv")
         shiftKVPipeline = try pipe("maple_shift_kv")
         sdpaPipeline = try pipe("maple_sdpa_d128")
+        embedTokenPipeline = try pipe("maple_embed_token")
         ready = true
     }
 
@@ -515,6 +517,23 @@ public enum SeedlessMetal {
         enc.setBytes(&h32, length: 4, index: 4)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
+    /// `out[H] = embTable[ids[row], :]` (GPU gather; safe inside a multi-step CB).
+    static func encodeEmbedToken(
+        into enc: MTLComputeCommandEncoder,
+        table: MTLBuffer, ids: MTLBuffer, out: MTLBuffer,
+        H: Int, row: Int
+    ) {
+        enc.setComputePipelineState(embedTokenPipeline!)
+        enc.setBuffer(table, offset: 0, index: 0)
+        enc.setBuffer(ids, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        var h32 = Int32(H), r32 = Int32(row)
+        enc.setBytes(&h32, length: 4, index: 3)
+        enc.setBytes(&r32, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
     }
 
     static func encodeGate(
@@ -1315,6 +1334,20 @@ public enum SeedlessMetal {
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         if (simd_lid == 0) { for (int i = 0; i < v_per_thread; i++) out[i] = half(o[i]); }
+    }
+
+    // Gather one embedding row: out[H] = table[token, :]
+    kernel void maple_embed_token(
+        device const half* table [[buffer(0)]],
+        device const int* ids [[buffer(1)]],
+        device half* out [[buffer(2)]],
+        constant int& H [[buffer(3)]],
+        constant int& row [[buffer(4)]],
+        uint gid [[thread_position_in_grid]])
+    {
+        if (gid >= (uint)H) return;
+        int tok = ids[row];
+        out[gid] = table[(size_t)tok * (size_t)H + gid];
     }
     """
 }

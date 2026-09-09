@@ -169,8 +169,21 @@ Not the failed serial full-E×K top-k. Chunk serial rounds are only over 256, me
 
 - Early-exit greedy verify + rolling gate (`MOMIJ_SPEC_GATE=0` to disable).
 - Lossless vs greedy (same token stream).
-- Sequential verify **does not beat greedy tok/s** (each accepted token still costs one forward). Peak ≫ greedy needs **batched/parallel verify** (Qwisp Tell style) — deferred as C2.
-- KV snapshot helpers (`snapshotCaches` / `restoreCaches`) landed for a future pipelined verify.
+- Sequential verify **does not beat greedy tok/s** (each accepted token still costs one forward).
+- KV snapshot helpers (`snapshotCaches` / `restoreCaches`) for reject rollback.
+
+## 2026-09-09 SuffixSpec C2 — draft-driven 1-CB chain verify
+
+Not true M-row batched attention (still D+1 serial layer walks inside one CB). Interim = GPU `maple_embed_token` + one commit/wait for the whole chain (`stepChainFeeds` / `verifyDraftChain`).
+
+| Probe (M1 Max, FlashHead fuse, p64/g64) | result |
+|---|---|
+| forced full-accept chain vs sequential | **chain1cb ≈ 201 tok/s** vs seq ≈ 186; **match=true**; **~1.08×** |
+| cold motif drafts (`accept≈0`) with `MOMIJ_SPEC_BATCH=1` | **regress** (~124 vs greedy ~180) — restore+replay tax |
+
+Policy: batch **off by default**; enable only with `MOMIJ_SPEC_BATCH=1` or rolling `meanAccept >= 1.5`. `MOMIJ_SPEC_BATCH=0` forces sequential. `MOMIJ_SPEC_MAX_M` caps feeds (default 9).
+
+True M-row verify still needed for peak ~250; chain mainly amortizes CB wait when drafts hit.
 
 ## Baseline (oracle / mlx-lm-deepgrove)
 

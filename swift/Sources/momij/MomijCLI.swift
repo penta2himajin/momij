@@ -1,0 +1,173 @@
+import Foundation
+import MomijCore
+import Tokenizers
+
+@main
+struct MomijMain {
+    static func main() async {
+        let args = Array(CommandLine.arguments.dropFirst())
+        guard let cmd = args.first else {
+            printUsage()
+            return
+        }
+        do {
+            switch cmd {
+            case "bench":
+                try await runBench(Array(args.dropFirst()))
+            case "serve":
+                try await runServeCmd(Array(args.dropFirst()))
+            case "seedless-bench":
+                try runSeedlessBench(Array(args.dropFirst()))
+            case "generate":
+                try await runGenerate(Array(args.dropFirst()))
+            default:
+                printUsage()
+            }
+        } catch {
+            fputs("error: \(error)\n", stderr)
+            exit(1)
+        }
+    }
+
+    static func printUsage() {
+        print(
+            """
+            momij — Maple-Preview high-speed inference (oMLX replacement)
+
+            Usage:
+              momij bench --model <dir> [--backend mlx|oracle] [--flash-head] [-p 128] [-g 256] [-n 3]
+              momij seedless-bench [--model <dir>]
+              momij generate --model <dir> --prompt <text> [--backend mlx|oracle] [--suffix-spec]
+              momij serve --model <dir> [--backend mlx|oracle] [--port 8742] [--host 127.0.0.1]
+            """
+        )
+    }
+
+    static func flag(_ args: [String], _ name: String) -> String? {
+        guard let i = args.firstIndex(of: name), i + 1 < args.count else { return nil }
+        return args[i + 1]
+    }
+
+    static func has(_ args: [String], _ name: String) -> Bool { args.contains(name) }
+
+    static func defaultModel() -> String {
+        ProcessInfo.processInfo.environment["MOMIJ_MODEL"]
+            ?? NSString("~/models/deepgrove/maple-preview-2bit-mlx").expandingTildeInPath
+    }
+
+    static func runBench(_ args: [String]) async throws {
+        let model = flag(args, "--model") ?? defaultModel()
+        let backend = flag(args, "--backend") ?? "oracle"
+        let p = Int(flag(args, "-p") ?? flag(args, "--prompt-tokens") ?? "128")!
+        let g = Int(flag(args, "-g") ?? flag(args, "--generation-tokens") ?? "256")!
+        let n = Int(flag(args, "-n") ?? flag(args, "--num-trials") ?? "3")!
+        let flash = has(args, "--flash-head")
+
+        if backend == "oracle" {
+            let ob = try OracleBackend(modelDir: model, flashHead: flash)
+            let r = try ob.benchmark(promptTokens: p, genTokens: g, trials: n)
+            print(String(format: "backend=oracle flash_head=%@ prompt_tps=%.3f generation_tps=%.3f peak_memory=%.3f",
+                         flash ? "true" : "false",
+                         r["prompt_tps"] ?? 0, r["generation_tps"] ?? 0, r["peak_memory"] ?? 0))
+        } else {
+            let store = try WeightStore(modelDir: model)
+            let engine = MapleEngine(store: store)
+            let r = engine.benchmark(promptTokens: p, genTokens: g, trials: n)
+            print(String(format: "backend=mlx prompt_tps=%.3f generation_tps=%.3f peak_memory=%.3f",
+                         r.promptTps, r.genTps, r.peakGB))
+        }
+    }
+
+    static func runSeedlessBench(_ args: [String]) throws {
+        let model = flag(args, "--model") ?? defaultModel()
+        try SeedlessMetal.ensureCompiled()
+        let qmv = try SeedlessMetal.benchQmv2(iters: 100)
+        print(String(format: "seedless qmv2 (H=2048→N=512) kernel/s=%.1f", qmv))
+        // E=4 keeps the naive fused kernel in a usable range; full fuse tuning is next.
+        let fused = try SeedlessMetal.benchFusedExpert(E: 4, iters: 20)
+        print(String(format: "seedless fused-expert (E=4,K=8) kernel/s=%.1f", fused))
+        if FileManager.default.fileExists(atPath: model) {
+            do {
+                let store = try WeightStore(modelDir: model)
+                let real = try SeedlessEngine.benchRealExpert(store: store, iters: 10)
+                print(String(format: "seedless fused-expert real-shapes kernel/s=%.1f", real))
+            } catch {
+                fputs("[momij] skip real-weight seedless bind: \(error)\n", stderr)
+            }
+        }
+    }
+
+    static func runGenerate(_ args: [String]) async throws {
+        let model = flag(args, "--model") ?? defaultModel()
+        let backendName = flag(args, "--backend") ?? "oracle"
+        let promptText = flag(args, "--prompt") ?? "Write a haiku about a maple grove."
+        let maxTok = Int(flag(args, "--max-tokens") ?? "64")!
+        let suffix = has(args, "--suffix-spec")
+
+        let tokenizer = try await loadTokenizer(modelDir: model)
+        let ids = try tokenizer.encode(promptText)
+        let opts = GenerateOptions(maxTokens: maxTok, useSuffixSpec: suffix)
+
+        let backend: any LLMBackend
+        if backendName == "mlx" {
+            backend = try MapleMLXBackend(modelDir: model)
+        } else {
+            backend = try OracleBackend(modelDir: model, flashHead: has(args, "--flash-head"))
+        }
+        var out: [Int] = []
+        for try await t in backend.generate(ids, options: opts) {
+            out.append(t)
+            if let s = try? tokenizer.decode([t]) {
+                print(s, terminator: "")
+                fflush(stdout)
+            }
+        }
+        print()
+        print("[momij] tokens=\(out.count)")
+    }
+
+    static func runServeCmd(_ args: [String]) async throws {
+        let model = flag(args, "--model") ?? defaultModel()
+        let backendName = flag(args, "--backend") ?? "oracle"
+        let host = flag(args, "--host") ?? "127.0.0.1"
+        let port = Int(flag(args, "--port") ?? "8742")!
+        let modelID = flag(args, "--model-id") ?? "maple-preview"
+
+        let tokenizer = try await loadTokenizer(modelDir: model)
+        let backend: any LLMBackend
+        if backendName == "mlx" {
+            backend = try MapleMLXBackend(modelDir: model)
+        } else {
+            backend = try OracleBackend(modelDir: model, flashHead: has(args, "--flash-head"))
+        }
+        let engine = MomijHTTP.MomijEngine(tokenizer: tokenizer, backend: backend, modelID: modelID)
+        try await MomijHTTP.runServe(engine: engine, host: host, port: port)
+    }
+
+    static func loadTokenizer(modelDir: String) async throws -> any MomijHTTP.TokenizerAdapter {
+        do {
+            let tok = try await AutoTokenizer.from(modelFolder: URL(fileURLWithPath: modelDir))
+            return HFTokenizer(tok)
+        } catch {
+            fputs("[momij] warning: HF tokenizer load failed (\(error)); using byte fallback\n", stderr)
+            return MomijHTTP.ByteTokenizer()
+        }
+    }
+}
+
+struct HFTokenizer: MomijHTTP.TokenizerAdapter {
+    let inner: any Tokenizer
+    init(_ inner: any Tokenizer) { self.inner = inner }
+    func encode(_ text: String) throws -> [Int] { inner.encode(text: text) }
+    func decode(_ ids: [Int]) throws -> String { inner.decode(tokens: ids) }
+    func applyChatTemplate(_ messages: [MomijHTTP.ChatMessage]) throws -> [Int] {
+        let dicts: [[String: String]] = messages.map {
+            ["role": $0.role, "content": $0.content ?? ""]
+        }
+        if let ids = try? inner.applyChatTemplate(messages: dicts) {
+            return ids
+        }
+        let text = messages.map { "\($0.role): \($0.content ?? "")" }.joined(separator: "\n")
+        return try encode(text)
+    }
+}

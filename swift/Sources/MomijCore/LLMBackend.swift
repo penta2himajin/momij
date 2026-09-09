@@ -1,0 +1,203 @@
+import Foundation
+
+public struct GenerateOptions: Sendable {
+    public var maxTokens: Int = 256
+    public var temperature: Double = 0
+    public var topP: Double = 1
+    public var eosTokenIds: [Int] = [151_645]
+    public var useSuffixSpec: Bool = false
+    public var draftK: Int = 8
+
+    public init(
+        maxTokens: Int = 256, temperature: Double = 0, topP: Double = 1,
+        eosTokenIds: [Int] = [151_645], useSuffixSpec: Bool = false, draftK: Int = 8
+    ) {
+        self.maxTokens = maxTokens
+        self.temperature = temperature
+        self.topP = topP
+        self.eosTokenIds = eosTokenIds
+        self.useSuffixSpec = useSuffixSpec
+        self.draftK = draftK
+    }
+}
+
+public protocol LLMBackend: AnyObject {
+    func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncThrowingStream<Int, Error>
+}
+
+/// MLX Maple greedy backend.
+public final class MapleMLXBackend: LLMBackend, @unchecked Sendable {
+    public let engine: MapleEngine
+
+    public init(modelDir: String) throws {
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        self.engine = MapleEngine(store: store)
+    }
+
+    public init(engine: MapleEngine) {
+        self.engine = engine
+    }
+
+    public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncThrowingStream<Int, Error> {
+        AsyncThrowingStream { cont in
+            Task {
+                do {
+                    let tokens: [Int]
+                    if options.useSuffixSpec {
+                        tokens = try SuffixSpec.run(
+                            prompt: prompt, maxTokens: options.maxTokens,
+                            draftK: options.draftK, eos: options.eosTokenIds.first,
+                            step: { ids in
+                                // Greedy one-step: regenerate from full prefix (correct but slow verify).
+                                // Prefill each time is wasteful; good enough for SuffixSpec wiring.
+                                let out = self.engine.generate(
+                                    prompt: ids, maxTokens: 1, eos: nil)
+                                return out.first
+                            },
+                            multiStep: { ids, k in
+                                self.engine.generate(prompt: ids, maxTokens: k, eos: nil)
+                            })
+                    } else {
+                        tokens = self.engine.generate(
+                            prompt: prompt, maxTokens: options.maxTokens,
+                            eos: options.eosTokenIds.first)
+                    }
+                    for t in tokens { cont.yield(t) }
+                    cont.finish()
+                } catch {
+                    cont.finish(throwing: error)
+                }
+            }
+        }
+    }
+}
+
+/// Oracle backend: long-lived Python mlx-lm-deepgrove worker (JSONL).
+public final class OracleBackend: LLMBackend, @unchecked Sendable {
+    private let process: Process
+    private let stdinPipe: Pipe
+    private let stdoutPipe: Pipe
+    private let lock = NSLock()
+
+    public init(
+        modelDir: String,
+        python: String = "/Users/penta2himajin/repos/mlx-lm-deepgrove/.venv/bin/python",
+        worker: String? = nil,
+        flashHead: Bool = false
+    ) throws {
+        let workerPath: String
+        if let worker {
+            workerPath = worker
+        } else {
+            // LLMBackend.swift lives at <repo>/swift/Sources/MomijCore/
+            var dir = URL(fileURLWithPath: #filePath)
+            for _ in 0 ..< 4 { dir = dir.deletingLastPathComponent() }
+            workerPath = dir.appendingPathComponent("python/momij_oracle/worker.py").path
+        }
+        guard FileManager.default.fileExists(atPath: workerPath) else {
+            throw OracleError.remote("worker not found at \(workerPath)")
+        }
+        guard FileManager.default.isExecutableFile(atPath: python)
+                || FileManager.default.fileExists(atPath: python) else {
+            throw OracleError.remote("python not found at \(python)")
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: python)
+        var args = [workerPath, "--model", modelDir]
+        if flashHead { args.append("--flash-head") }
+        p.arguments = args
+        let inn = Pipe(), out = Pipe()
+        p.standardInput = inn
+        p.standardOutput = out
+        p.standardError = FileHandle.standardError
+        try p.run()
+        self.process = p
+        self.stdinPipe = inn
+        self.stdoutPipe = out
+        // wait ready
+        guard let line = readLine(), line.contains("ready") else {
+            throw OracleError.notReady
+        }
+    }
+
+    deinit {
+        if process.isRunning {
+            process.terminate()
+        }
+    }
+
+    private func readLine() -> String? {
+        var data = Data()
+        let handle = stdoutPipe.fileHandleForReading
+        while true {
+            let chunk = handle.readData(ofLength: 1)
+            if chunk.isEmpty { return nil }
+            if chunk[0] == UInt8(ascii: "\n") { break }
+            data.append(chunk)
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func request(_ obj: [String: Any]) throws -> [String: Any] {
+        lock.lock(); defer { lock.unlock() }
+        let data = try JSONSerialization.data(withJSONObject: obj)
+        stdinPipe.fileHandleForWriting.write(data)
+        stdinPipe.fileHandleForWriting.write(Data("\n".utf8))
+        guard let line = readLine(),
+              let resp = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        else { throw OracleError.badResponse }
+        if let err = resp["error"] as? String { throw OracleError.remote(err) }
+        return resp
+    }
+
+    public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncThrowingStream<Int, Error> {
+        AsyncThrowingStream { cont in
+            Task {
+                do {
+                    var body: [String: Any] = [
+                        "cmd": "generate",
+                        "prompt": prompt,
+                        "max_tokens": options.maxTokens,
+                        "temperature": options.temperature,
+                    ]
+                    if options.useSuffixSpec {
+                        body["suffix_spec"] = true
+                        body["draft_k"] = options.draftK
+                    }
+                    let resp = try self.request(body)
+                    let tokens = (resp["tokens"] as? [Int]) ?? []
+                    for t in tokens { cont.yield(t) }
+                    cont.finish()
+                } catch {
+                    cont.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    public func benchmark(promptTokens: Int, genTokens: Int, trials: Int) throws -> [String: Double] {
+        let resp = try request([
+            "cmd": "benchmark",
+            "prompt_tokens": promptTokens,
+            "generation_tokens": genTokens,
+            "num_trials": trials,
+        ])
+        return [
+            "prompt_tps": resp["prompt_tps"] as? Double ?? 0,
+            "generation_tps": resp["generation_tps"] as? Double ?? 0,
+            "peak_memory": resp["peak_memory"] as? Double ?? 0,
+        ]
+    }
+}
+
+public enum OracleError: Error, CustomStringConvertible {
+    case notReady, badResponse, remote(String)
+    public var description: String {
+        switch self {
+        case .notReady: return "oracle worker not ready"
+        case .badResponse: return "oracle bad response"
+        case .remote(let s): return "oracle: \(s)"
+        }
+    }
+}

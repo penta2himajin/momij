@@ -622,11 +622,14 @@ public enum SeedlessMetal {
     }
 
     /// Argmax over FlashHead gathered logits → token id via `tokenMap[inds[p]*C + row]`.
-    /// Writes `ids[outRow]`. No force-token override (CPU can reconcile after wait).
+    /// Optional force-token rows (same rule as CPU `argmaxWithForce`).
     static func encodeFlashArgmaxToken(
         into enc: MTLComputeCommandEncoder,
         logits: MTLBuffer, inds: MTLBuffer, tokenMap: MTLBuffer, ids: MTLBuffer,
-        nProbes: Int, clusterSize: Int, outRow: Int
+        nProbes: Int, clusterSize: Int, outRow: Int,
+        h: MTLBuffer? = nil,
+        forceRows: MTLBuffer? = nil, forceIds: MTLBuffer? = nil,
+        nForce: Int = 0, H: Int = 0
     ) {
         enc.setComputePipelineState(flashArgmaxTokenPipeline!)
         enc.setBuffer(logits, offset: 0, index: 0)
@@ -638,6 +641,13 @@ public enum SeedlessMetal {
         enc.setBytes(&cs, length: 4, index: 5)
         enc.setBytes(&or, length: 4, index: 6)
         enc.setBuffer(stopBuf, offset: 0, index: 7)
+        // Optional force path buffers (dummy when nForce==0 — kernel ignores).
+        enc.setBuffer(h ?? ids, offset: 0, index: 8)
+        enc.setBuffer(forceRows ?? ids, offset: 0, index: 9)
+        enc.setBuffer(forceIds ?? ids, offset: 0, index: 10)
+        var nf = Int32(nForce), h32 = Int32(H)
+        enc.setBytes(&nf, length: 4, index: 11)
+        enc.setBytes(&h32, length: 4, index: 12)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
@@ -1592,7 +1602,7 @@ public enum SeedlessMetal {
         out[gid] = table[(size_t)tok * (size_t)H + gid];
     }
 
-    // FlashHead gather logits → token id (no force-token). One TG reduction.
+    // FlashHead gather logits → token id + optional force-token override. One TG.
     kernel void maple_flash_argmax_token(
         device const float* logits [[buffer(0)]],
         device const int* inds [[buffer(1)]],
@@ -1602,6 +1612,11 @@ public enum SeedlessMetal {
         constant int& clusterSize [[buffer(5)]],
         constant int& outRow [[buffer(6)]],
         device const int* stopFlag [[buffer(7)]],
+        device const half* h [[buffer(8)]],
+        device const half* forceRows [[buffer(9)]],
+        device const int* forceIds [[buffer(10)]],
+        constant int& nForce [[buffer(11)]],
+        constant int& H [[buffer(12)]],
         uint lid [[thread_index_in_threadgroup]],
         uint tptg [[threads_per_threadgroup]])
     {
@@ -1629,10 +1644,23 @@ public enum SeedlessMetal {
         }
         if (lid == 0) {
             int local = tgIdx[0];
+            float bestScore = tgScore[0];
             int probe = local / clusterSize;
             int row = local - probe * clusterSize;
             int cluster = inds[probe];
-            ids[outRow] = tokenMap[(size_t)cluster * (size_t)clusterSize + (size_t)row];
+            int bestId = tokenMap[(size_t)cluster * (size_t)clusterSize + (size_t)row];
+            for (int fi = 0; fi < nForce; fi++) {
+                float dot = 0;
+                size_t base = (size_t)fi * (size_t)H;
+                for (int k = 0; k < H; k++) {
+                    dot += (float)h[k] * (float)forceRows[base + (size_t)k];
+                }
+                if (dot > bestScore) {
+                    bestScore = dot;
+                    bestId = forceIds[fi];
+                }
+            }
+            ids[outRow] = bestId;
         }
     }
     """

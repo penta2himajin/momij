@@ -147,9 +147,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         return evals
     }
 
-    /// Greedy GPU token-feedback chain: K embeds+layers+FlashHead+argmax in **one wait**.
-    /// No force-token override on GPU (EOS force may diverge vs sequential near stop).
-    /// Env driver: `MOMIJ_CHAIN_K` via `generate`.
+    /// Greedy GPU token-feedback chain with **layersPerCB commits** + MTLSharedEvent
+    /// between tokens (CPU encode overlaps GPU; no mega-CB stall). Force-tokens on GPU.
     public func stepGreedyChain(from start: Int, count K: Int) throws -> [Int] {
         precondition(K > 0 && K <= specMaxM)
         guard useFlashHead, let fh = flashHead, fh.fuseIntoLayerCB else {
@@ -162,34 +161,62 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             return out
         }
         ensureSpecSlots()
-        guard let q = SeedlessMetal.queue, let feedBuf = specFeedIds else {
-            throw SeedlessError.notReady
-        }
+        guard let q = SeedlessMetal.queue,
+              let device = SeedlessMetal.device,
+              let feedBuf = specFeedIds,
+              let event = device.makeSharedEvent()
+        else { throw SeedlessError.notReady }
+
         let ip = feedBuf.contents().bindMemory(to: Int32.self, capacity: K + 1)
         ip[0] = Int32(start)
+        let g = max(1, layersPerCB)
+        var lastCB: MTLCommandBuffer?
 
-        let cb = q.makeCommandBuffer()!
-        let enc = cb.makeComputeCommandEncoder()!
-        for i in 0 ..< K {
-            SeedlessMetal.encodeEmbedToken(
-                into: enc, table: embBuf, ids: feedBuf, out: stack.hBuf, H: H, row: i)
-            for layer in stack.layers {
-                try layer.encodeStep(into: enc)
+        for ti in 0 ..< K {
+            var layerIdx = 0
+            var isFirstCB = true
+            while layerIdx < stack.layers.count {
+                let cb = q.makeCommandBuffer()!
+                if isFirstCB, ti > 0 {
+                    // GPU-side wait: previous token's argmax must complete before embed.
+                    cb.encodeWaitForEvent(event, value: UInt64(ti))
+                }
+                let enc = cb.makeComputeCommandEncoder()!
+                if isFirstCB {
+                    SeedlessMetal.encodeEmbedToken(
+                        into: enc, table: embBuf, ids: feedBuf, out: stack.hBuf, H: H, row: ti)
+                }
+                let end = min(layerIdx + g, stack.layers.count)
+                for j in layerIdx ..< end {
+                    try stack.layers[j].encodeStep(into: enc)
+                }
+                let isLast = end == stack.layers.count
+                if isLast {
+                    let norm = specNormSlots[ti]
+                    let inds = specIndsSlots[ti]
+                    let logits = specLogitsSlots[ti]
+                    SeedlessMetal.encodeRms(
+                        into: enc, h: stack.hBuf, w: normWBuf, out: norm,
+                        H: H, eps: config.rmsNormEps)
+                    fh.encodeCentroids(into: enc, h: norm)
+                    fh.encodeFusedAfterCentroids(into: enc, h: norm, inds: inds, logits: logits)
+                    SeedlessMetal.encodeFlashArgmaxToken(
+                        into: enc, logits: logits, inds: inds, tokenMap: fh.tokenMapBuf,
+                        ids: feedBuf, nProbes: fh.nProbes, clusterSize: fh.clusterSize,
+                        outRow: ti + 1, h: norm, forceRows: fh.forceRowsBuf,
+                        forceIds: fh.forceIdsBuf, nForce: fh.forceCount, H: H)
+                }
+                enc.endEncoding()
+                if isLast {
+                    cb.encodeSignalEvent(event, value: UInt64(ti + 1))
+                }
+                cb.commit()
+                lastCB = cb
+                layerIdx = end
+                isFirstCB = false
             }
-            let norm = specNormSlots[i]
-            let inds = specIndsSlots[i]
-            let logits = specLogitsSlots[i]
-            SeedlessMetal.encodeRms(
-                into: enc, h: stack.hBuf, w: normWBuf, out: norm, H: H, eps: config.rmsNormEps)
-            fh.encodeCentroids(into: enc, h: norm)
-            fh.encodeFusedAfterCentroids(into: enc, h: norm, inds: inds, logits: logits)
-            SeedlessMetal.encodeFlashArgmaxToken(
-                into: enc, logits: logits, inds: inds, tokenMap: fh.tokenMapBuf, ids: feedBuf,
-                nProbes: fh.nProbes, clusterSize: fh.clusterSize, outRow: i + 1)
         }
-        enc.endEncoding()
-        cb.commit()
-        cb.waitUntilCompleted()
+        lastCB?.waitUntilCompleted()
 
         var out: [Int] = []
         out.reserveCapacity(K)
@@ -292,11 +319,14 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         return out
     }
 
-    /// Greedy chain length. `MOMIJ_CHAIN_K` (default 0 = off / sequential).
+    /// Greedy chain length. Default **0** (sequential) — event-pipelined chain is
+    /// lossless with force-tokens but slower than seq on p128 (~180 vs ~197).
+    /// Opt-in: `MOMIJ_CHAIN_K=8`.
     public static var envChainK: Int {
-        guard let s = ProcessInfo.processInfo.environment["MOMIJ_CHAIN_K"], let v = Int(s), v > 0
-        else { return 0 }
-        return v
+        if let s = ProcessInfo.processInfo.environment["MOMIJ_CHAIN_K"], let v = Int(s) {
+            return max(0, v)
+        }
+        return 0
     }
 
     /// SuffixSpec decode: free draft from history, early-exit greedy verify.

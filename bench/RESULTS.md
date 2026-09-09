@@ -215,15 +215,20 @@ Not shipped (removed from metallib to avoid bloat). Same lesson as split-K: late
 
 ## 2026-09-10 wall: greedy GPU token-feedback chain
 
-Qwisp II-a style: `maple_flash_argmax_token` writes next id into the feed buffer; K steps = one wait (`stepGreedyChain` / `MOMIJ_CHAIN_K`). No force-token on GPU (short `generate` matched sequential on a Hello/24-tok smoke).
+Qwisp II-a style with force-tokens on GPU + `MTLSharedEvent` between tokens
+(`layersPerCB` commits; no mega-CB). Short `generate` **ALL_MATCH** vs `MOMIJ_CHAIN_K=0`.
 
-| Config (p128/g128, interleaved×3) | gen tok/s |
+| Config (p128/g128, cold interleaved) | gen tok/s |
 |---|---|
-| sequential (default) | ~181–187 (mean **~183**) |
-| `MOMIJ_CHAIN_K=4` | ~165–187 (noisy; mean ~180) |
-| `MOMIJ_CHAIN_K=8` | **~190–198** (mean **~195**) |
+| sequential (default) | **~193–198** |
+| `MOMIJ_CHAIN_K=8` (event-pipelined) | ~180 |
 
-Hits the prior GPU-floor band (~194–198). Default stays sequential; use `MOMIJ_CHAIN_K=8` for wall recovery toward stable ~200. Peak 250 still needs a faster GPU floor (kernel), not more chaining.
+**Not defaulted:** chain is lossless but slower than today’s sequential floor. Mega-CB
+variant previously looked like a win only when seq was ~183; under current ~197 seq it
+regresses (CPU encode stall and/or event/argmax tax). Keep `MOMIJ_CHAIN_K` opt-in.
+
+Stable ~200 is essentially the sequential Seedless path on this machine; peak 250 still
+needs a lower GPU floor (next: per-op layer profile).
 
 ## Baseline (oracle / mlx-lm-deepgrove)
 

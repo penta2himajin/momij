@@ -30,6 +30,9 @@ public final class SeedlessFlashHead {
     let candIndsBuf: MTLBuffer
     /// Device copy of token_map for GPU argmax → token id (greedy chain).
     public let tokenMapBuf: MTLBuffer
+    public let forceIdsBuf: MTLBuffer?
+    public let forceRowsBuf: MTLBuffer?
+    public var forceCount: Int { forceIds.count }
     private var topScratch: [Int]
 
     public init?(store: WeightStore, device: MTLDevice) {
@@ -121,6 +124,22 @@ public final class SeedlessFlashHead {
             length: tmHost.count * MemoryLayout<Int32>.size, options: .storageModeShared)!
         tmHost.withUnsafeBytes { mapBuf.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
         tokenMapBuf = mapBuf
+        if !forceIds.isEmpty {
+            let fib = device.makeBuffer(
+                length: forceIds.count * MemoryLayout<Int32>.size, options: .storageModeShared)!
+            let fip = fib.contents().bindMemory(to: Int32.self, capacity: forceIds.count)
+            for i in 0 ..< forceIds.count { fip[i] = Int32(forceIds[i]) }
+            forceIdsBuf = fib
+            let frb = device.makeBuffer(
+                length: forceFlat.count * MemoryLayout<Float16>.size, options: .storageModeShared)!
+            forceFlat.withUnsafeBytes {
+                frb.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count)
+            }
+            forceRowsBuf = frb
+        } else {
+            forceIdsBuf = nil
+            forceRowsBuf = nil
+        }
         topScratch = Array(repeating: 0, count: nClusters)
         forceRows = forceFlat
     }

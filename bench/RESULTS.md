@@ -6,13 +6,13 @@ M1 Max, AC, omlx stop, p128/g128:
 
 | Step | momij MLX decode tok/s |
 |---|---|
-| Before (baseline of this work) | ~97 |
-| + `asyncEval` token pipeline | ~118 |
-| + fused add+RMSNorm decode | ~123 |
-| + fused Metal router (top-8) | ~136–143 |
-| oracle same day | ~166–188 |
+| Before | ~97 |
+| + asyncEval / fused add-norm / fused router / chunked KV | **~121–143** (run-to-run) |
+| oracle same windows | **~162–188** |
 
-Still ~15–25% behind oracle. Next suspects: remaining graph/dispatch vs `mlx.compile`, QuantizedEmbedding, attention mask path.
+Tried without net gain (or regression): `mlx.compile` on swiglu/aggregate (~20 tok/s), QuantizedEmbedding gather, deep async without per-step `.item()`, fused qkv + qk-norm-rope Metal (no better than split q/k/v on this machine).
+
+Remaining gap ~25%: likely smaller dispatch/fusion differences vs Python mlx-lm graph, not a single missing kernel. Next: compare per-op timelines (Metal capture) or accept ~130 and shift to Seedless 1-CB.
 
 ## 2026-09-09 Phase profile (M1 Max, AC, omlx stop, p64/g32 n=1)
 

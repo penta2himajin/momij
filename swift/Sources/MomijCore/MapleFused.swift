@@ -253,4 +253,74 @@ enum MapleFused {
             outputDTypes: [.int32, .float32, .float32])
         return (outs[0], outs[1])
     }
+
+    nonisolated(unsafe) private static var qkNormRopeKernel: MLXFast.MLXFastKernel?
+
+    /// Decode: per-head RMSNorm + partial RoPE in one dispatch (oracle `maple_qk_norm_rope`).
+    static func qkNormRope(
+        qk: MLXArray, w: MLXArray, invFreq: MLXArray, offset: Int, eps: Float, ropeDim: Int
+    ) -> MLXArray {
+        let kernel: MLXFast.MLXFastKernel
+        if let k = qkNormRopeKernel {
+            kernel = k
+        } else {
+            let source = """
+                uint head = thread_position_in_grid.y;
+                uint lane = thread_position_in_grid.x;
+
+                constexpr int per_lane = HEAD_DIM / 32;
+                const device T_* xh = x + head * HEAD_DIM;
+                const device T_* wh = w + head * HEAD_DIM;
+                device T_* oh = out + head * HEAD_DIM;
+
+                float ss = 0.0f;
+                for (int i = 0; i < per_lane; ++i) {
+                    float v = (float)xh[lane * per_lane + i];
+                    ss += v * v;
+                }
+                ss = simd_sum(ss);
+                float pos = pos_eps[0];
+                float epsv = pos_eps[1];
+                float scale = metal::rsqrt(ss / HEAD_DIM + epsv);
+
+                for (int i = 0; i < per_lane; ++i) {
+                    int j = lane * per_lane + i;
+                    float v = (float)xh[j] * scale * (float)wh[j];
+                    if (ROPE_DIM > 0 && j < ROPE_DIM) {
+                        constexpr int rhalf = ROPE_DIM > 0 ? ROPE_DIM / 2 : 1;
+                        int p = j < rhalf ? j : j - rhalf;
+                        float theta = pos * inv_freq[p];
+                        float c = metal::cos(theta);
+                        float s = metal::sin(theta);
+                        int j2 = j < rhalf ? j + rhalf : j - rhalf;
+                        float u = (float)xh[j2] * scale * (float)wh[j2];
+                        v = j < rhalf ? (v * c - u * s) : (v * c + u * s);
+                    }
+                    oh[j] = (T_)v;
+                }
+            """
+            let k = MLXFast.metalKernel(
+                name: "maple_qk_norm_rope",
+                inputNames: ["x", "w", "inv_freq", "pos_eps"],
+                outputNames: ["out"],
+                source: source)
+            qkNormRopeKernel = k
+            kernel = k
+        }
+        let nHeads = qk.dim(0)
+        let headDim = qk.dim(1)
+        let posEps = MLXArray([Float(offset), eps])
+        let outs = kernel(
+            [qk, w, invFreq, posEps],
+            template: [
+                ("T_", qk.dtype),
+                ("HEAD_DIM", headDim),
+                ("ROPE_DIM", ropeDim),
+            ],
+            grid: (32, nHeads, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [qk.shape],
+            outputDTypes: [qk.dtype])
+        return outs[0]
+    }
 }

@@ -16,12 +16,15 @@ public final class WeightStore: @unchecked Sendable {
         for shard in Set(wm.values).sorted() {
             let m = try loadArrays(url: dir.appendingPathComponent(shard))
             for (k, v) in m {
+                // M1 Max: f16 path measures faster than bf16 for momij MLX (~130 vs ~110).
+                // Seedless Metal also prefers f16 scales. Oracle stays bf16 in Python.
                 arrays[k] = Self.metalF16(v)
             }
         }
         sanitize()
     }
 
+    /// Convert bf16 → f16 only when a raw Metal kernel needs f16 buffers.
     public static func metalF16(_ a: MLXArray) -> MLXArray {
         a.dtype == .bfloat16 ? a.asType(.float16) : a
     }
@@ -61,12 +64,25 @@ public final class WeightStore: @unchecked Sendable {
         }
 
         for l in 0 ..< config.numHiddenLayers {
+            let attn = "model.layers.\(l).self_attn"
+            for suffix in ["weight", "scales", "biases"] {
+                let q = "\(attn).q_proj.\(suffix)"
+                let k = "\(attn).k_proj.\(suffix)"
+                let v = "\(attn).v_proj.\(suffix)"
+                if arrays[q] != nil, arrays[k] != nil, arrays[v] != nil {
+                    arrays["\(attn).qkv_proj.\(suffix)"] =
+                        MLX.concatenated([
+                            arrays.removeValue(forKey: q)!,
+                            arrays.removeValue(forKey: k)!,
+                            arrays.removeValue(forKey: v)!,
+                        ], axis: 0)
+                }
+            }
             let p = "model.layers.\(l).mlp.switch_mlp"
             for suffix in ["weight", "scales", "biases"] {
                 let up = "\(p).up_proj.\(suffix)"
                 let gate = "\(p).gate_proj.\(suffix)"
                 if arrays[up] != nil, arrays[gate] != nil {
-                    // Fuse on expert output axis (axis=1): [E, I, ...] ‖ [E, I, ...] → [E, 2I, ...]
                     arrays["\(p).up_gate_proj.\(suffix)"] =
                         MLX.concatenated([arrays.removeValue(forKey: up)!,
                                           arrays.removeValue(forKey: gate)!], axis: 1)

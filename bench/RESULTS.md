@@ -1,18 +1,19 @@
 # momij bench notes
 
-## 2026-09-09 momij MLX → oracle parity (in progress)
+## 2026-09-09 momij MLX → oracle parity
+
+**Oracle architecture:** MLX lazy graph + fused `mx.fast.metal_kernel` ops + `async_eval` — **not** Seedless 1-CB.
 
 M1 Max, AC, omlx stop, p128/g128:
 
 | Step | momij MLX decode tok/s |
 |---|---|
 | Before | ~97 |
-| + asyncEval / fused add-norm / fused router / chunked KV | **~121–143** (run-to-run) |
-| oracle same windows | **~162–188** |
+| + asyncEval / fused add-norm / fused router / chunked KV | ~121–143 |
+| + fused qkv + qk-norm-rope (oracle maple.py) | **~143–145** (warm) |
+| oracle same windows | **~170–186** |
 
-Tried without net gain (or regression): `mlx.compile` on swiglu/aggregate (~20 tok/s), QuantizedEmbedding gather, deep async without per-step `.item()`, fused qkv + qk-norm-rope Metal (no better than split q/k/v on this machine).
-
-Remaining gap ~25%: likely smaller dispatch/fusion differences vs Python mlx-lm graph, not a single missing kernel. Next: compare per-op timelines (Metal capture) or accept ~130 and shift to Seedless 1-CB.
+Oracle-faithful ports landed; residual **~20–25%**. bf16-as-oracle was **slower** on this Mac (keep f16). `mlx.compile` / QuantizedEmb / deep-async chain regress. Remaining gap looks like Swift vs Python MLX graph fusion — proceed to **Seedless 1-CB** to beat oracle rather than chase the last MLX percent.
 
 ## 2026-09-09 Phase profile (M1 Max, AC, omlx stop, p64/g32 n=1)
 

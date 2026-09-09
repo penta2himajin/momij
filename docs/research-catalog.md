@@ -16,12 +16,12 @@ Phase profile: [bench/RESULTS.md](../bench/RESULTS.md) (2026-09-09).
 
 ## Ordered plan (do in order)
 
-1. **Parity: momij MLX → oracle (~97→~182 tok/s)** — **in progress (~143 vs ~170+)**  
-   Landed: async token pipeline, fused add+RMSNorm, fused Metal router, chunked KV.  
-   Still open: remaining ~15–25% (compile / emb / attn details). Re-measure e2e after each lever.
+1. **Parity: momij MLX → oracle** — **plateau ~143 vs ~180**  
+   Landed oracle maple.py fused path (async, add-norm, router, qkv, qk-norm-rope, chunked KV).  
+   Oracle is **not** 1-CB Seedless. Residual ~20–25% → move to Seedless rather than more MLX glue.
 2. **Drop host-bridged hybrid as the decode hot path**  
    Keep Metal experts for 1-CB; do not ship `MOMIJ_SEEDLESS_MOE` host roundtrip.
-3. **P0 Seedless: full 1-CB decode**  
+3. **P0 Seedless: full 1-CB decode** ← **next**  
    attn + norms + router + experts (+ optional lm_head) in one CB — no mid-layer MLX↔Metal sync.
 4. **Then raise expert/attn kernels** against the 1-CB ceiling (BW ~970 tok/s).
 5. **P1 serve**: SuffixSpec, continuous batch, oMLX drop-in hardening.
@@ -33,8 +33,8 @@ Phase profile: [bench/RESULTS.md](../bench/RESULTS.md) (2026-09-09).
 |---|---|---|
 | Raw Metal 1-CB decode (Seedless) | kernels landed; hybrid host bridge measured-and-rejected for hot path | Qwisp notes/01: GPU ~35% busy = sync floor |
 | Fused ternary expert block | real-weight ~1760 steps/s | faster than oracle switch under sync |
-| MLX exact greedy | `MapleEngine` ~97 tok/s | must close gap to oracle before claiming Seedless wins |
-| Oracle (= mlx-lm-deepgrove) | `OracleBackend` + profile via `MOMIJ_PROFILE_MOE=1` | ~182 tok/s; phase timers in worker |
+| MLX exact greedy | `MapleEngine` ~143 tok/s | oracle-aligned fused kernels; residual vs Python MLX |
+| Oracle (= mlx-lm-deepgrove) | MLX graph + metal_kernel (not 1-CB) | ~182 tok/s |
 
 ## P1 — serve / agentic
 

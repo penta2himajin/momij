@@ -9,7 +9,7 @@ public final class MapleEngine: @unchecked Sendable {
     public let store: WeightStore
     public let config: MapleConfig
     private var layers: [Layer] = []
-    private let embTable: MLXArray  // [V, H] f16, dequantized once
+    private let embTable: MLXArray  // dequantized, checkpoint dtype (bf16)
     private let normW: MLXArray
     private let lmHead: QuantProj
     private var caches: [KVCache] = []
@@ -70,9 +70,7 @@ public final class MapleEngine: @unchecked Sendable {
                 ropeBase: config.ropeTheta,
                 eps: config.rmsNormEps,
                 useRope: config.isSliding(i),
-                qProj: q("\(p).self_attn.q_proj"),
-                kProj: q("\(p).self_attn.k_proj"),
-                vProj: q("\(p).self_attn.v_proj"),
+                qkvProj: q("\(p).self_attn.qkv_proj"),
                 oProj: q("\(p).self_attn.o_proj"),
                 qNorm: store.req("\(p).self_attn.q_norm.weight"),
                 kNorm: store.req("\(p).self_attn.k_norm.weight"))

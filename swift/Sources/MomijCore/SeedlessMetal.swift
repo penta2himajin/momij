@@ -652,10 +652,21 @@ public enum SeedlessMetal {
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
+    /// Dense MoE gate gemv. Default: one simdgroup / row (`maple_batched_gemv`).
+    /// `MOMIJ_GATE_SIMD=0`: legacy 256-thread TG reduce (`maple_gate_gemv`).
+    public static var useGateSimd: Bool {
+        guard let raw = getenv("MOMIJ_GATE_SIMD") else { return true }
+        return String(cString: raw) != "0"
+    }
+
     static func encodeGate(
         into enc: MTLComputeCommandEncoder, w: MTLBuffer, x: MTLBuffer, y: MTLBuffer,
         E: Int, H: Int, threadsPerTG: Int = 256
     ) {
+        if useGateSimd {
+            encodeBatchedGemv(into: enc, w: w, x: x, y: y, E: E, H: H)
+            return
+        }
         enc.setComputePipelineState(gateGemvPipeline!)
         enc.setBuffer(w, offset: 0, index: 0)
         enc.setBuffer(x, offset: 0, index: 1)
@@ -666,6 +677,26 @@ public enum SeedlessMetal {
         let tpt = max(32, min(256, threadsPerTG))
         enc.dispatchThreadgroups(MTLSize(width: E, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: tpt, height: 1, depth: 1))
+    }
+
+    /// Force a specific gate path for tests (`simd: true` → batched; `false` → TG reduce).
+    static func encodeGate(
+        into enc: MTLComputeCommandEncoder, w: MTLBuffer, x: MTLBuffer, y: MTLBuffer,
+        E: Int, H: Int, simd: Bool
+    ) {
+        if simd {
+            encodeBatchedGemv(into: enc, w: w, x: x, y: y, E: E, H: H)
+        } else {
+            enc.setComputePipelineState(gateGemvPipeline!)
+            enc.setBuffer(w, offset: 0, index: 0)
+            enc.setBuffer(x, offset: 0, index: 1)
+            enc.setBuffer(y, offset: 0, index: 2)
+            var e32 = Int32(E), h32 = Int32(H)
+            enc.setBytes(&e32, length: 4, index: 3)
+            enc.setBytes(&h32, length: 4, index: 4)
+            enc.dispatchThreadgroups(MTLSize(width: E, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
     }
 
     /// Dense gemv y[E]=W[E,H]@x[H]. One simdgroup (32 threads) per row — no TG barriers.

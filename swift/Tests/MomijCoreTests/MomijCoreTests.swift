@@ -38,6 +38,45 @@ final class SuffixSpecTests: XCTestCase {
 }
 
 final class SeedlessMetalTests: XCTestCase {
+    func testGateSimdMatchesTGReduce() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let E = 256, H = 2048
+        func fillHalf(_ buf: MTLBuffer) {
+            let n = buf.length / 2
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = Float16((Float(i % 97) - 48.0) * 1e-3) }
+        }
+        let w = device.makeBuffer(length: E * H * 2, options: .storageModeShared)!
+        let x = device.makeBuffer(length: H * 2, options: .storageModeShared)!
+        let y0 = device.makeBuffer(length: E * 4, options: .storageModeShared)!
+        let y1 = device.makeBuffer(length: E * 4, options: .storageModeShared)!
+        fillHalf(w); fillHalf(x)
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        SeedlessMetal.encodeGate(into: enc, w: w, x: x, y: y0, E: E, H: H, simd: false)
+        SeedlessMetal.encodeGate(into: enc, w: w, x: x, y: y1, E: E, H: H, simd: true)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let a = y0.contents().bindMemory(to: Float.self, capacity: E)
+        let b = y1.contents().bindMemory(to: Float.self, capacity: E)
+        var maxAbs: Float = 0
+        var num = 0.0, den = 0.0
+        for i in 0 ..< E {
+            let d = abs(a[i] - b[i])
+            maxAbs = max(maxAbs, d)
+            num += Double(d * d)
+            den += Double(a[i] * a[i])
+        }
+        let rel = sqrt(num / max(den, 1e-30))
+        XCTAssertLessThan(rel, 1e-4, "gate simd vs TG; rel_l2=\(rel) maxAbs=\(maxAbs)")
+    }
+
     func testGqmm2CompilesAndRuns() throws {
         try SeedlessMetal.ensureCompiled()
         let rate = try SeedlessMetal.benchQmv2(iters: 20)

@@ -244,6 +244,17 @@ Rank (when shares are stable): **gqmm2 MoE up/down** and **gate** dominate MoE; 
 
 Implication for peak 250 (~4.0 ms/tok): need ~20% less packed GPU work — focus MoE gather-qmv / gate, not chain or FlashHead.
 
+## 2026-09-10 gate gemv: simd default
+
+A/B `maple_gate_gemv` (256-TG reduce) vs `maple_batched_gemv` (1 simdgroup/row). Parity OK.
+
+| Probe | TG reduce | simd (now default) |
+|---|---|---|
+| 24L commit→1w GPU | ~5.12 ms | **~4.90 ms** (~204 gpu tok/s) |
+| e2e p128 (interleaved) | ~176–182 (noisy) | **~181–183** (steadier) |
+
+Env: `MOMIJ_GATE_SIMD=0` restores TG path. Next: MoE `gqmm2` (up/down) without TG-cache / split-K.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

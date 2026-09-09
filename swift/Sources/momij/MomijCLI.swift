@@ -75,7 +75,9 @@ struct MomijMain {
             let eng = try SeedlessDecodeEngine(store: store, fullMaxLen: fullLen)
             let r = try eng.benchmark(promptTokens: p, genTokens: g, trials: n, profile: true)
             let ph = r.phase
-            print(String(format: "backend=seedless prompt_tps=%.3f generation_tps=%.3f", r.promptTps, r.genTps))
+            print(String(format: "backend=seedless layers_per_cb=%d flash_head=%@ probes=%d prompt_tps=%.3f generation_tps=%.3f",
+                         eng.layersPerCB, eng.useFlashHead ? "true" : "false", eng.flashProbes,
+                         r.promptTps, r.genTps))
             print(String(format: "  phase_ms/tok embed=%.3f layers=%.3f head=%.3f  (sum=%.3f)",
                          ph.embed, ph.layers, ph.head,
                          ph.embed + ph.layers + ph.head))
@@ -112,7 +114,10 @@ struct MomijMain {
                 print(String(format: "seedless moe-block-1cb (L0, rms+gate+top8+experts+resid) blocks/s=%.1f  → ~%.1f tok/s floor @%d layers (no attn)",
                              moe1cb, tokFloor, layers))
                 // Milestone B layer profile is the primary claim; skip MoE-only stack to save RAM/time.
-                print(try SeedlessEngine.profileLayerStack(store: store, iters: 10))
+                print(try SeedlessEngine.profileLayerStack(store: store, iters: 8))
+                if has(args, "--sweep-cb") {
+                    print(try SeedlessDecodeEngine.sweepLayersPerCB(store: store, prompt: 64, gen: 64))
+                }
             } catch {
                 fputs("[momij] skip real-weight seedless bind: \(error)\n", stderr)
             }

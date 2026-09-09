@@ -265,18 +265,25 @@ public final class SeedlessLayerStack {
         for l in layers { l.resetCache() }
     }
 
-    /// Commit each layer CB, wait once on last. Optionally encode `tail` into the last CB.
-    public func stepCommitWait(tail: ((MTLComputeCommandEncoder) -> Void)? = nil) throws {
+    /// Commit layer CBs in groups of `layersPerCB`, wait once on last.
+    /// Optionally encode `tail` into the last CB. `layersPerCB` balances CPU encode vs GPU fill.
+    public func stepCommitWait(layersPerCB: Int = 1, tail: ((MTLComputeCommandEncoder) -> Void)? = nil) throws {
         guard let q = SeedlessMetal.queue else { throw SeedlessError.notReady }
+        let g = max(1, layersPerCB)
         var last: MTLCommandBuffer?
-        for (i, layer) in layers.enumerated() {
+        var i = 0
+        while i < layers.count {
             let cb = q.makeCommandBuffer()!
             let enc = cb.makeComputeCommandEncoder()!
-            try layer.encodeStep(into: enc)
-            if i + 1 == layers.count, let tail { tail(enc) }
+            let end = min(i + g, layers.count)
+            for j in i ..< end {
+                try layers[j].encodeStep(into: enc)
+            }
+            if end == layers.count, let tail { tail(enc) }
             enc.endEncoding()
             cb.commit()
             last = cb
+            i = end
         }
         last?.waitUntilCompleted()
     }

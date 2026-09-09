@@ -117,6 +117,21 @@ Phase ms/tok (seedless gen): embed **0.001** · layers **4.7–4.8** · head(lm_
 
 Bottleneck now: **layers (~80%)** then **lm_head (~20%)**. Embed solved. Gap to oracle ~5% (~0.3 ms/tok). Next levers: faster SDPA/gqmm2 under growing N; Metal/FlashHead for lm_head.
 
+## 2026-09-09 Seedless → 200 tok/s chase (FlashHead Metal)
+
+M1 Max, fans max, omlx stop, p128/g128 n=5. Path: `layersPerCB=4`, FlashHead centroids fused into final CB (`maple_batched_gemv`), CPU top-k, Metal `maple_qmm4_gather` (1 TG/probe).
+
+| Config | gen tok/s | layers ms | head ms |
+|---|---|---|---|
+| seedless probes=96 | **~187** | ~4.87 | ~0.48 |
+| seedless probes=64 | ~182 | ~5.0 | ~0.49 |
+| exact lm_head (no FlashHead) | ~173 | ~4.75 | ~1.03 |
+| oracle (same window) | ~166–171 | — | — |
+
+Head dropped from ~1.2 (exact) / ~0.8 (MLX FlashHead) to **~0.48** via Metal gather. Remaining gap to 200 is **~0.5 ms/tok**, almost all in **layers** (GPU commit→1wait floor ~200–216 tok/s at pos=0; growing KV + encode tax keep e2e layers ~4.9 ms).
+
+Do **not** fuse GPU serial/multi-round top-k into the layer CB (measured regression to ~25–35 tok/s). Next: gqmm2/MoE occupancy, or eliminate the gather CB wait (true single-wait FlashHead with a fast parallel top-k).
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

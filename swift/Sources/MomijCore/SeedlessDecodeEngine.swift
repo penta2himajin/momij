@@ -9,12 +9,18 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     public let store: WeightStore
     public let config: MapleConfig
     public let stack: SeedlessLayerStack
+    /// Layers encoded per Metal command buffer (env `MOMIJ_LAYERS_PER_CB`, default 4).
+    public var layersPerCB: Int
     private let embTable: MLXArray
     private let embBuf: MTLBuffer
     private let vocab: Int
     private let normW: MLXArray
     private let normWBuf: MTLBuffer
     private let lmHead: QuantProj
+    private let flashHead: SeedlessFlashHead?
+    public let useFlashHead: Bool
+    /// FlashHead cluster probes (env `MOMIJ_FLASH_PROBES`, default 128). 0 if FlashHead off.
+    public var flashProbes: Int { flashHead?.nProbes ?? 0 }
     private let finalNormBuf: MTLBuffer
     private let H: Int
 
@@ -35,6 +41,12 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         self.config = store.config
         self.H = store.config.hiddenSize
         self.stack = try SeedlessLayerStack(store: store, device: device, fullMaxLen: fullMaxLen)
+        if let s = ProcessInfo.processInfo.environment["MOMIJ_LAYERS_PER_CB"], let v = Int(s), v > 0 {
+            layersPerCB = v
+        } else {
+            // Sweep sweet spot on M1 Max: g=4 under cooling.
+            layersPerCB = 4
+        }
 
         let embW = store.req("model.word_embeddings.weight")
         let embS = store.req("model.word_embeddings.scales")
@@ -50,6 +62,13 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             biases: store.req("lm_head.biases"),
             bits: config.headBits,
             groupSize: config.headGroupSize)
+        let flashEnv = ProcessInfo.processInfo.environment["MOMIJ_FLASH_HEAD"]
+        let wantFlash = flashEnv != "0"
+        flashHead = wantFlash ? SeedlessFlashHead(store: store, device: device) : nil
+        useFlashHead = flashHead != nil
+        if wantFlash && flashHead == nil {
+            fputs("[momij] FlashHead weights missing; using exact lm_head\n", stderr)
+        }
         MLX.eval(embTable, normW)
         vocab = embTable.dim(0)
         guard let ebuf = SeedlessMetal.mtlBuf(embTable, device),
@@ -68,32 +87,35 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         stack.hBuf.contents().copyMemory(from: src, byteCount: H * 2)
     }
 
-    private func nextToken(afterLayersWait: Bool = true) -> Int {
-        if afterLayersWait {
-            // finalNormBuf already filled by last-CB tail.
-        }
+    private func nextToken() -> Int {
         let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
-        let h = MLXArray(UnsafeBufferPointer(start: ptr, count: H)).reshaped([1, 1, H])
-        let logits = lmHead.apply(h)
+        if useFlashHead, let fh = flashHead {
+            return fh.greedyAfterCentroids(hBuf: finalNormBuf, hostH: ptr)
+        }
+        let h = MLXArray(UnsafeBufferPointer(start: ptr, count: H)).reshaped([H])
+        let logits = lmHead.apply(h.reshaped([1, 1, H]))
         let y = MLX.argMax(logits.reshaped([-1]), axis: -1)
         MLX.eval(y)
         return y.item(Int.self)
     }
 
-    /// One token: embed → Metal layers (+final RMS on last CB) → lm_head → argmax.
+    /// One token: embed → Metal layers (+final RMS + FlashHead centroids) → gather/sample.
     @discardableResult
     public func step(_ token: Int, profile: Bool = false) throws -> Int {
         var ph = PhaseMs()
         let t0 = CFAbsoluteTimeGetCurrent()
         embedToken(token)
         let t1 = CFAbsoluteTimeGetCurrent()
-        try stack.stepCommitWait { [self] enc in
+        try stack.stepCommitWait(layersPerCB: layersPerCB) { [self] enc in
             SeedlessMetal.encodeRms(
                 into: enc, h: stack.hBuf, w: normWBuf,
                 out: finalNormBuf, H: H, eps: config.rmsNormEps)
+            if let fh = flashHead {
+                fh.encodeCentroids(into: enc, h: finalNormBuf)
+            }
         }
         let t2 = CFAbsoluteTimeGetCurrent()
-        let next = nextToken(afterLayersWait: true)
+        let next = nextToken()
         let t3 = CFAbsoluteTimeGetCurrent()
         if profile {
             ph.embed = (t1 - t0) * 1000
@@ -241,5 +263,24 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             den += b * b
         }
         return sqrt(Double(num / max(den, 1e-12)))
+    }
+
+    /// Sweep `layersPerCB` candidates on a warm engine.
+    public static func sweepLayersPerCB(store: WeightStore, prompt: Int = 64, gen: Int = 64) throws -> String {
+        let eng = try SeedlessDecodeEngine(store: store, fullMaxLen: max(prompt + gen + 64, 2048))
+        var lines: [String] = []
+        var bestTps = 0.0
+        var bestG = 1
+        for g in [1, 2, 3, 4, 6, 8, 12, 24] {
+            eng.layersPerCB = g
+            _ = try eng.generate(prompt: Array(repeating: 100, count: 16), maxTokens: 4, eos: nil)
+            let r = try eng.benchmark(promptTokens: prompt, genTokens: gen, trials: 2, profile: true)
+            let ph = eng.lastPhase
+            lines.append(String(format: "  g=%2d  gen=%.1f tok/s  layers=%.3f head=%.3f ms",
+                                g, r.genTps, ph.layers, ph.head))
+            if r.genTps > bestTps { bestTps = r.genTps; bestG = g }
+        }
+        return "seedless layers_per_cb sweep (p\(prompt)/g\(gen)):\n" + lines.joined(separator: "\n")
+            + String(format: "\nbest g=%d @ %.1f tok/s", bestG, bestTps)
     }
 }

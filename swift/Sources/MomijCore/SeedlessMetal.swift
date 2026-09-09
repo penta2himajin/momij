@@ -16,6 +16,8 @@ public enum SeedlessMetal {
     nonisolated(unsafe) static var rmsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var residPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var gateGemvPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var batchedGemvPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var qmm4GatherPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var routeTop8Pipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var qkNormRopePipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var writeKVPipeline: MTLComputePipelineState?
@@ -44,6 +46,8 @@ public enum SeedlessMetal {
         rmsPipeline = try pipe("maple_rms_norm")
         residPipeline = try pipe("maple_resid_add")
         gateGemvPipeline = try pipe("maple_gate_gemv")
+        batchedGemvPipeline = try pipe("maple_batched_gemv")
+        qmm4GatherPipeline = try pipe("maple_qmm4_gather")
         routeTop8Pipeline = try pipe("maple_route_top8")
         qkNormRopePipeline = try pipe("maple_qk_norm_rope")
         writeKVPipeline = try pipe("maple_write_kv")
@@ -445,7 +449,7 @@ public enum SeedlessMetal {
 
     static func encodeGate(
         into enc: MTLComputeCommandEncoder, w: MTLBuffer, x: MTLBuffer, y: MTLBuffer,
-        E: Int, H: Int
+        E: Int, H: Int, threadsPerTG: Int = 256
     ) {
         enc.setComputePipelineState(gateGemvPipeline!)
         enc.setBuffer(w, offset: 0, index: 0)
@@ -454,8 +458,51 @@ public enum SeedlessMetal {
         var e32 = Int32(E), h32 = Int32(H)
         enc.setBytes(&e32, length: 4, index: 3)
         enc.setBytes(&h32, length: 4, index: 4)
+        let tpt = max(32, min(256, threadsPerTG))
         enc.dispatchThreadgroups(MTLSize(width: E, height: 1, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                                 threadsPerThreadgroup: MTLSize(width: tpt, height: 1, depth: 1))
+    }
+
+    /// Dense gemv y[E]=W[E,H]@x[H]. One simdgroup (32 threads) per row — no TG barriers.
+    static func encodeBatchedGemv(
+        into enc: MTLComputeCommandEncoder, w: MTLBuffer, x: MTLBuffer, y: MTLBuffer,
+        E: Int, H: Int, threadgroups: Int = 256, threadsPerTG: Int = 64
+    ) {
+        _ = threadgroups; _ = threadsPerTG
+        enc.setComputePipelineState(batchedGemvPipeline!)
+        enc.setBuffer(w, offset: 0, index: 0)
+        enc.setBuffer(x, offset: 0, index: 1)
+        enc.setBuffer(y, offset: 0, index: 2)
+        var e32 = Int32(E), h32 = Int32(H)
+        enc.setBytes(&e32, length: 4, index: 3)
+        enc.setBytes(&h32, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: E, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    }
+
+    /// 4-bit affine gather-qmv: for each probe cluster `inds[p]`, score all N rows → y[p*N + r].
+    static func encodeQmm4Gather(
+        into enc: MTLComputeCommandEncoder,
+        w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer, x: MTLBuffer,
+        inds: MTLBuffer, y: MTLBuffer,
+        nProbes: Int, N: Int, K: Int, gs: Int
+    ) {
+        enc.setComputePipelineState(qmm4GatherPipeline!)
+        enc.setBuffer(w, offset: 0, index: 0)
+        enc.setBuffer(scales, offset: 0, index: 1)
+        enc.setBuffer(biases, offset: 0, index: 2)
+        enc.setBuffer(x, offset: 0, index: 3)
+        enc.setBuffer(inds, offset: 0, index: 4)
+        enc.setBuffer(y, offset: 0, index: 5)
+        var n32 = Int32(N), k32 = Int32(K), gs32 = Int32(gs), np32 = Int32(nProbes)
+        enc.setBytes(&n32, length: 4, index: 6)
+        enc.setBytes(&k32, length: 4, index: 7)
+        enc.setBytes(&gs32, length: 4, index: 8)
+        enc.setBytes(&np32, length: 4, index: 9)
+        // One TG per probe; N simdgroups × 32 threads (clusterSize=32 → 1024 threads).
+        enc.dispatchThreadgroups(
+            MTLSize(width: nProbes, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: N * 32, height: 1, depth: 1))
     }
 
     static func encodeRoute(
@@ -737,6 +784,63 @@ public enum SeedlessMetal {
         if (tid == 0) y[e] = red[0];
     }
 
+    // One simdgroup per output row — simd_sum, no threadgroup barriers.
+    kernel void maple_batched_gemv(
+        device const half* W [[buffer(0)]],
+        device const half* x [[buffer(1)]],
+        device float* y [[buffer(2)]],
+        constant int& E [[buffer(3)]],
+        constant int& H [[buffer(4)]],
+        uint e [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]])
+    {
+        if (e >= (uint)E) return;
+        const device half* row = W + (size_t)e * (size_t)H;
+        float acc = 0.0f;
+        for (uint k = tid; k < (uint)H; k += 32) {
+            acc += float(row[k]) * float(x[k]);
+        }
+        acc = simd_sum(acc);
+        if (tid == 0) y[e] = acc;
+    }
+
+    // 4-bit affine gather-qmv: one TG per probe; one simdgroup per row (tgs = N*32).
+    kernel void maple_qmm4_gather(
+        device const uint* w [[buffer(0)]],
+        device const half* scales [[buffer(1)]],
+        device const half* biases [[buffer(2)]],
+        device const half* x [[buffer(3)]],
+        device const int* inds [[buffer(4)]],
+        device float* y [[buffer(5)]],
+        constant int& N [[buffer(6)]],
+        constant int& K [[buffer(7)]],
+        constant int& gs [[buffer(8)]],
+        constant int& nProbes [[buffer(9)]],
+        uint probe [[threadgroup_position_in_grid]],
+        uint simd_gid [[simdgroup_index_in_threadgroup]],
+        uint simd_lid [[thread_index_in_simdgroup]])
+    {
+        if (probe >= (uint)nProbes) return;
+        uint row = simd_gid;
+        if (row >= (uint)N) return;
+        uint e = (uint)inds[probe];
+        uint packs = (uint)K / 8;
+        uint groups = (uint)K / (uint)gs;
+        const device uint* wr = w + ((size_t)e * (size_t)N + row) * packs;
+        const device half* sr = scales + ((size_t)e * (size_t)N + row) * groups;
+        const device half* br = biases + ((size_t)e * (size_t)N + row) * groups;
+        float acc = 0.0f;
+        for (uint k = simd_lid; k < (uint)K; k += 32) {
+            uint pack = wr[k >> 3];
+            uint nib = (pack >> ((k & 7) * 4)) & 0xfu;
+            uint g = k / (uint)gs;
+            float wd = float(nib) * float(sr[g]) + float(br[g]);
+            acc += wd * float(x[k]);
+        }
+        acc = simd_sum(acc);
+        if (simd_lid == 0) y[probe * (uint)N + row] = acc;
+    }
+
     // Softmax + top-K with renorm. E<=256, K<=8. scores are float (for score_reduce).
     kernel void maple_route_top8(
         device const float* logits [[buffer(0)]],
@@ -876,6 +980,7 @@ public enum SeedlessMetal {
     }
 
     // Online-softmax SDPA decode, D=V=128 (Qwisp sdpa templated down from 256).
+    // Requires 32 simdgroups (1024 threads): V is striped across simd_gid.
     kernel void maple_sdpa_d128(
         device const half* queries [[buffer(0)]],   // [H, 128]
         device const half* keys    [[buffer(1)]],   // [KV, maxLen, 128]

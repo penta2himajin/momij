@@ -45,6 +45,43 @@ final class SuffixSpecTests: XCTestCase {
         XCTAssertEqual(SuffixSpec.adaptiveDraftK(meanAccept: 3.0, draftK: 8), 8)
     }
 
+    func testSuffixTreeDraftFollowsFrequency() {
+        let idx = SuffixDraftIndex(maxDepth: 16)
+        // Paths through [1,2,3]: →[4,4] twice and →[9] once → prefer 4
+        idx.insert([0, 1, 2, 3, 4, 4])
+        idx.insert([7, 1, 2, 3, 4, 5])
+        idx.insert([8, 1, 2, 3, 9])
+        let d = idx.draft(from: [1, 2, 3], maxK: 4, alpha: 1.0)
+        XCTAssertEqual(d.matchLen, 3)
+        XCTAssertEqual(d.tokens.first, 4)
+        XCTAssertEqual(SuffixDraftIndex.maxSpec(matchLen: d.matchLen, maxK: 4, alpha: 1.0), 3)
+    }
+
+    func testMaxSpecScalesWithMatchLen() {
+        XCTAssertEqual(SuffixDraftIndex.maxSpec(matchLen: 4, maxK: 16, alpha: 1.0), 4)
+        XCTAssertEqual(SuffixDraftIndex.maxSpec(matchLen: 4, maxK: 16, alpha: 2.0), 8)
+        XCTAssertEqual(SuffixDraftIndex.maxSpec(matchLen: 4, maxK: 3, alpha: 2.0), 3)
+        XCTAssertEqual(SuffixDraftIndex.maxSpec(matchLen: 0, maxK: 8, alpha: 1.0), 0)
+    }
+
+    func testGlobalIndexBeatsEmptyLocal() {
+        let global = SuffixDraftIndex(maxDepth: 32)
+        global.insert([1, 2, 3, 4, 5, 6])
+        let history = [1, 2, 3]
+        let d = SuffixDraftIndex.bestDraft(
+            local: nil, global: global, history: history, maxK: 4, alpha: 1.0)
+        XCTAssertEqual(d.matchLen, 3)
+        XCTAssertEqual(d.tokens, [4, 5, 6])
+    }
+
+    func testTreeDraftFallsBackToPLD() {
+        // Empty trees → PLD contiguous match
+        let history = [7, 1, 2, 3, 9, 8, 1, 2, 3]
+        let d = SuffixSpec.treeDraft(
+            history: history, k: 2, local: nil, global: nil, promptLen: nil)
+        XCTAssertEqual(d, [9, 8])
+    }
+
     func testSpecAcceptsMatchingDraft() throws {
         // Deterministic "model": always emits next = last+1
         var seq = 10

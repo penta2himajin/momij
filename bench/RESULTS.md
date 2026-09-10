@@ -536,6 +536,35 @@ Notes:
 4. Next: SuffixDecoding-style tree / online output index for agentic; keep
    gate when accept stays cold.
 
+## 2026-09-10 SuffixDecoding tree index (per-request + global)
+
+Port of SuffixDecoding ideas ([Oliaro et al.](https://arxiv.org/abs/2411.04975),
+ArcticInference): depth-64 suffix trie, `MAX_SPEC=α·p`, frequency-greedy
+child walk, **global** tree fed by prior generations. Single-chain verify
+(same as vLLM’s production SuffixDecoding). PLD remains fallback.
+
+M1 Max, omlx stop, release. Code-echo `fib` rewrite; JSON extract-style prompt.
+
+| Config | accept/attempt | accept/gen | spec | greedy | lossless |
+|---|---|---|---|---|---|
+| code, tree, n=5 | **2.26** | **0.82** | 155 | 190 | true |
+| code, α=2, n=5 | 2.32 | 0.82 | 158 | 184 | true |
+| **code, tree+MROW, n=3** | **2.26** | **0.82** | **218** | 187 | **true** |
+| JSON-ish, tree, n=4 | **5.60** | **0.86** | 179 | 178 | false† |
+
+† JSON `lossless=false` once across trials — treat as run variance / investigate;
+code path stayed lossless.
+
+Verdict:
+
+1. **Tree+global raises accept/gen 0.44 → 0.82** on code echo vs prior PLD-only.
+2. **First product win over greedy:** MROW + hot accept → **~218 tok/s** vs
+   ~187 greedy (~1.17×), lossless.
+3. Without MROW, high accept alone does not beat greedy (seq early-exit ≈ parity
+   or slight loss); packing matters once drafts land.
+4. `MOMIJ_SPEC_ALPHA` (default 1) controls `MAX_SPEC=αp`. Keep gate for cold
+   open-ended chat.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

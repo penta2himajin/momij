@@ -41,7 +41,7 @@ Phase profile: [bench/RESULTS.md](../bench/RESULTS.md) (2026-09-09).
 
 | Lever | Status | Notes |
 |---|---|---|
-| SuffixSpec / Tell | `SuffixSpec` + `MOMIJ_SUFFIX_SPEC=1` | No draft training; helps repetitive content |
+| SuffixSpec / Tell | `SuffixSpec` + suffix tree index + `MOMIJ_SUFFIX_SPEC=1` | PLD + SuffixDecoding-style trie (per-req + global); `MOMIJ_SPEC_ALPHA` |
 | OpenAI API + continuous batch | `/v1/chat/completions` streaming; CB deferred | oMLX drop-in surface |
 | P-EAGLE / DFlash | **deferred — needs draft training** | Maple has `num_nextn_predict_layers=0`. Draft must be ≫2.5× target on AS ([AtomGradient](https://atomgradient.github.io/apple-silicon-llm-inference/paper.pdf)). Sources: [P-EAGLE](https://arxiv.org/abs/2602.01469), [DFlash](https://arxiv.org/abs/2602.06036) |
 

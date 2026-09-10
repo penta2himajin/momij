@@ -29,6 +29,10 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     private let specMaxM: Int
     /// True M-row chain verify (`MOMIJ_MROW=1`). Default off until e2e wins.
     private let useMrow: Bool
+    /// SuffixDecoding α for `MAX_SPEC = α·matchLen` (`MOMIJ_SPEC_ALPHA`, default 1.0).
+    private let specAlpha: Double
+    /// Cross-request suffix tree (previous outputs). Shared for the engine lifetime.
+    private let globalSuffixIndex = SuffixDraftIndex(maxDepth: 64)
     private var specFeedIds: MTLBuffer?
     private var specNormSlots: [MTLBuffer] = []
     private var specIndsSlots: [MTLBuffer] = []
@@ -55,6 +59,11 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         let envM = ProcessInfo.processInfo.environment["MOMIJ_SPEC_MAX_M"].flatMap(Int.init)
         specMaxM = max(2, envM ?? 9)
         useMrow = ProcessInfo.processInfo.environment["MOMIJ_MROW"] == "1"
+        if let a = ProcessInfo.processInfo.environment["MOMIJ_SPEC_ALPHA"], let v = Double(a), v > 0 {
+            specAlpha = v
+        } else {
+            specAlpha = SuffixSpec.defaultSpecAlpha
+        }
         let stackM = useMrow ? specMaxM : 1
         self.stack = try SeedlessLayerStack(
             store: store, device: device, fullMaxLen: fullMaxLen, maxM: stackM)
@@ -466,9 +475,10 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         let aps = att > 0 ? Double(acc) / Double(att) : 0
         let frac = producedTok > 0 ? Double(acceptedTok) / Double(producedTok) : 0
         let base = String(
-            format: "suffix-spec bench (draftK=%d, n=%d, prompt=%d): greedy=%.1f tok/s  spec=%.1f tok/s  accept/attempt=%.2f  accept/gen=%.2f  attempts=%d gated=%d  lossless=%@  mrow=%@",
+            format: "suffix-spec bench (draftK=%d, n=%d, prompt=%d): greedy=%.1f tok/s  spec=%.1f tok/s  accept/attempt=%.2f  accept/gen=%.2f  attempts=%d gated=%d  lossless=%@  mrow=%@  global_tok=%d  alpha=%.1f",
             draftK, trials, promptIds.count, g, s, aps, frac, att, gat,
-            equal ? "true" : "false", useMrow ? "on" : "off")
+            equal ? "true" : "false", useMrow ? "on" : "off",
+            globalSuffixIndex.tokenCount, specAlpha)
         let chain = (try? benchmarkChainVerify(steps: 8, trials: 5)) ?? ""
         return base + (chain.isEmpty ? "" : "\n" + chain)
     }
@@ -554,17 +564,24 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         let batchForce = batchEnv == "1"
         let batchOff = batchEnv == "0"
         let gateWindow = 8
+        // Per-request suffix tree (SuffixDecoding). Rebuilt from `ids` each draft
+        // (O(n·depth) on CPU ≪ one Metal step). Global tree caches prior outputs.
+        let localIndex = SuffixDraftIndex(maxDepth: 64)
 
         while out.count < maxTokens {
             if let eos, y == eos { break }
             let remain = maxTokens - out.count
             let meanAccept = acceptWindow.isEmpty ? 1.0
                 : Double(acceptWindow.reduce(0, +)) / Double(acceptWindow.count)
-            // Cold / low-accept → shorter drafts; M-row makes verify cheap enough to try more often.
+            // Cold / low-accept → shorter drafts via accept window; tree also caps via α·p.
             let effK = SuffixSpec.adaptiveDraftK(
                 meanAccept: meanAccept, draftK: min(draftK, remain, specMaxM - 1))
-            let draft = SuffixSpec.suffixDraft(
-                history: ids, k: effK, promptLen: promptIds.count)
+            localIndex.clear()
+            localIndex.insert(ids)
+            let draft = SuffixSpec.treeDraft(
+                history: ids, k: effK,
+                local: localIndex, global: globalSuffixIndex,
+                alpha: specAlpha, promptLen: promptIds.count)
             // Soft gate: park on greedy after sustained misses. M-row verify is cheaper but
             // still loses when accept≈0 (measured ~80 tok/s vs ~180 greedy).
             let gateFloor = useMrow ? 0.5 : 1.0
@@ -621,6 +638,10 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             acceptWindow.append(accepted)
             if acceptWindow.count > gateWindow { acceptWindow.removeFirst() }
             if let eos, out.contains(eos) { break }
+        }
+        // Feed completed generation into the global tree for later requests / trials.
+        if out.count > 1 {
+            globalSuffixIndex.insert(out)
         }
         return (out, acceptedTotal, attempts, gated)
     }

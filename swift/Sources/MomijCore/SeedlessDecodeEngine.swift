@@ -27,7 +27,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     private let H: Int
     /// Max chained verify feeds (draftK+1). Env `MOMIJ_SPEC_MAX_M`, default 9.
     private let specMaxM: Int
-    /// True M-row chain verify (`MOMIJ_MROW=1`). Default off until e2e wins.
+    /// True M-row chain verify. Default **on**; set `MOMIJ_MROW=0` to disable.
+    /// Scratch is sized for `specMaxM` when on; actual packing only runs on hot batch verify.
     private let useMrow: Bool
     /// SuffixDecoding α for `MAX_SPEC = α·matchLen` (`MOMIJ_SPEC_ALPHA`, default 1.0).
     private let specAlpha: Double
@@ -61,7 +62,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         self.H = store.config.hiddenSize
         let envM = ProcessInfo.processInfo.environment["MOMIJ_SPEC_MAX_M"].flatMap(Int.init)
         specMaxM = max(2, envM ?? 9)
-        useMrow = ProcessInfo.processInfo.environment["MOMIJ_MROW"] == "1"
+        // Default on: hot SuffixSpec batch packs True M-row. Cold path never batches
+        // (see useBatch below), so opt-out with MOMIJ_MROW=0 if scratch memory matters.
+        useMrow = ProcessInfo.processInfo.environment["MOMIJ_MROW"] != "0"
         if let a = ProcessInfo.processInfo.environment["MOMIJ_SPEC_ALPHA"], let v = Double(a), v > 0 {
             specAlpha = v
         } else {
@@ -126,7 +129,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
 
     /// C2: draft-driven chain verify in **one CB / one wait** (GPU embed; Qwisp chained style).
     /// `feeds` = [y] + draft (length D+1). Returns greedy evals[0..<feeds.count].
-    /// With `MOMIJ_MROW=1` and capacity, packs True M-row layers instead of M×M=1.
+    /// With M-row enabled (default) and capacity, packs True M-row layers instead of M×M=1.
     public func stepChainFeeds(_ feeds: [Int]) throws -> [Int] {
         precondition(!feeds.isEmpty && feeds.count <= specMaxM)
         guard useFlashHead, let fh = flashHead, fh.fuseIntoLayerCB else {
@@ -645,10 +648,11 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             }
 
             attempts += 1
-            // Batch/M-row verify wins only when drafts land; otherwise sequential
-            // early-exit is cheaper (no snapshot restore). Force with MOMIJ_SPEC_BATCH=1.
+            // Hot only: batch (+ M-row pack when useMrow). Cold must stay sequential
+            // early-exit / greedy — forced MOMIJ_SPEC_BATCH=1 still allowed for benches.
+            let hotEnough = meanAccept >= 1.5
             let useBatch = !batchOff && useFlashHead && flashFused
-                && (batchForce || meanAccept >= 1.5)
+                && (batchForce || hotEnough)
             let accepted: Int
             if useBatch {
                 let r = try verifyDraftChain(y: y, draft: draft)

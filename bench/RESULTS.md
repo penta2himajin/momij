@@ -488,11 +488,11 @@ Honest read:
 
 ## 2026-09-10 e2e: True M-row wired into `stepChainFeeds`
 
-Env: `MOMIJ_MROW=1` sizes layer scratch to `SPEC_MAX_M` and packs draft verify
-as one M-row forward (embed rows → `encodeStep(M:)` ×24L → FlashHead per row).
-Default remains M=1. SWA rotate mid-batch falls back to sequential.
+Env: `MOMIJ_MROW` (now **default on**; `=0` to disable) sizes layer scratch to
+`SPEC_MAX_M` and packs draft verify as one M-row forward when batch runs.
+SWA rotate mid-batch falls back to sequential.
 
-M1 Max, omlx stop, release, FlashHead fuse. Measured 2026-09-10:
+M1 Max, omlx stop, release, FlashHead fuse. Measured 2026-09-10 (`MROW=1` then opt-in):
 
 | Path | gen tok/s | notes |
 |---|---|---|
@@ -507,8 +507,9 @@ Verdict (e2e tok/s, not synthetic µs):
    steps; ~2× vs packed M×M=1 in one CB). Lossless (`match=true`).
 2. Motif SuffixSpec still has near-zero draft accept, so product e2e tok/s stays
    below greedy until drafts land. M-row cannot invent accept rate.
-3. Do **not** default `MOMIJ_MROW=1` for cold SuffixSpec; keep opt-in for
-   high-accept / oracle-draft / chain-verify paths.
+3. **Policy (updated same day):** MROW default **on**; SuffixSpec still batches
+   **only when hot** (`meanAccept≥1.5` or `SPEC_BATCH=1`). Cold never packs
+   verify, so default-on scratch is idle cost only — not cold-path regress.
 
 ## 2026-09-10 SuffixSpec PLD drafts — raise accept%
 
@@ -596,6 +597,13 @@ Honest ceiling on this stack:
 3. Practical open-chat path today: keep hybrid + MROW; expect wins when the
    model’s own output is repetitive/structured; do not claim general chat 1.5×
    without better sampling / chat template / draft model.
+
+## 2026-09-10 policy: MROW default on, batch only when hot
+
+- `MOMIJ_MROW` defaults **on** (`=0` to disable). Allocates M-row scratch always.
+- SuffixSpec **batches only when `meanAccept ≥ 1.5`** (or `MOMIJ_SPEC_BATCH=1`).
+  Cold → sequential early-exit / gated greedy — no packed verify restore tax.
+- Hot batch + MROW → measured ~280 tok/s band on structured/repetitive workloads.
 
 ## Baseline (oracle / mlx-lm-deepgrove)
 

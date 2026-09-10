@@ -299,7 +299,22 @@ Parity vs affine on row-constant-α weights: rel_l2 < 1e-3.
 
 No measured packed/e2e win, but also no loss, and the kernel does less work (no
 per-group scale/bias walk). **Default is fold**; `MOMIJ_GQMM2_FOLD=0` restores affine.
-Tighter rewrite `α·(accum−sum)` would change the FMA mix (ternary-class risk); not tried.
+
+## 2026-09-10 gqmm2 defer-α (α after simd_sum) — no packed win
+
+Variant B: keep `ld16_b2` + masked 16-way accum; drop per-block `α*accum` /
+`sum*bias`; `y = α · (simd_sum(accum) − simd_sum(xsum))`. Separate metallib
+`gqmm2_rows_defer_a`, env `MOMIJ_GQMM2_DEFER_A=1` (takes priority over fold).
+Parity vs fold on ternary weights: rel_l2 < 1e-3.
+
+| Probe (interleaved) | fold (default) | `MOMIJ_GQMM2_DEFER_A=1` |
+|---|---|---|
+| 24L commit→1w GPU | 4.45 / 4.49 ms | 4.42 / 4.68 ms (tie/noise) |
+| e2e p128/g128 n=3 | 211.4 / 202.0 | 203.7 / 204.5 (mean ~206.7 vs ~204.1) |
+
+No win. Inner FMA stream is unchanged but moving α out of the K-loop did not
+raise the packed floor; e2e mean is inside fold's own spread. **Default stays
+fold.** Env left opt-in; do not promote on a tie.
 
 ## Baseline (oracle / mlx-lm-deepgrove)
 

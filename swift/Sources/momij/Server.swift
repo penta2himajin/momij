@@ -29,8 +29,13 @@ enum MomijHTTP {
         var max_completion_tokens: Int?
         var temperature: Double?
         var top_p: Double?
+        var presence_penalty: Double?
+        var frequency_penalty: Double?
+        /// HF / vLLM-style (not official OpenAI); 1.0 = off.
+        var repetition_penalty: Double?
         var stream: Bool?
         var n: Int?
+        var seed: UInt64?
     }
 
     actor AsyncLock {
@@ -103,7 +108,11 @@ enum MomijHTTP {
                 maxTokens: maxTok,
                 temperature: chatReq.temperature ?? 0,
                 topP: chatReq.top_p ?? 1,
-                useSuffixSpec: ProcessInfo.processInfo.environment["MOMIJ_SUFFIX_SPEC"] == "1"
+                presencePenalty: chatReq.presence_penalty ?? 0,
+                frequencyPenalty: chatReq.frequency_penalty ?? 0,
+                repetitionPenalty: chatReq.repetition_penalty ?? 1,
+                useSuffixSpec: ProcessInfo.processInfo.environment["MOMIJ_SUFFIX_SPEC"] == "1",
+                seed: chatReq.seed
             )
             if chatReq.stream == true {
                 return try await streamSSE(engine: engine, prompt: ids, options: opts)

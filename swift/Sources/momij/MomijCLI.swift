@@ -37,8 +37,8 @@ struct MomijMain {
             Usage:
               momij bench --model <dir> [--backend mlx|oracle|seedless] [--flash-head] [-p 128] [-g 256] [-n 3]
               momij seedless-bench [--model <dir>]
-              momij generate --model <dir> --prompt <text> [--backend mlx|oracle|seedless] [--suffix-spec]
-              momij serve --model <dir> [--backend mlx|oracle] [--port 8742] [--host 127.0.0.1]
+              momij generate --model <dir> --prompt <text> [--backend mlx|oracle|seedless] [--suffix-spec] [--temperature T] [--top-p P] [--repetition-penalty R]
+              momij serve --model <dir> [--backend seedless|mlx|oracle] [--port 8742] [--host 127.0.0.1]
             """
         )
     }
@@ -162,15 +162,30 @@ struct MomijMain {
         let promptText = flag(args, "--prompt") ?? "Write a haiku about a maple grove."
         let maxTok = Int(flag(args, "--max-tokens") ?? "64")!
         let suffix = has(args, "--suffix-spec")
+        let temperature = Double(flag(args, "--temperature") ?? "0") ?? 0
+        let topP = Double(flag(args, "--top-p") ?? "1") ?? 1
+        let presence = Double(flag(args, "--presence-penalty") ?? "0") ?? 0
+        let frequency = Double(flag(args, "--frequency-penalty") ?? "0") ?? 0
+        let repetition = Double(flag(args, "--repetition-penalty") ?? "1") ?? 1
 
         let tokenizer = try await loadTokenizer(modelDir: model)
         let ids = try tokenizer.encode(promptText)
-        let opts = GenerateOptions(maxTokens: maxTok, useSuffixSpec: suffix)
+        let opts = GenerateOptions(
+            maxTokens: maxTok,
+            temperature: temperature,
+            topP: topP,
+            presencePenalty: presence,
+            frequencyPenalty: frequency,
+            repetitionPenalty: repetition,
+            useSuffixSpec: suffix)
 
         let backend: any LLMBackend
-        if backendName == "mlx" {
+        switch backendName {
+        case "mlx":
             backend = try MapleMLXBackend(modelDir: model)
-        } else {
+        case "seedless":
+            backend = try SeedlessBackend(modelDir: model)
+        default:
             backend = try OracleBackend(modelDir: model, flashHead: has(args, "--flash-head"))
         }
         var out: [Int] = []
@@ -187,17 +202,20 @@ struct MomijMain {
 
     static func runServeCmd(_ args: [String]) async throws {
         let model = flag(args, "--model") ?? defaultModel()
-        let backendName = flag(args, "--backend") ?? "oracle"
+        let backendName = flag(args, "--backend") ?? "seedless"
         let host = flag(args, "--host") ?? "127.0.0.1"
         let port = Int(flag(args, "--port") ?? "8742")!
         let modelID = flag(args, "--model-id") ?? "maple-preview"
 
         let tokenizer = try await loadTokenizer(modelDir: model)
         let backend: any LLMBackend
-        if backendName == "mlx" {
+        switch backendName {
+        case "mlx":
             backend = try MapleMLXBackend(modelDir: model)
-        } else {
+        case "oracle":
             backend = try OracleBackend(modelDir: model, flashHead: has(args, "--flash-head"))
+        default:
+            backend = try SeedlessBackend(modelDir: model)
         }
         let engine = MomijHTTP.MomijEngine(tokenizer: tokenizer, backend: backend, modelID: modelID)
         try await MomijHTTP.runServe(engine: engine, host: host, port: port)

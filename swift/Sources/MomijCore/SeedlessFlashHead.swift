@@ -46,8 +46,9 @@ public final class SeedlessFlashHead {
         clusterSize = meta.clusterSize
         H = cfg.hiddenSize
         let envProbes = ProcessInfo.processInfo.environment["MOMIJ_FLASH_PROBES"].flatMap(Int.init)
-        // Default 64: best measured stable band on M1 Max (96 similar quality, more gather tax).
-        nProbes = min(envProbes ?? 64, nClusters)
+        let sampleProbes = ProcessInfo.processInfo.environment["MOMIJ_SAMPLE_PROBES"].flatMap(Int.init)
+        // Default 64; MOMIJ_SAMPLE_PROBES can widen gather for sampling paths.
+        nProbes = min(max(envProbes ?? 64, sampleProbes ?? 0), nClusters)
         headGroupSize = meta.headGroupSize
         // Default on: hierarchical GPU top-k + gather in the layer CB kills the ~0.3ms
         // second-wait tax (measured ~208 tok/s vs ~180). Set MOMIJ_FLASH_FUSE=0 to disable.
@@ -270,28 +271,94 @@ public final class SeedlessFlashHead {
         k: Int, inds: MTLBuffer? = nil, logits: MTLBuffer? = nil
     ) -> [Int] {
         let want = max(1, k)
+        let cands = candidateLogits(inds: inds, logits: logits, hostH: nil)
+        var order = Array(cands.ids.indices)
+        order.sort { cands.logits[$0] > cands.logits[$1] }
+        return order.prefix(want).map { cands.ids[$0] }
+    }
+
+    /// Deduped (token id, logit) pairs from probe gather. Optionally merges force-token dots.
+    public func candidateLogits(
+        inds: MTLBuffer? = nil,
+        logits: MTLBuffer? = nil,
+        hostH: UnsafePointer<Float16>? = nil
+    ) -> (ids: [Int], logits: [Float]) {
         let ib = inds ?? indsBuf
         let lb = logits ?? logitsBuf
         let nLogits = nProbes * clusterSize
         let ip = ib.contents().bindMemory(to: Int32.self, capacity: nProbes)
         let lp = lb.contents().bindMemory(to: Float.self, capacity: nLogits)
-        var order = Array(0 ..< nLogits)
-        order.sort { lp[$0] > lp[$1] }
-        var out: [Int] = []
-        out.reserveCapacity(want)
-        var seen = Set<Int>()
-        for local in order {
+        var best: [Int: Float] = [:]
+        best.reserveCapacity(nLogits)
+        for local in 0 ..< nLogits {
             let probe = local / clusterSize
             let row = local % clusterSize
             let cluster = Int(ip[probe])
             guard cluster >= 0, cluster < nClusters else { continue }
             let tid = Int(tokenMapHost[cluster * clusterSize + row])
-            if seen.insert(tid).inserted {
-                out.append(tid)
-                if out.count >= want { break }
+            let v = lp[local]
+            if let old = best[tid] {
+                if v > old { best[tid] = v }
+            } else {
+                best[tid] = v
             }
         }
-        return out
+        if let hostH, !forceIds.isEmpty {
+            for fi in 0 ..< forceIds.count {
+                var dot: Float = 0
+                let base = fi * H
+                for k in 0 ..< H {
+                    dot += Float(hostH[k]) * Float(forceRows[base + k])
+                }
+                let tid = forceIds[fi]
+                if let old = best[tid] {
+                    if dot > old { best[tid] = dot }
+                } else {
+                    best[tid] = dot
+                }
+            }
+        }
+        var ids: [Int] = []
+        var scores: [Float] = []
+        ids.reserveCapacity(best.count)
+        scores.reserveCapacity(best.count)
+        for (tid, v) in best {
+            ids.append(tid)
+            scores.append(v)
+        }
+        return (ids, scores)
+    }
+
+    /// Sample from FlashHead candidates after fused gather (post layer-CB wait).
+    public func sampleAfterFusedGather(
+        hostH: UnsafePointer<Float16>,
+        processor: LogitsProcessor,
+        seen: Set<Int>,
+        counts: [Int: Int],
+        rng: inout some RandomNumberGenerator,
+        inds: MTLBuffer? = nil,
+        logits: MTLBuffer? = nil
+    ) -> Int {
+        let cands = candidateLogits(inds: inds, logits: logits, hostH: hostH)
+        precondition(!cands.ids.isEmpty)
+        return processor.sample(
+            tokenIds: cands.ids, logits: cands.logits,
+            seen: seen, counts: counts, rng: &rng)
+    }
+
+    /// Same as fused path but after CPU top-k + gather CB (`fuseIntoLayerCB=false`).
+    public func sampleAfterCentroids(
+        hBuf: MTLBuffer, hostH: UnsafePointer<Float16>,
+        processor: LogitsProcessor,
+        seen: Set<Int>,
+        counts: [Int: Int],
+        rng: inout some RandomNumberGenerator
+    ) -> Int {
+        // Reuse greedy gather path to fill inds/logits, then sample.
+        _ = greedyAfterCentroids(hBuf: hBuf, hostH: hostH)
+        return sampleAfterFusedGather(
+            hostH: hostH, processor: processor,
+            seen: seen, counts: counts, rng: &rng)
     }
 
     private func argmaxWithForce(

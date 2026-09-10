@@ -605,17 +605,40 @@ Honest ceiling on this stack:
   Cold → sequential early-exit / gated greedy — no packed verify restore tax.
 - Hot batch + MROW → measured ~280 tok/s band on structured/repetitive workloads.
 
+## 2026-09-11 sampling dual-path (Phase 1+2)
+
+API / `GenerateOptions` now accept `temperature`, `top_p`, `presence_penalty`,
+`frequency_penalty`, `repetition_penalty`, `seed`.
+
+Routing (`SeedlessBackend`, serve default `--backend seedless`):
+
+| Request | Path |
+|---|---|
+| `isGreedyCompatible` (temp≈0, top_p≥1, penalties default) | existing greedy / SuffixSpec + M-row (**unchanged**) |
+| otherwise | FlashHead **candidate-set** `LogitsProcessor` sample; default **rejection-sampling** drafts (`generateSampledSpeculative`). `MOMIJ_SPEC_SAMPLE=0` → sequential `generateSampled` only |
+
+Notes:
+
+- Sampling is **not** full-vocab OpenAI-exact (probe gather). Widen with `MOMIJ_SAMPLE_PROBES`.
+- Unit tests: `LogitsProcessorTests`, `SpeculativeSamplingTests`.
+- Smoke (debug, mlx.metallib colocated): greedy `bench -p 128 -g 64` ≈ **94 gen tok/s**;
+  `generate --temperature 0.8 --repetition-penalty 1.2` emits tokens (path live).
+  Release FlashHead init still SIGSEGV in this workspace after clean rebuild — measure
+  greedy product band from prior RESULTS (~170+ release); do not claim regress from debug.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:
 `generation_tps ≈ 169` (p128/g128, n=2) — same band.
 
-## OpenAI server smoke (oracle backend, port 8742)
+## OpenAI server smoke (seedless backend default, port 8742)
 
 ```
 GET  /healthz → ok
 GET  /v1/models → maple-preview
 POST /v1/chat/completions → assistant tokens
+  (temperature / top_p / presence_penalty / frequency_penalty / repetition_penalty / seed)
 ```
 
 Drop-in for Maple vs oMLX: point clients at `http://127.0.0.1:8742/v1`.
+Greedy clients keep SuffixSpec/M-row; sampling clients use FlashHead candidate sampling.

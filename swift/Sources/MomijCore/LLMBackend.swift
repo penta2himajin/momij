@@ -4,25 +4,108 @@ public struct GenerateOptions: Sendable {
     public var maxTokens: Int = 256
     public var temperature: Double = 0
     public var topP: Double = 1
+    /// OpenAI presence_penalty (−2…2). Non-zero leaves the greedy SuffixSpec path.
+    public var presencePenalty: Double = 0
+    /// OpenAI frequency_penalty (−2…2).
+    public var frequencyPenalty: Double = 0
+    /// HF / vLLM-style; 1.0 = off. Values >1 penalize repeats.
+    public var repetitionPenalty: Double = 1
     public var eosTokenIds: [Int] = [151_645]
     public var useSuffixSpec: Bool = false
     public var draftK: Int = 8
+    /// Optional RNG seed for sampled decode (`nil` → nondeterministic).
+    public var seed: UInt64? = nil
 
     public init(
         maxTokens: Int = 256, temperature: Double = 0, topP: Double = 1,
-        eosTokenIds: [Int] = [151_645], useSuffixSpec: Bool = false, draftK: Int = 8
+        presencePenalty: Double = 0, frequencyPenalty: Double = 0,
+        repetitionPenalty: Double = 1,
+        eosTokenIds: [Int] = [151_645], useSuffixSpec: Bool = false, draftK: Int = 8,
+        seed: UInt64? = nil
     ) {
         self.maxTokens = maxTokens
         self.temperature = temperature
         self.topP = topP
+        self.presencePenalty = presencePenalty
+        self.frequencyPenalty = frequencyPenalty
+        self.repetitionPenalty = repetitionPenalty
         self.eosTokenIds = eosTokenIds
         self.useSuffixSpec = useSuffixSpec
         self.draftK = draftK
+        self.seed = seed
+    }
+
+    /// Fast SuffixSpec / M-row greedy path is valid only for deterministic greedy.
+    public var isGreedyCompatible: Bool {
+        temperature <= 1e-5
+            && topP >= 1 - 1e-6
+            && presencePenalty == 0
+            && frequencyPenalty == 0
+            && abs(repetitionPenalty - 1) < 1e-6
     }
 }
 
 public protocol LLMBackend: AnyObject {
     func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncThrowingStream<Int, Error>
+}
+
+/// Production Seedless Metal backend. Greedy-compatible requests keep SuffixSpec/M-row;
+/// sampling / penalties use FlashHead candidate sampling (+ optional speculative).
+public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
+    public let engine: SeedlessDecodeEngine
+    /// When true (default), non-greedy paths use rejection-sampling drafts.
+    public let speculativeSample: Bool
+
+    public init(modelDir: String, fullMaxLen: Int = 4096) throws {
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        try SeedlessMetal.ensureCompiled()
+        self.engine = try SeedlessDecodeEngine(store: store, fullMaxLen: fullMaxLen)
+        self.speculativeSample = ProcessInfo.processInfo.environment["MOMIJ_SPEC_SAMPLE"] != "0"
+    }
+
+    public init(engine: SeedlessDecodeEngine, speculativeSample: Bool = true) {
+        self.engine = engine
+        self.speculativeSample = speculativeSample
+    }
+
+    public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncThrowingStream<Int, Error> {
+        AsyncThrowingStream { cont in
+            Task {
+                do {
+                    let eos = options.eosTokenIds.first
+                    let tokens: [Int]
+                    if options.isGreedyCompatible {
+                        if options.useSuffixSpec {
+                            let r = try self.engine.generateSuffixSpec(
+                                prompt: prompt, maxTokens: options.maxTokens,
+                                draftK: options.draftK, eos: eos)
+                            tokens = r.tokens
+                        } else {
+                            tokens = try self.engine.generate(
+                                prompt: prompt, maxTokens: options.maxTokens, eos: eos)
+                        }
+                    } else {
+                        let proc = LogitsProcessor.from(options)
+                        if self.speculativeSample {
+                            tokens = try self.engine.generateSampledSpeculative(
+                                prompt: prompt, maxTokens: options.maxTokens,
+                                processor: proc, draftK: options.draftK,
+                                eos: eos, seed: options.seed)
+                        } else {
+                            tokens = try self.engine.generateSampled(
+                                prompt: prompt, maxTokens: options.maxTokens,
+                                processor: proc, eos: eos, seed: options.seed)
+                        }
+                    }
+                    for t in tokens { cont.yield(t) }
+                    cont.finish()
+                } catch {
+                    cont.finish(throwing: error)
+                }
+            }
+        }
+    }
 }
 
 /// MLX Maple greedy backend.

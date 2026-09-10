@@ -318,6 +318,268 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         return y.item(Int.self)
     }
 
+    private func nextTokenSampled(
+        processor: LogitsProcessor,
+        seen: Set<Int>,
+        counts: [Int: Int],
+        rng: inout SplitMix64
+    ) -> Int {
+        let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
+        if useFlashHead, let fh = flashHead {
+            if fh.fuseIntoLayerCB {
+                return fh.sampleAfterFusedGather(
+                    hostH: ptr, processor: processor,
+                    seen: seen, counts: counts, rng: &rng)
+            }
+            return fh.sampleAfterCentroids(
+                hBuf: finalNormBuf, hostH: ptr, processor: processor,
+                seen: seen, counts: counts, rng: &rng)
+        }
+        let h = MLXArray(UnsafeBufferPointer(start: ptr, count: H)).reshaped([H])
+        let logits = lmHead.apply(h.reshaped([1, 1, H])).reshaped([-1]).asType(.float32)
+        MLX.eval(logits)
+        let n = logits.shape[0]
+        var scores = [Float](repeating: 0, count: n)
+        logits.asData(access: .copy).data.withUnsafeBytes { raw in
+            let src = raw.bindMemory(to: Float.self)
+            let m = min(n, raw.count / MemoryLayout<Float>.size)
+            for i in 0 ..< m { scores[i] = src[i] }
+        }
+        let ids = Array(0 ..< n)
+        return processor.sample(
+            tokenIds: ids, logits: scores, seen: seen, counts: counts, rng: &rng)
+    }
+
+    /// Embed `token`, run layers, return FlashHead (or full) candidate logits for the next id.
+    public func stepCandidates(_ token: Int) throws -> (ids: [Int], logits: [Float]) {
+        embedToken(token)
+        try stack.stepCommitWait(layersPerCB: layersPerCB) { [self] enc in
+            SeedlessMetal.encodeRms(
+                into: enc, h: stack.hBuf, w: normWBuf,
+                out: finalNormBuf, H: H, eps: config.rmsNormEps)
+            if let fh = flashHead {
+                fh.encodeCentroids(into: enc, h: finalNormBuf)
+                if fh.fuseIntoLayerCB {
+                    fh.encodeFusedAfterCentroids(into: enc, h: finalNormBuf)
+                }
+            }
+        }
+        observeRecycle(fromToken: token)
+        let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
+        if useFlashHead, let fh = flashHead {
+            if !fh.fuseIntoLayerCB {
+                // Fill inds/logits via gather CB (discard greedy pick).
+                _ = fh.greedyAfterCentroids(hBuf: finalNormBuf, hostH: ptr)
+            }
+            return fh.candidateLogits(hostH: ptr)
+        }
+        let h = MLXArray(UnsafeBufferPointer(start: ptr, count: H)).reshaped([H])
+        let logits = lmHead.apply(h.reshaped([1, 1, H])).reshaped([-1]).asType(.float32)
+        MLX.eval(logits)
+        let n = logits.shape[0]
+        var scores = [Float](repeating: 0, count: n)
+        logits.asData(access: .copy).data.withUnsafeBytes { raw in
+            let src = raw.bindMemory(to: Float.self)
+            let m = min(n, raw.count / MemoryLayout<Float>.size)
+            for i in 0 ..< m { scores[i] = src[i] }
+        }
+        return (Array(0 ..< n), scores)
+    }
+
+    /// One sampled token (FlashHead candidates + LogitsProcessor). Updates recycle.
+    public func stepSampled(
+        _ token: Int,
+        processor: LogitsProcessor,
+        seen: Set<Int>,
+        counts: [Int: Int],
+        rng: inout SplitMix64
+    ) throws -> Int {
+        embedToken(token)
+        try stack.stepCommitWait(layersPerCB: layersPerCB) { [self] enc in
+            SeedlessMetal.encodeRms(
+                into: enc, h: stack.hBuf, w: normWBuf,
+                out: finalNormBuf, H: H, eps: config.rmsNormEps)
+            if let fh = flashHead {
+                fh.encodeCentroids(into: enc, h: finalNormBuf)
+                if fh.fuseIntoLayerCB {
+                    fh.encodeFusedAfterCentroids(into: enc, h: finalNormBuf)
+                }
+            }
+        }
+        let next = nextTokenSampled(
+            processor: processor, seen: seen, counts: counts, rng: &rng)
+        observeRecycle(fromToken: token)
+        return next
+    }
+
+    /// Non-speculative sampled decode. Penalties use prompt + generated history.
+    public func generateSampled(
+        prompt: [Int], maxTokens: Int,
+        processor: LogitsProcessor,
+        eos: Int? = 151_645,
+        seed: UInt64? = nil
+    ) throws -> [Int] {
+        guard !prompt.isEmpty, maxTokens > 0 else { return [] }
+        reset()
+        var rng = SplitMix64(seed: seed ?? UInt64.random(in: 1 ... .max))
+        var seen = Set(prompt)
+        var counts: [Int: Int] = [:]
+        for t in prompt { counts[t, default: 0] += 1 }
+
+        var last = prompt[0]
+        for i in 0 ..< prompt.count {
+            let id = prompt[i]
+            if i + 1 < prompt.count {
+                // Prefill stays greedy for KV; sampling starts at first gen token.
+                _ = try step(id)
+            } else {
+                last = try stepSampled(
+                    id, processor: processor, seen: seen, counts: counts, rng: &rng)
+            }
+        }
+        var out: [Int] = []
+        var y = last
+        while out.count < maxTokens {
+            out.append(y)
+            seen.insert(y)
+            counts[y, default: 0] += 1
+            if let eos, y == eos { break }
+            if out.count >= maxTokens { break }
+            y = try stepSampled(
+                y, processor: processor, seen: seen, counts: counts, rng: &rng)
+        }
+        return out
+    }
+
+    /// Sampled decode with model-free draft + rejection sampling (Phase 2).
+    /// Falls back to single-token sample when drafts are empty. Not distribution-exact
+    /// vs full-vocab OpenAI sampling (FlashHead candidate support).
+    public func generateSampledSpeculative(
+        prompt: [Int], maxTokens: Int,
+        processor: LogitsProcessor,
+        draftK: Int = 8,
+        eos: Int? = 151_645,
+        seed: UInt64? = nil
+    ) throws -> [Int] {
+        guard !prompt.isEmpty, maxTokens > 0 else { return [] }
+        reset()
+        var rng = SplitMix64(seed: seed ?? UInt64.random(in: 1 ... .max))
+        var seen = Set(prompt)
+        var counts: [Int: Int] = [:]
+        for t in prompt { counts[t, default: 0] += 1 }
+
+        var last = prompt[0]
+        for i in 0 ..< prompt.count {
+            let id = prompt[i]
+            if i + 1 < prompt.count {
+                _ = try step(id)
+            } else {
+                last = try stepSampled(
+                    id, processor: processor, seen: seen, counts: counts, rng: &rng)
+            }
+        }
+
+        let localIndex = SuffixDraftIndex(maxDepth: 64)
+        let useTree = ProcessInfo.processInfo.environment["MOMIJ_SPEC_TREE"] != "0"
+        var idsHist = prompt
+        idsHist.append(last)
+
+        var out: [Int] = []
+        var y = last
+        while out.count < maxTokens {
+            out.append(y)
+            seen.insert(y)
+            counts[y, default: 0] += 1
+            if let eos, y == eos { break }
+            let remain = maxTokens - out.count
+            if remain == 0 { break }
+
+            let meanAccept = 1.0  // opportunistic drafts; reject handles misses
+            let effK = SuffixSpec.adaptiveDraftK(
+                meanAccept: meanAccept, draftK: min(draftK, remain, specMaxM - 1))
+            localIndex.clear()
+            localIndex.insert(idsHist)
+            let treeHit = useTree
+                ? SuffixDraftIndex.bestDraft(
+                    local: localIndex, global: globalSuffixIndex,
+                    history: idsHist, maxK: effK, alpha: specAlpha)
+                : (matchLen: 0, tokens: [Int]())
+            let pld = SuffixSpec.suffixDraft(
+                history: idsHist, k: effK, promptLen: prompt.count)
+            let recycled = useRecycle ? recycleIndex.draft(from: y, maxK: min(effK, 4)) : []
+            let draft: [Int]
+            if treeHit.matchLen >= 1, !treeHit.tokens.isEmpty {
+                draft = treeHit.tokens
+            } else if !recycled.isEmpty {
+                draft = recycled
+            } else {
+                draft = pld
+            }
+
+            if draft.isEmpty {
+                y = try stepSampled(
+                    y, processor: processor, seen: seen, counts: counts, rng: &rng)
+                idsHist.append(y)
+                continue
+            }
+
+            // Rejection-sample along the draft; sample bonus if all accepted.
+            var cur = y
+            var accepted = 0
+            var stopped = false
+            for (i, d) in draft.enumerated() {
+                let cands = try stepCandidates(cur)
+                let prepared = processor.prepare(
+                    tokenIds: cands.ids, logits: cands.logits, seen: seen, counts: counts)
+                let decision = SpeculativeSampling.tryAccept(
+                    draftToken: d,
+                    ids: prepared.ids, logits: prepared.logits,
+                    processor: processor, rng: &rng)
+                if decision.accepted {
+                    accepted += 1
+                    out.append(d)
+                    seen.insert(d)
+                    counts[d, default: 0] += 1
+                    idsHist.append(d)
+                    cur = d
+                    if let eos, d == eos {
+                        y = d
+                        stopped = true
+                        break
+                    }
+                    if out.count >= maxTokens {
+                        y = d
+                        stopped = true
+                        break
+                    }
+                    if i + 1 == draft.count {
+                        // Bonus token from a fresh forward.
+                        y = try stepSampled(
+                            d, processor: processor, seen: seen, counts: counts, rng: &rng)
+                        idsHist.append(y)
+                        stopped = true
+                    }
+                } else {
+                    y = decision.token
+                    idsHist.append(y)
+                    stopped = true
+                    break
+                }
+            }
+            if !stopped {
+                y = try stepSampled(
+                    cur, processor: processor, seen: seen, counts: counts, rng: &rng)
+                idsHist.append(y)
+            }
+            _ = accepted
+        }
+        if out.count > maxTokens {
+            out = Array(out.prefix(maxTokens))
+        }
+        globalSuffixIndex.insert(out)
+        return out
+    }
+
     /// One token: embed → Metal layers (+final RMS + FlashHead centroids) → gather/sample.
     /// Updates Token Recycling adjacency from FlashHead candidates when enabled.
     @discardableResult

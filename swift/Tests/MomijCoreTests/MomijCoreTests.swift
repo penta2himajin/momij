@@ -82,6 +82,17 @@ final class SuffixSpecTests: XCTestCase {
         XCTAssertEqual(d, [9, 8])
     }
 
+    func testTokenRecycleDraftChain() {
+        let r = TokenRecycleIndex(topK: 4)
+        r.observe(fromToken: 10, candidates: [20, 21, 22])
+        r.observe(fromToken: 20, candidates: [30, 31])
+        r.observe(fromToken: 30, candidates: [40])
+        XCTAssertEqual(r.draft(from: 10, maxK: 3), [20, 30, 40])
+        // Recent observe wins ordering
+        r.observe(fromToken: 10, candidates: [99, 20])
+        XCTAssertEqual(r.draft(from: 10, maxK: 1).first, 99)
+    }
+
     func testSpecAcceptsMatchingDraft() throws {
         // Deterministic "model": always emits next = last+1
         var seq = 10

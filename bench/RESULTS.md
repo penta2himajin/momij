@@ -565,6 +565,38 @@ Verdict:
 4. `MOMIJ_SPEC_ALPHA` (default 1) controls `MAX_SPEC=αp`. Keep gate for cold
    open-ended chat.
 
+## 2026-09-10 open-chat ceiling (Token Recycling approx)
+
+Research: Token Recycling (Luo et al. ACL 2025) stores full-vocab top-k in an
+adjacency matrix (~2MB) and drafts via BFS — strong on Spec-Bench chat (~2×).
+SuffixDecoding alone is weak on high-entropy chat (WildChat); hybrid with
+EAGLE is the paper’s recommendation for mixed workloads.
+
+What we shipped: **FlashHead-approx TR** — top-k from gathered cluster logits
+(not full V), hybrid with suffix tree (`MOMIJ_SPEC_RECYCLE`, `MOMIJ_SPEC_TREE`).
+
+M1 Max, omlx stop, release, `MOMIJ_MROW=1`:
+
+| Prompt / mode | accept/gen | spec | greedy | src tree/rec | notes |
+|---|---|---|---|---|---|
+| fib hybrid | 0.84–0.86 | **~279–286** | ~190 | mostly tree | structured repeat |
+| “BST explain” hybrid | ~0.86 | **~287–292** | ~190 | all tree | Maple often self-repeats |
+| same, **TREE=0** (recycle only) | **0.16** | ~188 | ~189 | all recycle | ≈ greedy parity |
+| creative / short chat hybrid | ~0.86 | ~265–289 | ~180 | tree | **greedy text often loops** |
+
+Honest ceiling on this stack:
+
+1. **Open prompts under Maple greedy frequently collapse into repetition**
+   (confirmed via `momij generate --backend mlx`). Suffix trees then dominate;
+   inflated accept is partly model degeneration, not “smart chat drafting”.
+2. **FlashHead-approx TR alone ≈ 0.16 accept/gen** — enough to stay near greedy
+   when gated, **not** enough to beat it. Full-vocab TR / EAGLE would be the
+   next lever (needs exact head top-k or a trained draft; catalog still defers
+   P-EAGLE until draft ≫2.5× on AS).
+3. Practical open-chat path today: keep hybrid + MROW; expect wins when the
+   model’s own output is repetitive/structured; do not claim general chat 1.5×
+   without better sampling / chat template / draft model.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

@@ -264,6 +264,36 @@ public final class SeedlessFlashHead {
         return id
     }
 
+    /// Top-`k` token ids from the last FlashHead gather (probe clusters × rows).
+    /// Used for Token Recycling adjacency updates without a full-vocab top-k.
+    public func topTokenCandidates(
+        k: Int, inds: MTLBuffer? = nil, logits: MTLBuffer? = nil
+    ) -> [Int] {
+        let want = max(1, k)
+        let ib = inds ?? indsBuf
+        let lb = logits ?? logitsBuf
+        let nLogits = nProbes * clusterSize
+        let ip = ib.contents().bindMemory(to: Int32.self, capacity: nProbes)
+        let lp = lb.contents().bindMemory(to: Float.self, capacity: nLogits)
+        var order = Array(0 ..< nLogits)
+        order.sort { lp[$0] > lp[$1] }
+        var out: [Int] = []
+        out.reserveCapacity(want)
+        var seen = Set<Int>()
+        for local in order {
+            let probe = local / clusterSize
+            let row = local % clusterSize
+            let cluster = Int(ip[probe])
+            guard cluster >= 0, cluster < nClusters else { continue }
+            let tid = Int(tokenMapHost[cluster * clusterSize + row])
+            if seen.insert(tid).inserted {
+                out.append(tid)
+                if out.count >= want { break }
+            }
+        }
+        return out
+    }
+
     private func argmaxWithForce(
         topClusters: [Int], hostH: UnsafePointer<Float16>,
         forceBestId: Int = -1, forceBestScore: Float = -Float.infinity,

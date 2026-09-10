@@ -33,6 +33,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     private let specAlpha: Double
     /// Cross-request suffix tree (previous outputs). Shared for the engine lifetime.
     private let globalSuffixIndex = SuffixDraftIndex(maxDepth: 64)
+    /// FlashHead-approx Token Recycling adjacency (open-ended chat).
+    private let recycleIndex = TokenRecycleIndex(topK: 16)
+    private let useRecycle: Bool
     private var specFeedIds: MTLBuffer?
     private var specNormSlots: [MTLBuffer] = []
     private var specIndsSlots: [MTLBuffer] = []
@@ -64,6 +67,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         } else {
             specAlpha = SuffixSpec.defaultSpecAlpha
         }
+        // Default on: TR adjacency helps open chat; set MOMIJ_SPEC_RECYCLE=0 to disable.
+        useRecycle = ProcessInfo.processInfo.environment["MOMIJ_SPEC_RECYCLE"] != "0"
         let stackM = useMrow ? specMaxM : 1
         self.stack = try SeedlessLayerStack(
             store: store, device: device, fullMaxLen: fullMaxLen, maxM: stackM)
@@ -277,12 +282,22 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         return out
     }
 
-    public func reset() { stack.resetCaches() }
+    public func reset() {
+        stack.resetCaches()
+        // Keep global suffix + recycle across resets (warm multi-turn / trials).
+    }
 
     private func embedToken(_ id: Int) {
         precondition(id >= 0 && id < vocab)
         let src = embBuf.contents().advanced(by: id * H * 2)
         stack.hBuf.contents().copyMemory(from: src, byteCount: H * 2)
+    }
+
+    /// Observe FlashHead top candidates into the recycle adjacency for `fromToken`.
+    private func observeRecycle(fromToken: Int, inds: MTLBuffer? = nil, logits: MTLBuffer? = nil) {
+        guard useRecycle, let fh = flashHead else { return }
+        let cands = fh.topTokenCandidates(k: recycleIndex.topK, inds: inds, logits: logits)
+        recycleIndex.observe(fromToken: fromToken, candidates: cands)
     }
 
     private func nextToken() -> Int {
@@ -301,6 +316,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     }
 
     /// One token: embed → Metal layers (+final RMS + FlashHead centroids) → gather/sample.
+    /// Updates Token Recycling adjacency from FlashHead candidates when enabled.
     @discardableResult
     public func step(_ token: Int, profile: Bool = false) throws -> Int {
         var ph = PhaseMs()
@@ -320,6 +336,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         }
         let t2 = CFAbsoluteTimeGetCurrent()
         let next = nextToken()
+        observeRecycle(fromToken: token)
         let t3 = CFAbsoluteTimeGetCurrent()
         if profile {
             ph.embed = (t1 - t0) * 1000
@@ -399,8 +416,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 y = try step(prompt[i])
             }
         }
-        return try generateSuffixSpecFromPrefill(
+        let r = try generateSuffixSpecFromPrefill(
             first: y, promptIds: prompt, maxTokens: maxTokens, draftK: draftK, eos: eos)
+        return (r.tokens, r.accepted, r.attempts, r.gated)
     }
 
     /// Compare greedy vs SuffixSpec effective tok/s.
@@ -430,6 +448,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         var equal = true
         var acceptedTok = 0
         var producedTok = 0
+        var srcTree = 0, srcRecycle = 0, srcPld = 0
         for _ in 0 ..< trials {
             reset()
             var last = promptIds[0]
@@ -467,6 +486,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             acc += r2.accepted; att += r2.attempts; gat += r2.gated
             acceptedTok += r2.accepted
             producedTok += r2.tokens.count
+            srcTree += r2.srcTree; srcRecycle += r2.srcRecycle; srcPld += r2.srcPld
             if gOut != r.tokens { equal = false }
             _ = r
         }
@@ -475,10 +495,11 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         let aps = att > 0 ? Double(acc) / Double(att) : 0
         let frac = producedTok > 0 ? Double(acceptedTok) / Double(producedTok) : 0
         let base = String(
-            format: "suffix-spec bench (draftK=%d, n=%d, prompt=%d): greedy=%.1f tok/s  spec=%.1f tok/s  accept/attempt=%.2f  accept/gen=%.2f  attempts=%d gated=%d  lossless=%@  mrow=%@  global_tok=%d  alpha=%.1f",
+            format: "suffix-spec bench (draftK=%d, n=%d, prompt=%d): greedy=%.1f tok/s  spec=%.1f tok/s  accept/attempt=%.2f  accept/gen=%.2f  attempts=%d gated=%d  lossless=%@  mrow=%@  global_tok=%d  alpha=%.1f  recycle_n=%d  src(tree/rec/pld)=%d/%d/%d",
             draftK, trials, promptIds.count, g, s, aps, frac, att, gat,
             equal ? "true" : "false", useMrow ? "on" : "off",
-            globalSuffixIndex.tokenCount, specAlpha)
+            globalSuffixIndex.tokenCount, specAlpha,
+            recycleIndex.entryCount, srcTree, srcRecycle, srcPld)
         let chain = (try? benchmarkChainVerify(steps: 8, trials: 5)) ?? ""
         return base + (chain.isEmpty ? "" : "\n" + chain)
     }
@@ -549,7 +570,10 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     /// Prefill already done; `first` is the first generated token; `promptIds` is the prompt.
     private func generateSuffixSpecFromPrefill(
         first: Int, promptIds: [Int], maxTokens: Int, draftK: Int, eos: Int?
-    ) throws -> (tokens: [Int], accepted: Int, attempts: Int, gated: Int) {
+    ) throws -> (
+        tokens: [Int], accepted: Int, attempts: Int, gated: Int,
+        srcTree: Int, srcRecycle: Int, srcPld: Int
+    ) {
         var ids = promptIds
         var y = first
         var out: [Int] = [y]
@@ -567,6 +591,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         // Per-request suffix tree (SuffixDecoding). Rebuilt from `ids` each draft
         // (O(n·depth) on CPU ≪ one Metal step). Global tree caches prior outputs.
         let localIndex = SuffixDraftIndex(maxDepth: 64)
+        let useTree = ProcessInfo.processInfo.environment["MOMIJ_SPEC_TREE"] != "0"
+        var srcTree = 0, srcRecycle = 0, srcPld = 0
 
         while out.count < maxTokens {
             if let eos, y == eos { break }
@@ -578,17 +604,37 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 meanAccept: meanAccept, draftK: min(draftK, remain, specMaxM - 1))
             localIndex.clear()
             localIndex.insert(ids)
-            let draft = SuffixSpec.treeDraft(
-                history: ids, k: effK,
-                local: localIndex, global: globalSuffixIndex,
-                alpha: specAlpha, promptLen: promptIds.count)
-            // Soft gate: park on greedy after sustained misses. M-row verify is cheaper but
-            // still loses when accept≈0 (measured ~80 tok/s vs ~180 greedy).
-            let gateFloor = useMrow ? 0.5 : 1.0
+            let treeHit = useTree
+                ? SuffixDraftIndex.bestDraft(
+                    local: localIndex, global: globalSuffixIndex,
+                    history: ids, maxK: effK, alpha: specAlpha)
+                : (matchLen: 0, tokens: [Int]())
+            let pld = SuffixSpec.suffixDraft(
+                history: ids, k: effK, promptLen: promptIds.count)
+            let recycleK = min(effK, 4)
+            let recycled = useRecycle ? recycleIndex.draft(from: y, maxK: recycleK) : []
+            // Hybrid: any suffix-tree hit → tree; else Token Recycling; else PLD.
+            // matchLen≥1 (not 2): short open-chat n-grams still beat cold recycle.
+            let draft: [Int]
+            if treeHit.matchLen >= 1, !treeHit.tokens.isEmpty {
+                draft = treeHit.tokens
+                srcTree += 1
+            } else if !recycled.isEmpty {
+                draft = recycled
+                srcRecycle += 1
+            } else if !pld.isEmpty {
+                draft = pld
+                srcPld += 1
+            } else {
+                draft = treeHit.tokens
+                if !draft.isEmpty { srcTree += 1 }
+            }
+            // Soft gate: recycle-only / low-accept stays opportunistic (reprobe often).
+            let gateFloor: Double = useTree ? (useRecycle ? 0.25 : (useMrow ? 0.5 : 1.0)) : 0.15
             let suspend = gateOn
                 && acceptWindow.count >= gateWindow && meanAccept < gateFloor
-            // Periodic re-probe after gated stretch (late self-similarity / echo).
-            let reprobe = suspend && (out.count % 24 == 0) && !draft.isEmpty
+            // Periodic re-probe after gated stretch (late self-similarity / recycle warm-up).
+            let reprobe = suspend && (out.count % 8 == 0) && !draft.isEmpty
 
             if (draft.isEmpty || suspend) && !reprobe {
                 if !draft.isEmpty { gated += 1 }
@@ -618,7 +664,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             } else {
                 var acc = 0
                 var cur = y
-                for d in draft {
+                for (di, d) in draft.enumerated() {
                     let q = try step(cur)
                     out.append(q)
                     ids.append(q)
@@ -629,6 +675,11 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                         if let eos, q == eos { break }
                         if out.count >= maxTokens { break }
                     } else {
+                        // Rejected draft tail may still appear later (Token Recycling insight).
+                        if useRecycle {
+                            let rest = Array(draft[di...])
+                            recycleIndex.observe(fromToken: cur, candidates: [q] + rest)
+                        }
                         break
                     }
                 }
@@ -643,7 +694,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         if out.count > 1 {
             globalSuffixIndex.insert(out)
         }
-        return (out, acceptedTotal, attempts, gated)
+        return (out, acceptedTotal, attempts, gated, srcTree, srcRecycle, srcPld)
     }
 
     /// Snapshot → one-CB chain verify → restore+replay on partial accept.
@@ -651,6 +702,12 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         let feeds = [y] + draft  // M = D+1; evals[i] vs draft[i] for i<D; evals[D] is bonus next
         let snap = stack.snapshotCaches()
         let evals = try stepChainFeeds(feeds)
+        // Refresh recycle adjacency from each FlashHead row (open-chat TR).
+        if useRecycle {
+            for i in 0 ..< min(feeds.count, specIndsSlots.count) {
+                observeRecycle(fromToken: feeds[i], inds: specIndsSlots[i], logits: specLogitsSlots[i])
+            }
+        }
         var p = 0
         while p < draft.count, p < evals.count, evals[p] == draft[p] { p += 1 }
 

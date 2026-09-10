@@ -9,12 +9,14 @@ import MLX
 /// down gather → score reduce on one command buffer. Optional `gqmm2_up_swiglu`
 /// (`MOMIJ_FUSE_UP_SWIGLU=1`) fuses the first two; default keeps them separate (faster e2e).
 /// Experimental (default off): `MOMIJ_GQMM2_SPLITK=1` (micro↑ e2e↓), `MOMIJ_GQMM2_W16=1` (mild).
+/// `MOMIJ_GQMM2_TERNARY=1` Maple `{-α,0,+α}` path (separate metallib; packed/e2e measured regress).
 /// `gqmm2_rows_vec` (vectorized loads) and `gqmm2_rows_pf` measured packed-CB regress — not shipped.
 public enum SeedlessMetal {
     nonisolated(unsafe) static var device: MTLDevice?
     nonisolated(unsafe) static var queue: MTLCommandQueue?
     nonisolated(unsafe) static var gqmm2Pipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var gqmm2W16Pipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var gqmm2TernaryPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var gqmm2SplitKPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var gqmm2ReduceSKPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var gqmm2UpSwigluPipeline: MTLComputePipelineState?
@@ -112,6 +114,22 @@ public enum SeedlessMetal {
         return String(cString: raw) == "1"
     }
 
+    /// Maple ternary: `y = α · Σ(q−1)·x` (codes {0,1,2}, bias unused). Env: `MOMIJ_GQMM2_TERNARY=1`.
+    /// Separate metallib (not in stock compile) — measured packed/e2e regress; opt-in only.
+    public static var useTernary: Bool {
+        guard let raw = getenv("MOMIJ_GQMM2_TERNARY") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    private static func ensureTernaryCompiled() throws {
+        if gqmm2TernaryPipeline != nil { return }
+        try ensureCompiled()
+        guard let device else { throw SeedlessError.notReady }
+        let lib = try device.makeLibrary(source: ternaryMetalSource, options: mlxMatchCompileOpts())
+        gqmm2TernaryPipeline = try device.makeComputePipelineState(
+            function: lib.makeFunction(name: "gqmm2_rows_ternary")!)
+    }
+
     private static let gqmm2BlockSize = 512
 
     private static func ensureSKPartials(bytes: Int) throws -> MTLBuffer {
@@ -131,16 +149,19 @@ public enum SeedlessMetal {
         into encoder: MTLComputeCommandEncoder? = nil,
         commandQueue: MTLCommandQueue? = nil,
         splitK: Bool? = nil,
-        w16: Bool? = nil
+        w16: Bool? = nil,
+        ternary: Bool? = nil
     ) throws {
         try ensureCompiled()
         guard let stop = stopBuf else { throw SeedlessError.notReady }
         let doSK = splitK ?? useSplitK
-        let doW16 = !doSK && (w16 ?? useW16)
+        let doTernary = !doSK && (ternary ?? useTernary)
+        let doW16 = !doSK && !doTernary && (w16 ?? useW16)
         let rowsPerTG = doW16 ? 16 : 8
         guard N % rowsPerTG == 0, K % gqmm2BlockSize == 0, gs == 64 || gs == 128 else {
             throw SeedlessError.unsupportedShape(N: N, K: K, gs: gs)
         }
+        if doTernary { try ensureTernaryCompiled() }
 
         let ownsCB = encoder == nil
         let q = commandQueue ?? queue!
@@ -186,8 +207,16 @@ public enum SeedlessMetal {
                 MTLSize(width: N, height: Ktop, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: min(256, N), height: 1, depth: 1))
         } else {
-            guard let pipe = doW16 ? gqmm2W16Pipeline : gqmm2Pipeline else {
-                throw SeedlessError.notReady
+            let pipe: MTLComputePipelineState
+            if doTernary {
+                guard let t = gqmm2TernaryPipeline else { throw SeedlessError.notReady }
+                pipe = t
+            } else if doW16 {
+                guard let w = gqmm2W16Pipeline else { throw SeedlessError.notReady }
+                pipe = w
+            } else {
+                guard let p = gqmm2Pipeline else { throw SeedlessError.notReady }
+                pipe = p
             }
             enc.setComputePipelineState(pipe)
             enc.setBuffer(w, offset: 0, index: 0)
@@ -1692,6 +1721,72 @@ public enum SeedlessMetal {
                 }
             }
             ids[outRow] = bestId;
+        }
+    }
+    """
+
+    /// Opt-in Maple ternary gather (separate metallib — avoids stock-path bloat).
+    private static let ternaryMetalSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+    #define SIMD_SIZE 32
+
+    kernel void gqmm2_rows_ternary(
+        device const uint32_t* w      [[buffer(0)]],
+        device const half*     scales [[buffer(1)]],
+        device const half*     biases [[buffer(2)]],
+        device const half*     x      [[buffer(3)]],
+        device const int*      inds   [[buffer(4)]],
+        device half*           y      [[buffer(5)]],
+        constant int& in_vec_size  [[buffer(6)]],
+        constant int& out_vec_size [[buffer(7)]],
+        constant int& ktop         [[buffer(8)]],
+        device const int* stopFlag [[buffer(9)]],
+        constant uint& lhsPer      [[buffer(10)]],
+        constant int&  gsz         [[buffer(11)]],
+        uint3 tid      [[threadgroup_position_in_grid]],
+        uint  simd_gid [[simdgroup_index_in_threadgroup]],
+        uint  simd_lid [[thread_index_in_simdgroup]])
+    {
+        if (stopFlag[0] != 0) return;
+        (void)biases;
+        constexpr int packs_per_thread = 1, num_simdgroups = 2, results_per_simdgroup = 4;
+        constexpr int pack_factor = 16, bytes_per_pack = 4, values_per_thread = 16;
+        constexpr int block_size = 512;
+        const device uint8_t* ws = (const device uint8_t*)w;
+        thread float x_thread[16];
+        thread float result[4] = {0};
+        const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+        const int in_vec_size_g = in_vec_size / gsz;
+        uint mk = tid.z;
+        uint e = (uint)inds[mk];
+        ws     += (size_t)e * out_vec_size * in_vec_size_w;
+        scales += (size_t)e * out_vec_size * in_vec_size_g;
+        const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+        ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+        scales += out_row * in_vec_size_g;
+        x += (size_t)(lhsPer ? mk : mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
+        y += (size_t)mk * out_vec_size + out_row;
+        for (int k = 0; k < in_vec_size; k += block_size) {
+            for (int i = 0; i < 16; i++) x_thread[i] = (float)x[i];
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                float accum = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    accum += ((float)( wl[i]        & 0x03) - 1.0f) * x_thread[4*i]
+                           + ((float)((wl[i] >> 2) & 0x03) - 1.0f) * x_thread[4*i+1]
+                           + ((float)((wl[i] >> 4) & 0x03) - 1.0f) * x_thread[4*i+2]
+                           + ((float)((wl[i] >> 6) & 0x03) - 1.0f) * x_thread[4*i+3];
+                }
+                result[row] += accum;
+            }
+            ws += block_size * bytes_per_pack / pack_factor;
+            x += block_size;
+        }
+        for (int row = 0; row < results_per_simdgroup; row++) {
+            float alpha = (float)scales[row * in_vec_size_g];
+            result[row] = simd_sum(result[row]) * alpha;
+            if (simd_lid == 0) y[row] = (half)result[row];
         }
     }
     """

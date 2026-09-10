@@ -125,10 +125,10 @@ final class SeedlessMetalTests: XCTestCase {
         let enc = cb.makeComputeCommandEncoder()!
         try SeedlessMetal.gqmm2(
             x: x, w: w, scales: s, biases: b, inds: inds, out: y0,
-            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: false, w16: false)
+            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: false, w16: false, ternary: false)
         try SeedlessMetal.gqmm2(
             x: x, w: w, scales: s, biases: b, inds: inds, out: y1,
-            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: true, w16: false)
+            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: true, w16: false, ternary: false)
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
@@ -145,6 +145,85 @@ final class SeedlessMetalTests: XCTestCase {
         }
         let rel = sqrt(num / max(den, 1e-30))
         XCTAssertLessThan(rel, 1e-3, "split-K gqmm2 must match default; rel_l2=\(rel) maxAbs=\(maxAbs)")
+    }
+
+    /// Maple ternary: codes ∈ {0,1,2}, bias == -scale, α constant across groups.
+    /// Ternary path must match stock affine gqmm2 on such weights.
+    func testGqmm2TernaryMatchesAffineOnTernaryWeights() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 512, N = 128, E = 4, Ktop = 2, gs = 128
+        func buf(_ bytes: Int) -> MTLBuffer {
+            device.makeBuffer(length: bytes, options: .storageModeShared)!
+        }
+        let packedK = H * 2 / 32  // uint32 count along K
+        let nGroups = H / gs
+        let x = buf(H * 2)
+        let xp = x.contents().bindMemory(to: Float16.self, capacity: H)
+        for i in 0 ..< H { xp[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+
+        let w = buf(E * N * packedK * 4)
+        let wp = w.contents().bindMemory(to: UInt32.self, capacity: E * N * packedK)
+        // Pack 16 codes {0,1,2} per uint32 (LSB first), never 3.
+        var seed: UInt64 = 0xC0FFEE
+        for i in 0 ..< (E * N * packedK) {
+            var word: UInt32 = 0
+            for t in 0 ..< 16 {
+                seed = seed &* 6364136223846793005 &+ 1
+                let code = UInt32(seed % 3)  // 0,1,2
+                word |= code << (UInt32(t) * 2)
+            }
+            wp[i] = word
+        }
+        let s = buf(E * N * nGroups * 2)
+        let b = buf(E * N * nGroups * 2)
+        let sp = s.contents().bindMemory(to: Float16.self, capacity: E * N * nGroups)
+        let bp = b.contents().bindMemory(to: Float16.self, capacity: E * N * nGroups)
+        for e in 0 ..< E {
+            for n in 0 ..< N {
+                let alpha = Float16(0.02 + 0.001 * Float((e * N + n) % 13))
+                for g in 0 ..< nGroups {
+                    let idx = ((e * N) + n) * nGroups + g
+                    sp[idx] = alpha
+                    bp[idx] = -alpha
+                }
+            }
+        }
+        let inds = buf(Ktop * 4)
+        let ip = inds.contents().bindMemory(to: Int32.self, capacity: Ktop)
+        ip[0] = 1; ip[1] = 2
+        let y0 = buf(Ktop * N * 2)
+        let y1 = buf(Ktop * N * 2)
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        try SeedlessMetal.gqmm2(
+            x: x, w: w, scales: s, biases: b, inds: inds, out: y0,
+            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: false, w16: false, ternary: false)
+        try SeedlessMetal.gqmm2(
+            x: x, w: w, scales: s, biases: b, inds: inds, out: y1,
+            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: false, w16: false, ternary: true)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let a = y0.contents().bindMemory(to: Float16.self, capacity: Ktop * N)
+        let bOut = y1.contents().bindMemory(to: Float16.self, capacity: Ktop * N)
+        var maxAbs: Float = 0
+        var num = 0.0, den = 0.0
+        for i in 0 ..< (Ktop * N) {
+            let d = abs(Float(a[i]) - Float(bOut[i]))
+            maxAbs = max(maxAbs, d)
+            num += Double(d * d)
+            den += Double(Float(a[i]) * Float(a[i]))
+        }
+        let rel = sqrt(num / max(den, 1e-30))
+        // Affine path uses masked·pre-divide; ternary uses shift·plain x.
+        // Same real math (bias=-α); half rounding differs at ~1e-3–3e-3.
+        XCTAssertLessThan(rel, 5e-3, "ternary gqmm2 must match affine on ternary weights; rel_l2=\(rel) maxAbs=\(maxAbs)")
+        XCTAssertLessThan(maxAbs, 5e-3, "ternary maxAbs too large: \(maxAbs)")
     }
 
     func testGqmm2W16MatchesDefault() throws {
@@ -182,10 +261,10 @@ final class SeedlessMetalTests: XCTestCase {
         let enc = cb.makeComputeCommandEncoder()!
         try SeedlessMetal.gqmm2(
             x: x, w: w, scales: s, biases: b, inds: inds, out: y0,
-            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: false, w16: false)
+            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: false, w16: false, ternary: false)
         try SeedlessMetal.gqmm2(
             x: x, w: w, scales: s, biases: b, inds: inds, out: y1,
-            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: false, w16: true)
+            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: false, w16: true, ternary: false)
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
@@ -240,7 +319,7 @@ final class SeedlessMetalTests: XCTestCase {
         let enc = cb.makeComputeCommandEncoder()!
         try SeedlessMetal.gqmm2(
             x: x, w: ugW, scales: ugS, biases: ugB, inds: inds, out: ugOut,
-            Ktop: Ktop, K: H, N: 2 * I, gs: gs, into: enc)
+            Ktop: Ktop, K: H, N: 2 * I, gs: gs, into: enc, ternary: false)
         SeedlessMetal.encodeClampedSwiglu(into: enc, ug: ugOut, act: actSep, I: I, Ktop: Ktop)
         try SeedlessMetal.gqmm2UpSwiglu(
             x: x, w: ugW, scales: ugS, biases: ugB, inds: inds, out: actFused,

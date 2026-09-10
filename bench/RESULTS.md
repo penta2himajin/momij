@@ -267,6 +267,23 @@ Tried vectorized `half4` x-load + `uint32` weight pack (`gqmm2_rows_vec`), parit
 
 Not shipped (removed from metallib). Same family as PF: micro/load tricks do not raise the packed MoE floor. Remaining MoE levers need a different angle (layout / fewer bytes / Qwisp diff), not load vectorization.
 
+## 2026-09-10 gqmm2 ternary (`{-α,0,+α}`) — no-go for packed floor
+
+Maple-Preview is natively ternary (`codes∈{0,1,2}`, `bias=-α`, row `α`). Opt-in kernel
+`gqmm2_rows_ternary`: `y = α·Σ(q−1)·x`, no x pre-divide, α once from scales group0,
+biases unused. Parity vs affine on ternary weights: rel_l2≈3e-3 (float schedule). Separate
+metallib via `ensureTernaryCompiled` (not co-compiled with stock).
+
+| Probe (interleaved) | stock | `MOMIJ_GQMM2_TERNARY=1` |
+|---|---|---|
+| 24L commit→1w GPU | ~5.2–5.3 ms | **~5.6 ms worse** |
+| e2e p128/g128 n=3 | **~181** | **~173 regress** |
+
+Default stays stock. Env left opt-in for further experiments. Lesson: on M1 Max the
+MLX-tuned masked·pre-divide affine stream already wins; rewriting to signed trit mul
+adds work / different issue mix and does not raise the packed floor. Next MoE levers:
+M-row batched verify, or layout / fewer intermediate bytes — not another trit ALU rewrite.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

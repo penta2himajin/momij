@@ -284,6 +284,23 @@ MLX-tuned masked·pre-divide affine stream already wins; rewriting to signed tri
 adds work / different issue mix and does not raise the packed floor. Next MoE levers:
 M-row batched verify, or layout / fewer intermediate bytes — not another trit ALU rewrite.
 
+## 2026-09-10 gqmm2 fold-α (stock qd2, hoisted row α) — default on
+
+Keep stock `ld16_b2`/`qd2` FMA stream; only Maple identities: load row `α` once from
+`scales[group0]`, pass `bias=-α`, do not advance scales/biases along K. Kernel
+`gqmm2_rows_fold` in a **separate** metallib (ternary wins if both set).
+Parity vs affine on row-constant-α weights: rel_l2 < 1e-3.
+
+| Probe (interleaved) | per-group affine | fold |
+|---|---|---|
+| gqmm2 micro kernel/s | 2611 / 3239 | 2703 / 2672 (noise) |
+| 24L commit→1w GPU | 4.97 / 5.06 ms | 4.99 / 4.92 ms (tie) |
+| e2e p128/g128 n=3 | 179.1 / 180.1 | 177.0 / 182.4 (tie, mean ~179.6 vs ~179.7) |
+
+No measured packed/e2e win, but also no loss, and the kernel does less work (no
+per-group scale/bias walk). **Default is fold**; `MOMIJ_GQMM2_FOLD=0` restores affine.
+Tighter rewrite `α·(accum−sum)` would change the FMA mix (ternary-class risk); not tried.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

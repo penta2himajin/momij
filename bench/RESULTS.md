@@ -316,6 +316,24 @@ No win. Inner FMA stream is unchanged but moving α out of the K-loop did not
 raise the packed floor; e2e mean is inside fold's own spread. **Default stays
 fold.** Env left opt-in; do not promote on a tie.
 
+## 2026-09-10 gqmm2 fold-A (`α·(accum−sum)` epilogue) — no stack win
+
+Variant A: same as fold (`ld16_b2` + masked 16-way) but epilogue is
+`α·(accum−sum)` instead of `α·accum + (−α)·sum`. Separate metallib
+`gqmm2_rows_fold_a`, env `MOMIJ_GQMM2_FOLD_A=1`. Parity vs fold: rel_l2 < 1e-3.
+Interleaved vs fold default and defer-α (B) to test whether noise-level
+rewrites accumulate.
+
+| Probe (interleaved) | fold | A (`FOLD_A=1`) | B (`DEFER_A=1`) |
+|---|---|---|---|
+| 24L commit→1w GPU | 4.41 / 4.36 ms | 4.52 / 5.57 ms | 4.75 / 5.56 ms |
+| e2e p128/g128 n=3 | 204.1 / 205.1 | 199.8 / 205.5 | 205.0 / 205.1 |
+
+Means: fold ~204.6, A ~202.7, B ~205.0 tok/s. A/B do not stack into a packed
+or e2e win; pair-1 packed is fold < A < B (A/B slightly slower). **Default
+stays fold.** Env left opt-in. Algebraic epilogue tweaks are not an additive
+lever on this issue-bound `qd2` stream.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

@@ -432,6 +432,26 @@ Honest read:
 - Full attn M-row still needs `qk_norm_rope` + `writeKV` (and RMS) for M
   tokens with per-row RoPE / cache slots. Do not default decode to M-row.
 
+## 2026-09-10 True M-row attn block (qk-norm / writeKV / causal SDPA)
+
+`encodeAttnBlock(..., M:)`: QKV/O `gqmm2` M, `qk_norm_rope` depth M with
+RoPE `pos+m`, `writeKV` slots `writePos+m`, SDPA token-major `[M, heads, D]`
+and `N = seqLen+m` when `causalM`. `rotateFirst` stays M=1-only. Decode still
+`M=1`. Parity: M=2 vs two sequential M=1 (shared prefix cache), rel_l2 < 1e-3.
+
+Warm interleaved `M=1,2,4,8,8,4,2,1` (20 iters). Maple 16h/4kv, writePos=32
+so SDPA N=33. omlx stopped.
+
+| probe | M=1 gpu_ms | M=2 vsM1 | M=4 | M=8 |
+|---|---|---|---|---|
+| attn-block | 0.226 | **0.90** | 0.39 | 0.39 |
+| sdpa N=128 (shared N, this session) | 0.193 | 0.91 | 0.38 | 0.21 |
+
+Earlier SDPA-only 0.17× at M=2 was M=1 launch tax. Honest packing: **attn
+block is like O-proj — M=2 ≈ no win, M≥4 is 0.39×**. Draft=2 will not move
+sequential attn; QKV still packs but o-proj + epilogue dominate the block.
+Do not default decode to M-row. Next structural gap is router / e2e M≥2.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

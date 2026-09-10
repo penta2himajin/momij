@@ -550,13 +550,13 @@ public enum SeedlessMetal {
                             threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
     }
 
-    /// Decode SDPA. Queries laid out `[numHeads, M, headDim]`; `tid.y` is the query row.
-    /// Same KV cache for all M (prefix reuse). `encodeAttnBlock` still uses M=1.
+    /// Decode SDPA. Queries laid out `[M, numHeads, headDim]`; `tid.y` is the query row.
+    /// Same KV cache for all M. `causalM`: query m uses `N = seqLen + m` (draft-causal).
     public static func encodeSdpa(
         into enc: MTLComputeCommandEncoder,
         queries: MTLBuffer, kCache: MTLBuffer, vCache: MTLBuffer, out: MTLBuffer,
         numHeads: Int, numKV: Int, headDim: Int,
-        maxLen: Int, seqLen: Int, M: Int = 1
+        maxLen: Int, seqLen: Int, M: Int = 1, causalM: Bool = false
     ) {
         enc.setComputePipelineState(sdpaPipeline!)
         enc.setBuffer(queries, offset: 0, index: 0)
@@ -567,6 +567,7 @@ public enum SeedlessMetal {
         var khs = Int32(maxLen * headDim), kss = Int32(headDim)
         var vhs = Int32(maxLen * headDim), vss = Int32(headDim)
         var sc = Float(pow(Double(headDim), -0.5))
+        var causal = Int32(causalM ? 1 : 0)
         enc.setBytes(&gqa, length: 4, index: 4)
         enc.setBytes(&n32, length: 4, index: 5)
         enc.setBytes(&khs, length: 4, index: 6)
@@ -574,12 +575,15 @@ public enum SeedlessMetal {
         enc.setBytes(&vhs, length: 4, index: 8)
         enc.setBytes(&vss, length: 4, index: 9)
         enc.setBytes(&sc, length: 4, index: 10)
+        enc.setBytes(&causal, length: 4, index: 11)
         enc.dispatchThreadgroups(
             MTLSize(width: numHeads, height: M, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
     }
 
-    /// Decode attn body. `ropePos` = absolute RoPE index; `writePos` = cache slot; `seqLen` = SDPA N.
+    /// Decode attn body. `ropePos` / `writePos` / `seqLen` are for token 0;
+    /// `M>1` uses RoPE `pos+m`, writes cache slots `writePos+m`, and causal SDPA
+    /// (`N = seqLen + m`). Decode still calls this with `M=1`. `rotateFirst` is M=1 only.
     public static func encodeAttnBlock(
         into enc: MTLComputeCommandEncoder,
         xNorm: MTLBuffer,
@@ -590,11 +594,15 @@ public enum SeedlessMetal {
         kCache: MTLBuffer, vCache: MTLBuffer,
         H: Int, numHeads: Int, numKV: Int, headDim: Int,
         ropeDim: Int, ropePos: Int, writePos: Int, maxLen: Int, seqLen: Int,
-        eps: Float, gs: Int = 128, rotateFirst: Bool = false
+        eps: Float, gs: Int = 128, M: Int = 1, rotateFirst: Bool = false
     ) throws {
         try ensureCompiled()
         guard let qkPipe = qkNormRopePipeline, let writeKV = writeKVPipeline, sdpaPipeline != nil
         else { throw SeedlessError.notReady }
+        guard M >= 1 else { throw SeedlessError.unsupportedShape(N: H, K: H, gs: gs) }
+        if rotateFirst && M > 1 {
+            throw SeedlessError.unsupportedShape(N: H, K: H, gs: gs)
+        }
 
         let qDim = numHeads * headDim
         let kvDim = numKV * headDim
@@ -616,7 +624,7 @@ public enum SeedlessMetal {
         }
 
         try gqmm2(x: xNorm, w: qkvW, scales: qkvS, biases: qkvB, inds: densInds, out: qkvOut,
-                  Ktop: 1, K: H, N: qkvN, gs: gs, lhsPerExpert: false, into: enc)
+                  Ktop: 1, K: H, N: qkvN, gs: gs, lhsPerExpert: false, M: M, into: enc)
 
         enc.setComputePipelineState(qkPipe)
         enc.setBuffer(qkvOut, offset: 0, index: 0)
@@ -624,22 +632,31 @@ public enum SeedlessMetal {
         enc.setBuffer(qkOut, offset: 0, index: 2)
         enc.setBuffer(invFreq, offset: 0, index: 3)
         var posF = Float(ropePos), epsV = eps, rope = Int32(ropeDim)
+        var m32 = Int32(M), inRow = Int32(qkvN), nQ = Int32(numHeads), nK = Int32(numKV)
         enc.setBytes(&posF, length: 4, index: 4)
         enc.setBytes(&epsV, length: 4, index: 5)
         enc.setBytes(&rope, length: 4, index: 6)
+        enc.setBytes(&m32, length: 4, index: 7)
+        enc.setBytes(&inRow, length: 4, index: 8)
+        enc.setBytes(&nQ, length: 4, index: 9)
+        enc.setBytes(&nK, length: 4, index: 10)
         let nQK = numHeads + numKV
-        enc.dispatchThreadgroups(MTLSize(width: 1, height: nQK, depth: 1),
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: nQK, depth: M),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
         var kv32 = Int32(numKV), d32 = Int32(headDim), ml32 = Int32(maxLen), p32 = Int32(writePos)
+        var srcHS = Int32(headDim), srcSSK = Int32(kvDim), srcSSV = Int32(qkvN)
         enc.setComputePipelineState(writeKV)
-        enc.setBuffer(qkOut, offset: qDim * 2, index: 0)
+        enc.setBuffer(qkOut, offset: qDim * M * 2, index: 0)
         enc.setBuffer(kCache, offset: 0, index: 1)
         enc.setBytes(&kv32, length: 4, index: 2)
         enc.setBytes(&d32, length: 4, index: 3)
         enc.setBytes(&ml32, length: 4, index: 4)
         enc.setBytes(&p32, length: 4, index: 5)
-        enc.dispatchThreads(MTLSize(width: kvDim, height: 1, depth: 1),
+        enc.setBytes(&m32, length: 4, index: 6)
+        enc.setBytes(&srcHS, length: 4, index: 7)
+        enc.setBytes(&srcSSK, length: 4, index: 8)
+        enc.dispatchThreads(MTLSize(width: kvDim, height: M, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(256, kvDim), height: 1, depth: 1))
 
         enc.setComputePipelineState(writeKV)
@@ -649,16 +666,19 @@ public enum SeedlessMetal {
         enc.setBytes(&d32, length: 4, index: 3)
         enc.setBytes(&ml32, length: 4, index: 4)
         enc.setBytes(&p32, length: 4, index: 5)
-        enc.dispatchThreads(MTLSize(width: kvDim, height: 1, depth: 1),
+        enc.setBytes(&m32, length: 4, index: 6)
+        enc.setBytes(&srcHS, length: 4, index: 7)
+        enc.setBytes(&srcSSV, length: 4, index: 8)
+        enc.dispatchThreads(MTLSize(width: kvDim, height: M, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(256, kvDim), height: 1, depth: 1))
 
         encodeSdpa(
             into: enc, queries: qkOut, kCache: kCache, vCache: vCache, out: attnTmp,
             numHeads: numHeads, numKV: numKV, headDim: headDim,
-            maxLen: maxLen, seqLen: seqLen, M: 1)
+            maxLen: maxLen, seqLen: seqLen, M: M, causalM: M > 1)
 
         try gqmm2(x: attnTmp, w: oW, scales: oS, biases: oB, inds: densInds, out: attnOut,
-                  Ktop: 1, K: qDim, N: H, gs: gs, lhsPerExpert: false, into: enc)
+                  Ktop: 1, K: qDim, N: H, gs: gs, lhsPerExpert: false, M: M, into: enc)
     }
 
     /// One full layer decode: input_rms → attn → resid → MoE block.
@@ -1317,6 +1337,122 @@ public enum SeedlessMetal {
         return out.joined(separator: "\n")
     }
 
+    /// GPU-timed full `encodeAttnBlock` M-row (qkv + qk-norm/RoPE + writeKV + causal SDPA + o).
+    public static func benchAttnBlockMrow(
+        H: Int = 2048, numHeads: Int = 16, numKV: Int = 4, headDim: Int = 128,
+        maxM: Int = 8, iters: Int = 20, writePos: Int = 32, maxLen: Int = 128
+    ) throws -> String {
+        try ensureCompiled()
+        guard let device else { throw SeedlessError.notReady }
+        let gs = 128
+        let qDim = numHeads * headDim
+        let kvDim = numKV * headDim
+        let qkvN = qDim + 2 * kvDim
+        let packedH = H * 2 / 32
+        let packedQ = qDim * 2 / 32
+        let nGH = H / gs
+        let nGQ = qDim / gs
+        let seqLen = writePos + 1
+
+        func fillAlpha(_ buf: MTLBuffer, n: Int) {
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = 0.02 }
+        }
+        func fillNeg(_ buf: MTLBuffer, n: Int) {
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = -0.02 }
+        }
+        func fillX(_ buf: MTLBuffer, n: Int) {
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+        }
+
+        let dens = device.makeBuffer(length: 4, options: .storageModeShared)!
+        dens.contents().storeBytes(of: Int32(0), as: Int32.self)
+        let x = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared)!
+        fillX(x, n: maxM * H)
+        let qkvW = device.makeBuffer(length: qkvN * packedH * 4, options: .storageModeShared)!
+        let qkvS = device.makeBuffer(length: qkvN * nGH * 2, options: .storageModeShared)!
+        let qkvB = device.makeBuffer(length: qkvN * nGH * 2, options: .storageModeShared)!
+        fillAlpha(qkvS, n: qkvN * nGH)
+        fillNeg(qkvB, n: qkvN * nGH)
+        let oW = device.makeBuffer(length: H * packedQ * 4, options: .storageModeShared)!
+        let oS = device.makeBuffer(length: H * nGQ * 2, options: .storageModeShared)!
+        let oB = device.makeBuffer(length: H * nGQ * 2, options: .storageModeShared)!
+        fillAlpha(oS, n: H * nGQ)
+        fillNeg(oB, n: H * nGQ)
+        let qkW = device.makeBuffer(length: (numHeads + numKV) * headDim * 2, options: .storageModeShared)!
+        fillAlpha(qkW, n: (numHeads + numKV) * headDim)
+        let inv = device.makeBuffer(length: 32 * 4, options: .storageModeShared)!
+        let ip = inv.contents().bindMemory(to: Float.self, capacity: 32)
+        for i in 0 ..< 32 { ip[i] = 0.1 / Float(i + 1) }
+        let qkvOut = device.makeBuffer(length: maxM * qkvN * 2, options: .storageModeShared)!
+        let qkOut = device.makeBuffer(length: maxM * (qDim + kvDim) * 2, options: .storageModeShared)!
+        let attnTmp = device.makeBuffer(length: maxM * qDim * 2, options: .storageModeShared)!
+        let attnOut = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared)!
+        let kCache = device.makeBuffer(length: numKV * maxLen * headDim * 2, options: .storageModeShared)!
+        let vCache = device.makeBuffer(length: numKV * maxLen * headDim * 2, options: .storageModeShared)!
+        fillX(kCache, n: numKV * maxLen * headDim)
+        fillX(vCache, n: numKV * maxLen * headDim)
+
+        func time(M: Int) throws -> Double {
+            var gpu = 0.0
+            for _ in 0 ..< iters {
+                gpu += try timeCB { enc in
+                    try encodeAttnBlock(
+                        into: enc, xNorm: x,
+                        qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
+                        oW: oW, oS: oS, oB: oB,
+                        qkW: qkW, invFreq: inv, densInds: dens,
+                        qkvOut: qkvOut, qkOut: qkOut, attnTmp: attnTmp, attnOut: attnOut,
+                        kCache: kCache, vCache: vCache,
+                        H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
+                        ropeDim: 64, ropePos: writePos, writePos: writePos, maxLen: maxLen, seqLen: seqLen,
+                        eps: 1e-6, gs: gs, M: M)
+                }.gpuMs
+            }
+            return gpu / Double(iters)
+        }
+
+        for _ in 0 ..< 8 {
+            _ = try timeCB { enc in
+                try encodeAttnBlock(
+                    into: enc, xNorm: x,
+                    qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
+                    oW: oW, oS: oS, oB: oB,
+                    qkW: qkW, invFreq: inv, densInds: dens,
+                    qkvOut: qkvOut, qkOut: qkOut, attnTmp: attnTmp, attnOut: attnOut,
+                    kCache: kCache, vCache: vCache,
+                    H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
+                    ropeDim: 64, ropePos: writePos, writePos: writePos, maxLen: maxLen, seqLen: seqLen,
+                    eps: 1e-6, gs: gs, M: maxM)
+            }
+        }
+
+        var acc: [Int: (gpu: Double, n: Int)] = [:]
+        for M in [1, 2, 4, 8, 8, 4, 2, 1] where M <= maxM {
+            let gpu = try time(M: M)
+            let a = acc[M] ?? (0, 0)
+            acc[M] = (a.gpu + gpu, a.n + 1)
+        }
+        let gpu1 = (acc[1] ?? (0, 1)).gpu / Double((acc[1] ?? (0, 1)).n)
+        var lines = [
+            "attn-block M-row (H=\(H) 16h/4kv N=\(seqLen), \(iters) iters, warm)",
+            "  mode        M   gpu_ms   ms/tok     vsM1    tok/s"
+        ]
+        for M in [1, 2, 4, 8] where M <= maxM {
+            let a = acc[M]!
+            let gpu = a.gpu / Double(a.n)
+            let per = gpu / Double(M)
+            let vs = gpu1 > 0 ? per / gpu1 : 0
+            let tps = per > 0 ? 1000.0 / per : 0
+            lines.append(
+                "  dense    \(String(format: "%4d %8.3f %8.3f %8.3f %8.0f", M, gpu, per, vs, tps))"
+            )
+        }
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: - Metal source
 
     private static let metalSource = """
@@ -1927,22 +2063,36 @@ public enum SeedlessMetal {
 
     // Milestone B: decode attention (HEAD_DIM=128, GQA).
     kernel void maple_qk_norm_rope(
-        device const half* x [[buffer(0)]],      // [nHeads, 128]
-        device const half* w [[buffer(1)]],
-        device half* out [[buffer(2)]],
+        device const half* x [[buffer(0)]],      // [M, qkvN] token-major; Q|K at start of each row
+        device const half* w [[buffer(1)]],      // [nQ+nK, 128]
+        device half* out [[buffer(2)]],          // Q [M, nQ, 128] then K [M, nK, 128]
         device const float* inv_freq [[buffer(3)]],
         constant float& pos [[buffer(4)]],
         constant float& eps [[buffer(5)]],
         constant int& ropeDim [[buffer(6)]],
-        uint2 tid [[thread_position_in_grid]])
+        constant int& M [[buffer(7)]],
+        constant int& inRow [[buffer(8)]],
+        constant int& nQ [[buffer(9)]],
+        constant int& nK [[buffer(10)]],
+        uint3 tid [[thread_position_in_grid]])
     {
         constexpr int HEAD_DIM = 128;
         constexpr int per_lane = HEAD_DIM / 32;
-        uint head = tid.y;
         uint lane = tid.x;
-        const device half* xh = x + head * HEAD_DIM;
+        uint head = tid.y;
+        uint m = tid.z;
+        if (m >= (uint)M) return;
+        const device half* xh = x + (size_t)m * (size_t)inRow + (size_t)head * HEAD_DIM;
         const device half* wh = w + head * HEAD_DIM;
-        device half* oh = out + head * HEAD_DIM;
+        device half* oh;
+        if ((int)head < nQ) {
+            oh = out + ((size_t)m * (size_t)nQ + (size_t)head) * HEAD_DIM;
+        } else {
+            uint hk = head - (uint)nQ;
+            oh = out + (size_t)nQ * (size_t)M * HEAD_DIM
+               + ((size_t)m * (size_t)nK + (size_t)hk) * HEAD_DIM;
+        }
+        float pos_m = pos + float(m);
         float ss = 0.0f;
         for (int i = 0; i < per_lane; ++i) {
             float v = float(xh[lane * per_lane + i]);
@@ -1956,7 +2106,7 @@ public enum SeedlessMetal {
             if (ropeDim > 0 && j < ropeDim) {
                 int rhalf = ropeDim / 2;
                 int p = j < rhalf ? j : j - rhalf;
-                float theta = pos * inv_freq[p];
+                float theta = pos_m * inv_freq[p];
                 float c = metal::cos(theta);
                 float s = metal::sin(theta);
                 int j2 = j < rhalf ? j + rhalf : j - rhalf;
@@ -1974,11 +2124,16 @@ public enum SeedlessMetal {
         constant int& D [[buffer(3)]],
         constant int& maxLen [[buffer(4)]],
         constant int& pos [[buffer(5)]],
-        uint i [[thread_position_in_grid]])
+        constant int& M [[buffer(6)]],
+        constant int& srcHeadStride [[buffer(7)]],
+        constant int& srcSeqStride [[buffer(8)]],
+        uint2 gid [[thread_position_in_grid]])
     {
-        if (i >= (uint)(KV * D)) return;
+        uint i = gid.x, m = gid.y;
+        if (i >= (uint)(KV * D) || m >= (uint)M) return;
         uint h = i / (uint)D, d = i % (uint)D;
-        cache[(size_t)h * (size_t)maxLen * (size_t)D + (size_t)pos * (size_t)D + d] = src[h * D + d];
+        half v = src[(size_t)h * (size_t)srcHeadStride + (size_t)m * (size_t)srcSeqStride + d];
+        cache[(size_t)h * (size_t)maxLen * (size_t)D + (size_t)(pos + (int)m) * (size_t)D + d] = v;
     }
 
     // Drop oldest token: cache[h, s, :] <- cache[h, s+1, :] for s in 0..maxLen-2.
@@ -2009,6 +2164,7 @@ public enum SeedlessMetal {
         constant int& v_head_stride[[buffer(8)]],
         constant int& v_seq_stride [[buffer(9)]],
         constant float& scale      [[buffer(10)]],
+        constant int& causal       [[buffer(11)]],
         uint3 tid [[threadgroup_position_in_grid]],
         uint3 tpg [[threadgroups_per_grid]],
         uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -2027,7 +2183,9 @@ public enum SeedlessMetal {
         const int q_batch_head_idx = tid.x;
         const int q_seq_idx = tid.y;
         const int kv_head_idx = q_batch_head_idx / gqa_factor;
-        const int o_offset = q_batch_head_idx * tpg.y + q_seq_idx;
+        // Token-major: [M, numHeads, D]. M=1 is identical to the old [heads, D].
+        const int o_offset = q_seq_idx * tpg.x + q_batch_head_idx;
+        const int nUse = N + (causal ? q_seq_idx : 0);
         queries += o_offset * D + simd_lid * qk_per_thread;
         keys   += kv_head_idx * k_head_stride + simd_gid * k_seq_stride + simd_lid * qk_per_thread;
         values += kv_head_idx * v_head_stride + simd_gid * v_seq_stride + simd_lid * v_per_thread;
@@ -2036,7 +2194,7 @@ public enum SeedlessMetal {
         for (int i = 0; i < v_per_thread; i++) o[i] = 0;
         U max_score = -INFINITY;
         U sum_exp_score = 0;
-        for (int i = simd_gid; i < N; i += BN) {
+        for (int i = simd_gid; i < nUse; i += BN) {
             for (int j = 0; j < qk_per_thread; j++) k[j] = (U)keys[j];
             U score = 0;
             for (int j = 0; j < qk_per_thread; j++) score += q[j] * k[j];

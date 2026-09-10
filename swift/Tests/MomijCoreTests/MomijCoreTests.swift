@@ -901,7 +901,7 @@ final class SeedlessAttnEncodeTests: XCTestCase {
             let qSrc = qM.contents().bindMemory(to: Float16.self, capacity: heads * M * d)
             let qDst = q1.contents().bindMemory(to: Float16.self, capacity: heads * d)
             for h in 0 ..< heads {
-                for i in 0 ..< d { qDst[h * d + i] = qSrc[(h * M + m) * d + i] }
+                for i in 0 ..< d { qDst[h * d + i] = qSrc[(m * heads + h) * d + i] }
             }
             let cb1 = q.makeCommandBuffer()!
             let enc1 = cb1.makeComputeCommandEncoder()!
@@ -914,7 +914,7 @@ final class SeedlessAttnEncodeTests: XCTestCase {
             let ySrc = y1.contents().bindMemory(to: Float16.self, capacity: heads * d)
             let yDst = ySeq.contents().bindMemory(to: Float16.self, capacity: heads * M * d)
             for h in 0 ..< heads {
-                for i in 0 ..< d { yDst[(h * M + m) * d + i] = ySrc[h * d + i] }
+                for i in 0 ..< d { yDst[(m * heads + h) * d + i] = ySrc[h * d + i] }
             }
         }
         let a = yM.contents().bindMemory(to: Float16.self, capacity: heads * M * d)
@@ -929,6 +929,117 @@ final class SeedlessAttnEncodeTests: XCTestCase {
         }
         let rel = sqrt(num / max(den, 1e-30))
         XCTAssertLessThan(rel, 1e-3, "M-row SDPA must match sequential M=1; rel_l2=\(rel) maxAbs=\(maxAbs)")
+    }
+
+    /// Batched encodeAttnBlock M=2 (causal SDPA, RoPE pos+m) must match two sequential M=1 steps.
+    func testAttnBlockMrowMatchesSequential() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 512, heads = 4, kv = 2, d = 128, gs = 128, M = 2
+        let qDim = heads * d, kvDim = kv * d, qkvN = qDim + 2 * kvDim
+        let maxLen = 8, writePos = 2, ropePos = 2, seqLen = writePos + 1
+        func buf(_ n: Int, _ bpe: Int = 2) -> MTLBuffer {
+            device.makeBuffer(length: n * bpe, options: .storageModeShared)!
+        }
+        func fillU8(_ b: MTLBuffer) {
+            let p = b.contents().bindMemory(to: UInt8.self, capacity: b.length)
+            for i in 0 ..< b.length { p[i] = UInt8((i * 17 + 3) & 0xff) }
+        }
+        func fillH(_ b: MTLBuffer, _ v: Float16) {
+            let n = b.length / 2
+            let p = b.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = v }
+        }
+        let dens = buf(1, 4)
+        dens.contents().storeBytes(of: Int32(0), as: Int32.self)
+        let x = buf(M * H)
+        let xp = x.contents().bindMemory(to: Float16.self, capacity: M * H)
+        for i in 0 ..< (M * H) { xp[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+        let packedH = H * 2 / 32
+        let packedQ = qDim * 2 / 32
+        let qkvW = buf(qkvN * packedH, 4); fillU8(qkvW)
+        let qkvS = buf(qkvN * (H / gs)); fillH(qkvS, 0.02)
+        let qkvB = buf(qkvN * (H / gs)); fillH(qkvB, -0.02)
+        let oW = buf(H * packedQ, 4); fillU8(oW)
+        let oS = buf(H * (qDim / gs)); fillH(oS, 0.02)
+        let oB = buf(H * (qDim / gs)); fillH(oB, -0.02)
+        let qkW = buf((heads + kv) * d); fillH(qkW, 1.0)
+        let inv = buf(32, 4)
+        let ip = inv.contents().bindMemory(to: Float.self, capacity: 32)
+        for i in 0 ..< 32 { ip[i] = 0.1 / Float(i + 1) }
+        let qkvOut = buf(M * qkvN)
+        let qkOut = buf(M * (qDim + kvDim))
+        let attnTmp = buf(M * qDim)
+        let yM = buf(M * H)
+        let ySeq = buf(M * H)
+        let kCache = buf(kv * maxLen * d)
+        let vCache = buf(kv * maxLen * d)
+        fillH(kCache, 0.01)
+        fillH(vCache, 0.02)
+
+        let kSeq = buf(kv * maxLen * d)
+        let vSeq = buf(kv * maxLen * d)
+        let k0 = kCache.contents().bindMemory(to: Float16.self, capacity: kv * maxLen * d)
+        let v0 = vCache.contents().bindMemory(to: Float16.self, capacity: kv * maxLen * d)
+        let k1p = kSeq.contents().bindMemory(to: Float16.self, capacity: kv * maxLen * d)
+        let v1p = vSeq.contents().bindMemory(to: Float16.self, capacity: kv * maxLen * d)
+        for i in 0 ..< (kv * maxLen * d) { k1p[i] = k0[i]; v1p[i] = v0[i] }
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        try SeedlessMetal.encodeAttnBlock(
+            into: enc, xNorm: x,
+            qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
+            oW: oW, oS: oS, oB: oB,
+            qkW: qkW, invFreq: inv, densInds: dens,
+            qkvOut: qkvOut, qkOut: qkOut, attnTmp: attnTmp, attnOut: yM,
+            kCache: kCache, vCache: vCache,
+            H: H, numHeads: heads, numKV: kv, headDim: d,
+            ropeDim: 64, ropePos: ropePos, writePos: writePos, maxLen: maxLen, seqLen: seqLen,
+            eps: 1e-6, gs: gs, M: M)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        for m in 0 ..< M {
+            let x1 = buf(H)
+            let xSrc = x.contents().bindMemory(to: Float16.self, capacity: M * H)
+            let xDst = x1.contents().bindMemory(to: Float16.self, capacity: H)
+            for i in 0 ..< H { xDst[i] = xSrc[m * H + i] }
+            let qkv1 = buf(qkvN), qk1 = buf(qDim + kvDim), tmp1 = buf(qDim), y1 = buf(H)
+            let cb1 = q.makeCommandBuffer()!
+            let enc1 = cb1.makeComputeCommandEncoder()!
+            try SeedlessMetal.encodeAttnBlock(
+                into: enc1, xNorm: x1,
+                qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
+                oW: oW, oS: oS, oB: oB,
+                qkW: qkW, invFreq: inv, densInds: dens,
+                qkvOut: qkv1, qkOut: qk1, attnTmp: tmp1, attnOut: y1,
+                kCache: kSeq, vCache: vSeq,
+                H: H, numHeads: heads, numKV: kv, headDim: d,
+                ropeDim: 64, ropePos: ropePos + m, writePos: writePos + m, maxLen: maxLen,
+                seqLen: seqLen + m, eps: 1e-6, gs: gs, M: 1)
+            enc1.endEncoding()
+            cb1.commit()
+            cb1.waitUntilCompleted()
+            let ySrc = y1.contents().bindMemory(to: Float16.self, capacity: H)
+            let yDst = ySeq.contents().bindMemory(to: Float16.self, capacity: M * H)
+            for i in 0 ..< H { yDst[m * H + i] = ySrc[i] }
+        }
+        let a = yM.contents().bindMemory(to: Float16.self, capacity: M * H)
+        let bOut = ySeq.contents().bindMemory(to: Float16.self, capacity: M * H)
+        var maxAbs: Float = 0
+        var num = 0.0, den = 0.0
+        for i in 0 ..< (M * H) {
+            let dlt = abs(Float(a[i]) - Float(bOut[i]))
+            maxAbs = max(maxAbs, dlt)
+            num += Double(dlt * dlt)
+            den += Double(Float(a[i]) * Float(a[i]))
+        }
+        let rel = sqrt(num / max(den, 1e-30))
+        XCTAssertLessThan(rel, 1e-3, "M-row attn block must match sequential M=1; rel_l2=\(rel) maxAbs=\(maxAbs)")
     }
 }
 

@@ -550,6 +550,35 @@ public enum SeedlessMetal {
                             threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
     }
 
+    /// Decode SDPA. Queries laid out `[numHeads, M, headDim]`; `tid.y` is the query row.
+    /// Same KV cache for all M (prefix reuse). `encodeAttnBlock` still uses M=1.
+    public static func encodeSdpa(
+        into enc: MTLComputeCommandEncoder,
+        queries: MTLBuffer, kCache: MTLBuffer, vCache: MTLBuffer, out: MTLBuffer,
+        numHeads: Int, numKV: Int, headDim: Int,
+        maxLen: Int, seqLen: Int, M: Int = 1
+    ) {
+        enc.setComputePipelineState(sdpaPipeline!)
+        enc.setBuffer(queries, offset: 0, index: 0)
+        enc.setBuffer(kCache, offset: 0, index: 1)
+        enc.setBuffer(vCache, offset: 0, index: 2)
+        enc.setBuffer(out, offset: 0, index: 3)
+        var gqa = Int32(numHeads / numKV), n32 = Int32(seqLen)
+        var khs = Int32(maxLen * headDim), kss = Int32(headDim)
+        var vhs = Int32(maxLen * headDim), vss = Int32(headDim)
+        var sc = Float(pow(Double(headDim), -0.5))
+        enc.setBytes(&gqa, length: 4, index: 4)
+        enc.setBytes(&n32, length: 4, index: 5)
+        enc.setBytes(&khs, length: 4, index: 6)
+        enc.setBytes(&kss, length: 4, index: 7)
+        enc.setBytes(&vhs, length: 4, index: 8)
+        enc.setBytes(&vss, length: 4, index: 9)
+        enc.setBytes(&sc, length: 4, index: 10)
+        enc.dispatchThreadgroups(
+            MTLSize(width: numHeads, height: M, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
+    }
+
     /// Decode attn body. `ropePos` = absolute RoPE index; `writePos` = cache slot; `seqLen` = SDPA N.
     public static func encodeAttnBlock(
         into enc: MTLComputeCommandEncoder,
@@ -564,7 +593,7 @@ public enum SeedlessMetal {
         eps: Float, gs: Int = 128, rotateFirst: Bool = false
     ) throws {
         try ensureCompiled()
-        guard let qkPipe = qkNormRopePipeline, let writeKV = writeKVPipeline, let sdpa = sdpaPipeline
+        guard let qkPipe = qkNormRopePipeline, let writeKV = writeKVPipeline, sdpaPipeline != nil
         else { throw SeedlessError.notReady }
 
         let qDim = numHeads * headDim
@@ -623,24 +652,10 @@ public enum SeedlessMetal {
         enc.dispatchThreads(MTLSize(width: kvDim, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(256, kvDim), height: 1, depth: 1))
 
-        enc.setComputePipelineState(sdpa)
-        enc.setBuffer(qkOut, offset: 0, index: 0)
-        enc.setBuffer(kCache, offset: 0, index: 1)
-        enc.setBuffer(vCache, offset: 0, index: 2)
-        enc.setBuffer(attnTmp, offset: 0, index: 3)
-        var gqa = Int32(numHeads / numKV), n32 = Int32(seqLen)
-        var khs = Int32(maxLen * headDim), kss = Int32(headDim)
-        var vhs = Int32(maxLen * headDim), vss = Int32(headDim)
-        var sc = Float(pow(Double(headDim), -0.5))
-        enc.setBytes(&gqa, length: 4, index: 4)
-        enc.setBytes(&n32, length: 4, index: 5)
-        enc.setBytes(&khs, length: 4, index: 6)
-        enc.setBytes(&kss, length: 4, index: 7)
-        enc.setBytes(&vhs, length: 4, index: 8)
-        enc.setBytes(&vss, length: 4, index: 9)
-        enc.setBytes(&sc, length: 4, index: 10)
-        enc.dispatchThreadgroups(MTLSize(width: numHeads, height: 1, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
+        encodeSdpa(
+            into: enc, queries: qkOut, kCache: kCache, vCache: vCache, out: attnTmp,
+            numHeads: numHeads, numKV: numKV, headDim: headDim,
+            maxLen: maxLen, seqLen: seqLen, M: 1)
 
         try gqmm2(x: attnTmp, w: oW, scales: oS, biases: oB, inds: densInds, out: attnOut,
                   Ktop: 1, K: qDim, N: H, gs: gs, lhsPerExpert: false, into: enc)
@@ -1170,6 +1185,136 @@ public enum SeedlessMetal {
             }
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// GPU-timed attn M-row: dense QKV/O `gqmm2` (Ktop=1, weight reuse) and SDPA
+    /// (`tid.y` query row, shared KV). Warm interleaved `M=1,2,4,8,8,4,2,1`.
+    public static func benchAttnMrow(
+        H: Int = 2048, numHeads: Int = 16, numKV: Int = 4, headDim: Int = 128,
+        maxM: Int = 8, iters: Int = 20, seqLens: [Int] = [128, 512]
+    ) throws -> String {
+        try ensureCompiled()
+        guard let device, sdpaPipeline != nil else { throw SeedlessError.notReady }
+        let gs = 128
+        let qDim = numHeads * headDim
+        let qkvN = qDim + 2 * numKV * headDim
+        let packedH = H * 2 / 32
+        let packedQ = qDim * 2 / 32
+        let nGH = H / gs
+        let nGQ = qDim / gs
+        let maxLen = seqLens.max() ?? 128
+
+        func fillAlpha(_ buf: MTLBuffer, n: Int) {
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = 0.02 }
+        }
+        func fillNeg(_ buf: MTLBuffer, n: Int) {
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = -0.02 }
+        }
+        func fillX(_ buf: MTLBuffer, n: Int) {
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+        }
+
+        let dens = device.makeBuffer(length: 4, options: .storageModeShared)!
+        dens.contents().storeBytes(of: Int32(0), as: Int32.self)
+
+        let xQ = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared)!
+        fillX(xQ, n: maxM * H)
+        let qkvW = device.makeBuffer(length: qkvN * packedH * 4, options: .storageModeShared)!
+        let qkvS = device.makeBuffer(length: qkvN * nGH * 2, options: .storageModeShared)!
+        let qkvB = device.makeBuffer(length: qkvN * nGH * 2, options: .storageModeShared)!
+        fillAlpha(qkvS, n: qkvN * nGH)
+        fillNeg(qkvB, n: qkvN * nGH)
+        let yQ = device.makeBuffer(length: maxM * qkvN * 2, options: .storageModeShared)!
+
+        let xO = device.makeBuffer(length: maxM * qDim * 2, options: .storageModeShared)!
+        fillX(xO, n: maxM * qDim)
+        let oW = device.makeBuffer(length: H * packedQ * 4, options: .storageModeShared)!
+        let oS = device.makeBuffer(length: H * nGQ * 2, options: .storageModeShared)!
+        let oB = device.makeBuffer(length: H * nGQ * 2, options: .storageModeShared)!
+        fillAlpha(oS, n: H * nGQ)
+        fillNeg(oB, n: H * nGQ)
+        let yO = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared)!
+
+        let q = device.makeBuffer(length: numHeads * maxM * headDim * 2, options: .storageModeShared)!
+        fillX(q, n: numHeads * maxM * headDim)
+        let kCache = device.makeBuffer(length: numKV * maxLen * headDim * 2, options: .storageModeShared)!
+        let vCache = device.makeBuffer(length: numKV * maxLen * headDim * 2, options: .storageModeShared)!
+        fillX(kCache, n: numKV * maxLen * headDim)
+        fillX(vCache, n: numKV * maxLen * headDim)
+        let yS = device.makeBuffer(length: numHeads * maxM * headDim * 2, options: .storageModeShared)!
+
+        func sweep(_ title: String, time: (Int) throws -> Double) throws -> [String] {
+            var acc: [Int: (gpu: Double, n: Int)] = [:]
+            for M in [1, 2, 4, 8, 8, 4, 2, 1] where M <= maxM {
+                let gpu = try time(M)
+                let a = acc[M] ?? (0, 0)
+                acc[M] = (a.gpu + gpu, a.n + 1)
+            }
+            let gpu1 = (acc[1] ?? (0, 1)).gpu / Double((acc[1] ?? (0, 1)).n)
+            var lines = [title, "  mode        M   gpu_ms   ms/tok     vsM1    tok/s"]
+            for M in [1, 2, 4, 8] where M <= maxM {
+                let a = acc[M]!
+                let gpu = a.gpu / Double(a.n)
+                let per = gpu / Double(M)
+                let vs = gpu1 > 0 ? per / gpu1 : 0
+                let tps = per > 0 ? 1000.0 / per : 0
+                lines.append(
+                    "  dense    \(String(format: "%4d %8.3f %8.3f %8.3f %8.0f", M, gpu, per, vs, tps))"
+                )
+            }
+            return lines
+        }
+
+        for _ in 0 ..< 8 {
+            try gqmm2(x: xQ, w: qkvW, scales: qkvS, biases: qkvB, inds: dens, out: yQ,
+                      Ktop: 1, K: H, N: qkvN, gs: gs, M: maxM, splitK: false)
+            try gqmm2(x: xO, w: oW, scales: oS, biases: oB, inds: dens, out: yO,
+                      Ktop: 1, K: qDim, N: H, gs: gs, M: maxM, splitK: false)
+            _ = try timeCB { enc in
+                encodeSdpa(into: enc, queries: q, kCache: kCache, vCache: vCache, out: yS,
+                           numHeads: numHeads, numKV: numKV, headDim: headDim,
+                           maxLen: maxLen, seqLen: maxLen, M: maxM)
+            }
+        }
+
+        var out: [String] = []
+        out += try sweep("attn M-row qkv (K=\(H) N=\(qkvN) Ktop=1, \(iters) iters, warm)") { M in
+            var gpu = 0.0
+            for _ in 0 ..< iters {
+                gpu += try timeCB { enc in
+                    try gqmm2(x: xQ, w: qkvW, scales: qkvS, biases: qkvB, inds: dens, out: yQ,
+                              Ktop: 1, K: H, N: qkvN, gs: gs, M: M, into: enc, splitK: false)
+                }.gpuMs
+            }
+            return gpu / Double(iters)
+        }
+        out += try sweep("attn M-row o-proj (K=\(qDim) N=\(H) Ktop=1, \(iters) iters, warm)") { M in
+            var gpu = 0.0
+            for _ in 0 ..< iters {
+                gpu += try timeCB { enc in
+                    try gqmm2(x: xO, w: oW, scales: oS, biases: oB, inds: dens, out: yO,
+                              Ktop: 1, K: qDim, N: H, gs: gs, M: M, into: enc, splitK: false)
+                }.gpuMs
+            }
+            return gpu / Double(iters)
+        }
+        for N in seqLens {
+            out += try sweep("attn M-row sdpa (H=\(numHeads) KV=\(numKV) D=\(headDim) N=\(N), \(iters) iters, warm)") { M in
+                var gpu = 0.0
+                for _ in 0 ..< iters {
+                    gpu += try timeCB { enc in
+                        encodeSdpa(into: enc, queries: q, kCache: kCache, vCache: vCache, out: yS,
+                                   numHeads: numHeads, numKV: numKV, headDim: headDim,
+                                   maxLen: maxLen, seqLen: N, M: M)
+                    }.gpuMs
+                }
+                return gpu / Double(iters)
+            }
+        }
+        return out.joined(separator: "\n")
     }
 
     // MARK: - Metal source

@@ -404,6 +404,34 @@ M=8 reaches 0.51×. Draft=2 can move the **expert block**; peak 250 still
 needs attn + router M-row and a path that runs M≥2 end-to-end. Do not
 default decode to M-row yet.
 
+## 2026-09-10 True M-row attn probes (warm)
+
+SDPA kernel already had `tid.y = q_seq` / `o_offset = head·M + seq`; dispatch
+was `height: 1`. Wired `encodeSdpa(..., M:)` → `height: M`, queries
+`[numHeads, M, D]`, shared KV. `encodeAttnBlock` still M=1 (qk-norm / writeKV
+are one-token). QKV/O use existing dense `gqmm2` (Ktop=1, same weights).
+Parity: SDPA M=2 vs two sequential M=1, rel_l2 < 1e-3.
+
+Warm interleaved `M=1,2,4,8,8,4,2,1` (20 iters). Maple 16h/4kv/D=128. omlx stopped.
+
+| probe | M=1 gpu_ms | M=2 vsM1 | M=4 | M=8 |
+|---|---|---|---|---|
+| qkv K=2048 N=3072 Ktop=1 | 0.174 | **0.40** | 0.29 | 0.24 |
+| o-proj K=2048 N=2048 Ktop=1 | 0.103 | 0.92 | 0.57 | 0.43 |
+| sdpa N=128 | 0.192 | 0.17 | 0.24 | 0.11 |
+| sdpa N=512 | 0.259 | 0.24 | 0.26 | 0.17 |
+
+Honest read:
+
+- **QKV dense M-row is a real packing lever** (Ktop=1, full weight reuse).
+  M=2 already 0.40× ms/tok. Stronger than MoE gqmm2 at M=2.
+- **O-proj matches the MoE-gqmm2 pattern**: M=2 ≈ noise (0.92), win from M≥4.
+- **SDPA M=1 micro is occupancy/launch bound** (16 TGs). vsM1 looks spectacular
+  because M>1 fills the grid; do not read 0.17× as 6× math. Inside a packed
+  24L CB the sequential SDPA tax is already small (`--profile-floor`).
+- Full attn M-row still needs `qk_norm_rope` + `writeKV` (and RMS) for M
+  tokens with per-row RoPE / cache slots. Do not default decode to M-row.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

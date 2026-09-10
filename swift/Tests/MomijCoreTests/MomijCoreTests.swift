@@ -861,6 +861,75 @@ final class SeedlessAttnEncodeTests: XCTestCase {
         cb.waitUntilCompleted()
         XCTAssertTrue(attnOut.contents().bindMemory(to: Float16.self, capacity: 1)[0].isFinite)
     }
+
+    /// Batched SDPA M=2 (shared KV) must match two sequential M=1 queries.
+    func testSdpaMrowMatchesSequential() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let heads = 16, kv = 4, d = 128, M = 2, maxLen = 8, seqLen = 8
+        func buf(_ n: Int, _ bpe: Int = 2) -> MTLBuffer {
+            device.makeBuffer(length: n * bpe, options: .storageModeShared)!
+        }
+        let qM = buf(heads * M * d)
+        let qp = qM.contents().bindMemory(to: Float16.self, capacity: heads * M * d)
+        for i in 0 ..< (heads * M * d) { qp[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+        let kCache = buf(kv * maxLen * d)
+        let vCache = buf(kv * maxLen * d)
+        let kp = kCache.contents().bindMemory(to: Float16.self, capacity: kv * maxLen * d)
+        let vp = vCache.contents().bindMemory(to: Float16.self, capacity: kv * maxLen * d)
+        for i in 0 ..< (kv * maxLen * d) {
+            kp[i] = Float16((Float(i % 13) - 6.0) * 0.02)
+            vp[i] = Float16((Float(i % 11) - 5.0) * 0.02)
+        }
+        let yM = buf(heads * M * d)
+        let ySeq = buf(heads * M * d)
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        SeedlessMetal.encodeSdpa(
+            into: enc, queries: qM, kCache: kCache, vCache: vCache, out: yM,
+            numHeads: heads, numKV: kv, headDim: d, maxLen: maxLen, seqLen: seqLen, M: M)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        for m in 0 ..< M {
+            let q1 = buf(heads * d)
+            let y1 = buf(heads * d)
+            let qSrc = qM.contents().bindMemory(to: Float16.self, capacity: heads * M * d)
+            let qDst = q1.contents().bindMemory(to: Float16.self, capacity: heads * d)
+            for h in 0 ..< heads {
+                for i in 0 ..< d { qDst[h * d + i] = qSrc[(h * M + m) * d + i] }
+            }
+            let cb1 = q.makeCommandBuffer()!
+            let enc1 = cb1.makeComputeCommandEncoder()!
+            SeedlessMetal.encodeSdpa(
+                into: enc1, queries: q1, kCache: kCache, vCache: vCache, out: y1,
+                numHeads: heads, numKV: kv, headDim: d, maxLen: maxLen, seqLen: seqLen, M: 1)
+            enc1.endEncoding()
+            cb1.commit()
+            cb1.waitUntilCompleted()
+            let ySrc = y1.contents().bindMemory(to: Float16.self, capacity: heads * d)
+            let yDst = ySeq.contents().bindMemory(to: Float16.self, capacity: heads * M * d)
+            for h in 0 ..< heads {
+                for i in 0 ..< d { yDst[(h * M + m) * d + i] = ySrc[h * d + i] }
+            }
+        }
+        let a = yM.contents().bindMemory(to: Float16.self, capacity: heads * M * d)
+        let bOut = ySeq.contents().bindMemory(to: Float16.self, capacity: heads * M * d)
+        var maxAbs: Float = 0
+        var num = 0.0, den = 0.0
+        for i in 0 ..< (heads * M * d) {
+            let dlt = abs(Float(a[i]) - Float(bOut[i]))
+            maxAbs = max(maxAbs, dlt)
+            num += Double(dlt * dlt)
+            den += Double(Float(a[i]) * Float(a[i]))
+        }
+        let rel = sqrt(num / max(den, 1e-30))
+        XCTAssertLessThan(rel, 1e-3, "M-row SDPA must match sequential M=1; rel_l2=\(rel) maxAbs=\(maxAbs)")
+    }
 }
 
 final class ConfigTests: XCTestCase {

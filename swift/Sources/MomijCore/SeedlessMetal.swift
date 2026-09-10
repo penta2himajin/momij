@@ -198,11 +198,14 @@ public enum SeedlessMetal {
         return buf
     }
 
-    /// 2-bit gather-qmv: x[1,K], w[E,N,K/16], scales/biases[E,N,K/gs], inds[Ktop] → y[Ktop,N]
+    /// 2-bit gather-qmv: x[M,K] (or [M·Ktop,K] if lhsPerExpert), w[E,N,K/16],
+    /// scales/biases[E,N,K/gs], inds[M·Ktop] → y[M·Ktop,N]. Kernel `ktop` stays per-token;
+    /// grid depth is `M * Ktop` (Qwisp gqmm2Rows).
     public static func gqmm2(
         x: MTLBuffer, w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer, inds: MTLBuffer,
         out: MTLBuffer,
         Ktop: Int, K: Int, N: Int, gs: Int = 128, lhsPerExpert: Bool = false,
+        M: Int = 1,
         into encoder: MTLComputeCommandEncoder? = nil,
         commandQueue: MTLCommandQueue? = nil,
         splitK: Bool? = nil,
@@ -214,14 +217,14 @@ public enum SeedlessMetal {
     ) throws {
         try ensureCompiled()
         guard let stop = stopBuf else { throw SeedlessError.notReady }
-        let doSK = splitK ?? useSplitK
+        let doSK = M == 1 && (splitK ?? useSplitK)
         let doTernary = !doSK && (ternary ?? useTernary)
         let doDeferA = !doSK && !doTernary && (deferA ?? useDeferA)
         let doFoldA = !doSK && !doTernary && !doDeferA && (foldA ?? useFoldA)
         let doFold = !doSK && !doTernary && !doDeferA && !doFoldA && (fold ?? useFold)
         let doW16 = !doSK && !doTernary && !doDeferA && !doFoldA && !doFold && (w16 ?? useW16)
         let rowsPerTG = doW16 ? 16 : 8
-        guard N % rowsPerTG == 0, K % gqmm2BlockSize == 0, gs == 64 || gs == 128 else {
+        guard M >= 1, N % rowsPerTG == 0, K % gqmm2BlockSize == 0, gs == 64 || gs == 128 else {
             throw SeedlessError.unsupportedShape(N: N, K: K, gs: gs)
         }
         if doTernary { try ensureTernaryCompiled() }
@@ -311,7 +314,7 @@ public enum SeedlessMetal {
             enc.setBytes(&gsv, length: 4, index: 11)
             let tptg = doW16 ? 128 : 64
             enc.dispatchThreadgroups(
-                MTLSize(width: 1, height: N / rowsPerTG, depth: Ktop),
+                MTLSize(width: 1, height: N / rowsPerTG, depth: M * Ktop),
                 threadsPerThreadgroup: MTLSize(width: tptg, height: 1, depth: 1))
         }
 
@@ -927,6 +930,93 @@ public enum SeedlessMetal {
         }
         _ = queue  // silence
         return Double(iters) / (CFAbsoluteTimeGetCurrent() - t0)
+    }
+
+    /// GPU-timed M-row gqmm2 sweep. `shared` = all tokens reuse the same Ktop experts;
+    /// `disjoint` = token m uses experts `[m·Ktop ..)`. Reports ms/token vs M=1.
+    public static func benchGqmm2Mrow(
+        K: Int = 2048, N: Int = 1024, Ktop: Int = 8, E: Int = 256, gs: Int = 128,
+        maxM: Int = 8, iters: Int = 40, lhsPerExpert: Bool = false
+    ) throws -> String {
+        try ensureCompiled()
+        guard let device else { throw SeedlessError.notReady }
+        let packedK = K * 2 / 32
+        let nGroups = K / gs
+        let xRows = lhsPerExpert ? maxM * Ktop : maxM
+        let x = device.makeBuffer(length: xRows * K * 2, options: .storageModeShared)!
+        let xp = x.contents().bindMemory(to: Float16.self, capacity: xRows * K)
+        for i in 0 ..< (xRows * K) { xp[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+        let w = device.makeBuffer(length: E * N * packedK * 4, options: .storageModeShared)!
+        let s = device.makeBuffer(length: E * N * nGroups * 2, options: .storageModeShared)!
+        let b = device.makeBuffer(length: E * N * nGroups * 2, options: .storageModeShared)!
+        let sp = s.contents().bindMemory(to: Float16.self, capacity: E * N * nGroups)
+        let bp = b.contents().bindMemory(to: Float16.self, capacity: E * N * nGroups)
+        for i in 0 ..< (E * N * nGroups) {
+            let alpha = Float16(0.02)
+            sp[i] = alpha
+            bp[i] = -alpha
+        }
+        let inds = device.makeBuffer(length: maxM * Ktop * 4, options: .storageModeShared)!
+        let y = device.makeBuffer(length: maxM * Ktop * N * 2, options: .storageModeShared)!
+
+        func fillInds(M: Int, shared: Bool) {
+            let p = inds.contents().bindMemory(to: Int32.self, capacity: M * Ktop)
+            for m in 0 ..< M {
+                for k in 0 ..< Ktop {
+                    let e = shared ? k : (m * Ktop + k)
+                    p[m * Ktop + k] = Int32(e % E)
+                }
+            }
+        }
+
+        func time(M: Int, shared: Bool) throws -> (wall: Double, gpu: Double) {
+            fillInds(M: M, shared: shared)
+            var wall = 0.0, gpu = 0.0
+            for _ in 0 ..< iters {
+                let t = try timeCB { enc in
+                    try gqmm2(x: x, w: w, scales: s, biases: b, inds: inds, out: y,
+                              Ktop: Ktop, K: K, N: N, gs: gs, lhsPerExpert: lhsPerExpert, M: M,
+                              into: enc, splitK: false)
+                }
+                wall += t.wallMs
+                gpu += t.gpuMs
+            }
+            return (wall / Double(iters), gpu / Double(iters))
+        }
+
+        // Warm the GPU / caches on the largest grid before the sweep.
+        fillInds(M: maxM, shared: true)
+        for _ in 0 ..< 8 {
+            try gqmm2(x: x, w: w, scales: s, biases: b, inds: inds, out: y,
+                      Ktop: Ktop, K: K, N: N, gs: gs, lhsPerExpert: lhsPerExpert, M: maxM,
+                      splitK: false)
+        }
+
+        var lines: [String] = []
+        let tag = lhsPerExpert ? "down-like lhsPer" : "up-like shared-x"
+        lines.append("gqmm2 M-row (\(tag) K=\(K) N=\(N) Ktop=\(Ktop) E=\(E), \(iters) iters, warm)")
+        lines.append("  mode        M   gpu_ms   ms/tok     vsM1    tok/s")
+        for shared in [true, false] {
+            let mode = shared ? "shared" : "disjoint"
+            var acc: [Int: (gpu: Double, n: Int)] = [:]
+            for M in [1, 2, 4, 8, 8, 4, 2, 1] where M <= maxM {
+                let t = try time(M: M, shared: shared)
+                let a = acc[M] ?? (0, 0)
+                acc[M] = (a.gpu + t.gpu, a.n + 1)
+            }
+            let gpu1 = (acc[1] ?? (0, 1)).gpu / Double((acc[1] ?? (0, 1)).n)
+            for M in [1, 2, 4, 8] where M <= maxM {
+                let a = acc[M]!
+                let gpu = a.gpu / Double(a.n)
+                let per = gpu / Double(M)
+                let vs = gpu1 > 0 ? per / gpu1 : 0
+                let tps = per > 0 ? 1000.0 / per : 0
+                lines.append(
+                    "  \(mode.padding(toLength: 8, withPad: " ", startingAt: 0)) \(String(format: "%4d %8.3f %8.3f %8.3f %8.0f", M, gpu, per, vs, tps))"
+                )
+            }
+        }
+        return lines.joined(separator: "\n")
     }
 
     public static func benchFusedExpert(

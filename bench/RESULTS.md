@@ -334,6 +334,48 @@ or e2e win; pair-1 packed is fold < A < B (A/B slightly slower). **Default
 stays fold.** Env left opt-in. Algebraic epilogue tweaks are not an additive
 lever on this issue-bound `qd2` stream.
 
+## 2026-09-10 True M-row gqmm2 (kernel-only, warm)
+
+Qwisp `gqmm2Rows` already encoded `tid.z = m*Ktop+ki` / `x` row =
+`lhsPer ? mk : mk/ktop`. Momij kernel had the same `mk/ktop` but dispatch
+was `depth: Ktop` only. Wired `gqmm2(..., M:)` → `depth: M*Ktop`, split-K
+off at `M>1`. Parity: M=2 batched vs two sequential M=1, rel_l2 < 1e-7.
+
+GPU `timeCB` after 8× warmup at maxM, then interleaved `M=1,2,4,8,8,4,2,1`
+(30 iters each, averaged per M). omlx stopped. Maple-like: Ktop=8, E=256.
+
+| shape | mode | M | gpu_ms | ms/tok | vsM1 |
+|---|---|---|---|---|---|
+| up K=2048 N=1024 | shared | 1 | 0.074 | 0.074 | 1.00 |
+| | shared | 2 | 0.145 | 0.072 | 0.98 |
+| | shared | 4 | 0.240 | 0.060 | 0.81 |
+| | shared | 8 | 0.367 | 0.046 | 0.62 |
+| | disjoint | 1 | 0.068 | 0.068 | 1.00 |
+| | disjoint | 2 | 0.088 | 0.044 | 0.65 |
+| | disjoint | 4 | 0.125 | 0.031 | 0.46 |
+| | disjoint | 8 | 0.226 | 0.028 | 0.42 |
+| down K=512 N=2048 lhsPer | shared | 1 | 0.072 | 0.072 | 1.00 |
+| | shared | 2 | 0.138 | 0.069 | 0.96 |
+| | shared | 4 | 0.185 | 0.046 | 0.64 |
+| | shared | 8 | 0.340 | 0.043 | 0.59 |
+| | disjoint | 1 | 0.095 | 0.095 | 1.00 |
+| | disjoint | 2 | 0.197 | 0.099 | 1.04 |
+| | disjoint | 4 | 0.310 | 0.078 | 0.81 |
+| | disjoint | 8 | 0.578 | 0.072 | 0.76 |
+
+First sweep without warmup was invalid (cold M=1). Honest read:
+
+- **M=2 ≈ no win** (up shared 0.98, down shared 0.96). Speculative decode
+  at draft=2 will not move the sequential ~200–210 floor via this kernel.
+- **M≥4 is a real packing lever.** Up shared M=8 is 0.62× ms/tok; down
+  shared 0.59×. Occupancy/weight reuse, not ALU rewrite.
+- Up disjoint beating shared at the same `M*Ktop` TG count is likely
+  less contention (64 unique experts vs 8) — not a reason to prefer
+  disjoint routing in production.
+- This is **one GEMM**, not e2e. Peak 250 still needs attn + fused-expert
+  M-row and a path that actually runs M≥4. Do not default decode to M-row
+  until that stack exists.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

@@ -108,6 +108,9 @@ struct MomijMain {
         try SeedlessMetal.ensureCompiled()
         let qmv = try SeedlessMetal.benchQmv2(iters: 200)
         print(String(format: "seedless gqmm2 (H=2048→N=512,Ktop=1) kernel/s=%.1f", qmv))
+        print(try SeedlessMetal.benchGqmm2Mrow(iters: 30))
+        print(try SeedlessMetal.benchGqmm2Mrow(
+            K: 512, N: 2048, Ktop: 8, iters: 30, lhsPerExpert: true))
         let fused = try SeedlessMetal.benchFusedExpert(E: 256, iters: 100)
         print(String(format: "seedless fused-expert (E=256,K=8) steps/s=%.1f", fused))
         if FileManager.default.fileExists(atPath: model) {

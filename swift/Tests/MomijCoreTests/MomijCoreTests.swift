@@ -83,6 +83,72 @@ final class SeedlessMetalTests: XCTestCase {
         XCTAssertGreaterThan(rate, 10, "gqmm2 should exceed 10 kernel/s, got \(rate)")
     }
 
+    /// Batched M=2 must match two sequential M=1 gathers (same weights, per-token x / inds).
+    func testGqmm2MrowMatchesSequential() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, SeedlessMetal.queue != nil else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 512, N = 128, E = 8, Ktop = 2, M = 2, gs = 128
+        func buf(_ bytes: Int) -> MTLBuffer {
+            device.makeBuffer(length: bytes, options: .storageModeShared)!
+        }
+        let packedK = H * 2 / 32
+        let nGroups = H / gs
+        let x = buf(M * H * 2)
+        let xp = x.contents().bindMemory(to: Float16.self, capacity: M * H)
+        for i in 0 ..< (M * H) { xp[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+        let w = buf(E * N * packedK * 4)
+        let wp = w.contents().bindMemory(to: UInt8.self, capacity: E * N * packedK * 4)
+        for i in 0 ..< (E * N * packedK * 4) { wp[i] = UInt8((i * 17 + 3) & 0xff) }
+        let s = buf(E * N * nGroups * 2)
+        let b = buf(E * N * nGroups * 2)
+        let sp = s.contents().bindMemory(to: Float16.self, capacity: E * N * nGroups)
+        let bp = b.contents().bindMemory(to: Float16.self, capacity: E * N * nGroups)
+        for i in 0 ..< (E * N * nGroups) {
+            sp[i] = 0.02
+            bp[i] = -0.02
+        }
+        let indsM = buf(M * Ktop * 4)
+        let ipM = indsM.contents().bindMemory(to: Int32.self, capacity: M * Ktop)
+        ipM[0] = 1; ipM[1] = 3; ipM[2] = 2; ipM[3] = 5
+        let yM = buf(M * Ktop * N * 2)
+        let ySeq = buf(M * Ktop * N * 2)
+
+        try SeedlessMetal.gqmm2(
+            x: x, w: w, scales: s, biases: b, inds: indsM, out: yM,
+            Ktop: Ktop, K: H, N: N, gs: gs, M: M, splitK: false)
+        for m in 0 ..< M {
+            let x1 = buf(H * 2)
+            let xSrc = x.contents().bindMemory(to: Float16.self, capacity: M * H)
+            let xDst = x1.contents().bindMemory(to: Float16.self, capacity: H)
+            for i in 0 ..< H { xDst[i] = xSrc[m * H + i] }
+            let inds1 = buf(Ktop * 4)
+            let iSrc = indsM.contents().bindMemory(to: Int32.self, capacity: M * Ktop)
+            let iDst = inds1.contents().bindMemory(to: Int32.self, capacity: Ktop)
+            for k in 0 ..< Ktop { iDst[k] = iSrc[m * Ktop + k] }
+            let y1 = buf(Ktop * N * 2)
+            try SeedlessMetal.gqmm2(
+                x: x1, w: w, scales: s, biases: b, inds: inds1, out: y1,
+                Ktop: Ktop, K: H, N: N, gs: gs, M: 1, splitK: false)
+            let ySrc = y1.contents().bindMemory(to: Float16.self, capacity: Ktop * N)
+            let yDst = ySeq.contents().bindMemory(to: Float16.self, capacity: M * Ktop * N)
+            for i in 0 ..< (Ktop * N) { yDst[m * Ktop * N + i] = ySrc[i] }
+        }
+        let a = yM.contents().bindMemory(to: Float16.self, capacity: M * Ktop * N)
+        let bOut = ySeq.contents().bindMemory(to: Float16.self, capacity: M * Ktop * N)
+        var maxAbs: Float = 0
+        var num = 0.0, den = 0.0
+        for i in 0 ..< (M * Ktop * N) {
+            let d = abs(Float(a[i]) - Float(bOut[i]))
+            maxAbs = max(maxAbs, d)
+            num += Double(d * d)
+            den += Double(Float(a[i]) * Float(a[i]))
+        }
+        let rel = sqrt(num / max(den, 1e-30))
+        XCTAssertLessThan(rel, 1e-3, "M-row gqmm2 must match sequential M=1; rel_l2=\(rel) maxAbs=\(maxAbs)")
+    }
+
     func testFusedExpertFasterThanNaiveFloor() throws {
         try SeedlessMetal.ensureCompiled()
         let rate = try SeedlessMetal.benchFusedExpert(E: 256, iters: 30)

@@ -144,9 +144,12 @@ public final class SeedlessFlashHead {
         forceRows = forceFlat
     }
 
-    public func encodeCentroids(into enc: MTLComputeCommandEncoder, h: MTLBuffer) {
+    public func encodeCentroids(
+        into enc: MTLComputeCommandEncoder, h: MTLBuffer, hByteOffset: Int = 0
+    ) {
         SeedlessMetal.encodeBatchedGemv(
-            into: enc, w: centroidsBuf, x: h, y: scoresBuf, E: nClusters, H: H)
+            into: enc, w: centroidsBuf, x: h, y: scoresBuf, E: nClusters, H: H,
+            xByteOffset: hByteOffset)
     }
 
     /// Hierarchical GPU top-k + gather into the current encoder (no extra CB).
@@ -155,7 +158,8 @@ public final class SeedlessFlashHead {
     }
 
     public func encodeFusedAfterCentroids(
-        into enc: MTLComputeCommandEncoder, h: MTLBuffer, inds: MTLBuffer, logits: MTLBuffer
+        into enc: MTLComputeCommandEncoder, h: MTLBuffer, inds: MTLBuffer, logits: MTLBuffer,
+        hByteOffset: Int = 0
     ) {
         SeedlessMetal.encodeFlashTopK(
             into: enc, scores: scoresBuf, inds: inds,
@@ -165,7 +169,8 @@ public final class SeedlessFlashHead {
             into: enc,
             w: headWBuf, scales: headSBuf, biases: headBBuf, x: h,
             inds: inds, y: logits,
-            nProbes: nProbes, N: clusterSize, K: H, gs: headGroupSize)
+            nProbes: nProbes, N: clusterSize, K: H, gs: headGroupSize,
+            xByteOffset: hByteOffset)
     }
 
     /// After fused layer CB wait: read inds+logits, argmax, force tokens.

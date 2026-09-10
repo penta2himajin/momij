@@ -20,6 +20,8 @@ public final class SeedlessLayerBlock {
     public let isSliding: Bool
     /// Absolute tokens written (RoPE index for next write).
     public private(set) var offset: Int = 0
+    /// Scratch capacity for True M-row (env-driven via stack).
+    public let maxM: Int
 
     let hBuf: MTLBuffer
     let inNorm: MTLBuffer
@@ -59,8 +61,12 @@ public final class SeedlessLayerBlock {
     let downOut: MTLBuffer
     let moeOut: MTLBuffer
 
-    public init(store: WeightStore, layer: Int, device: MTLDevice, sharedH: MTLBuffer? = nil, maxLen: Int? = nil) throws {
+    public init(
+        store: WeightStore, layer: Int, device: MTLDevice,
+        sharedH: MTLBuffer? = nil, maxLen: Int? = nil, maxM: Int = 1
+    ) throws {
         self.layer = layer
+        self.maxM = max(1, maxM)
         let cfg = store.config
         H = cfg.hiddenSize
         I = cfg.moeIntermediateSize
@@ -134,31 +140,32 @@ public final class SeedlessLayerBlock {
         downS = try mtl(dS)
         downB = try mtl(dB)
 
-        hBuf = sharedH ?? device.makeBuffer(length: H * 2, options: .storageModeShared)!
+        hBuf = sharedH ?? device.makeBuffer(length: self.maxM * H * 2, options: .storageModeShared)!
         densInds = device.makeBuffer(length: 4, options: .storageModeShared)!
         densInds.contents().storeBytes(of: Int32(0), as: Int32.self)
 
         let qDim = numHeads * headDim
         let kvDim = numKV * headDim
         let qkvN = qDim + 2 * kvDim
-        xAttn = device.makeBuffer(length: H * 2, options: .storageModeShared)!
-        qkvOut = device.makeBuffer(length: qkvN * 2, options: .storageModeShared)!
-        qkOut = device.makeBuffer(length: (qDim + kvDim) * 2, options: .storageModeShared)!
-        attnTmp = device.makeBuffer(length: qDim * 2, options: .storageModeShared)!
-        attnOut = device.makeBuffer(length: H * 2, options: .storageModeShared)!
+        let m = self.maxM
+        xAttn = device.makeBuffer(length: m * H * 2, options: .storageModeShared)!
+        qkvOut = device.makeBuffer(length: m * qkvN * 2, options: .storageModeShared)!
+        qkOut = device.makeBuffer(length: m * (qDim + kvDim) * 2, options: .storageModeShared)!
+        attnTmp = device.makeBuffer(length: m * qDim * 2, options: .storageModeShared)!
+        attnOut = device.makeBuffer(length: m * H * 2, options: .storageModeShared)!
         kCache = device.makeBuffer(length: numKV * self.maxLen * headDim * 2, options: .storageModeShared)!
         vCache = device.makeBuffer(length: numKV * self.maxLen * headDim * 2, options: .storageModeShared)!
         memset(kCache.contents(), 0, numKV * self.maxLen * headDim * 2)
         memset(vCache.contents(), 0, numKV * self.maxLen * headDim * 2)
 
-        xMoe = device.makeBuffer(length: H * 2, options: .storageModeShared)!
-        logits = device.makeBuffer(length: E * 4, options: .storageModeShared)!
-        inds = device.makeBuffer(length: Ktop * 4, options: .storageModeShared)!
-        scores = device.makeBuffer(length: Ktop * 4, options: .storageModeShared)!
-        ugOut = device.makeBuffer(length: Ktop * 2 * I * 2, options: .storageModeShared)!
-        act = device.makeBuffer(length: Ktop * I * 2, options: .storageModeShared)!
-        downOut = device.makeBuffer(length: Ktop * H * 2, options: .storageModeShared)!
-        moeOut = device.makeBuffer(length: H * 2, options: .storageModeShared)!
+        xMoe = device.makeBuffer(length: m * H * 2, options: .storageModeShared)!
+        logits = device.makeBuffer(length: m * E * 4, options: .storageModeShared)!
+        inds = device.makeBuffer(length: m * Ktop * 4, options: .storageModeShared)!
+        scores = device.makeBuffer(length: m * Ktop * 4, options: .storageModeShared)!
+        ugOut = device.makeBuffer(length: m * Ktop * 2 * I * 2, options: .storageModeShared)!
+        act = device.makeBuffer(length: m * Ktop * I * 2, options: .storageModeShared)!
+        downOut = device.makeBuffer(length: m * Ktop * H * 2, options: .storageModeShared)!
+        moeOut = device.makeBuffer(length: m * H * 2, options: .storageModeShared)!
     }
 
     public func resetCache() {
@@ -174,12 +181,21 @@ public final class SeedlessLayerBlock {
         v.withUnsafeBytes { vCache.contents().copyMemory(from: $0.baseAddress!, byteCount: v.count) }
     }
 
-    /// Encode one decode step at current `offset`, then advance offset.
-    public func encodeStep(into enc: MTLComputeCommandEncoder) throws {
-        if !isSliding && offset >= maxLen {
-            throw SeedlessError.unsupportedShape(N: offset, K: maxLen, gs: 0)
+    /// Encode `M` decode tokens at current `offset`, then advance offset by M.
+    /// `M>1` requires True M-row scratch (`maxM`) and no SWA rotate in the window.
+    public func encodeStep(into enc: MTLComputeCommandEncoder, M: Int = 1) throws {
+        precondition(M >= 1 && M <= maxM)
+        if !isSliding && offset + M > maxLen {
+            throw SeedlessError.unsupportedShape(N: offset + M, K: maxLen, gs: 0)
         }
         let rotate = isSliding && offset >= maxLen
+        if rotate && M > 1 {
+            throw SeedlessError.unsupportedShape(N: M, K: maxLen, gs: 0)
+        }
+        // SWA: refuse M-row if any of the M writes would need a rotate mid-batch.
+        if isSliding && !rotate && offset + M > maxLen {
+            throw SeedlessError.unsupportedShape(N: offset + M, K: maxLen, gs: 0)
+        }
         let writePos = rotate ? maxLen - 1 : offset
         let seqLen = rotate ? maxLen : offset + 1
         let ropePos = offset
@@ -196,8 +212,17 @@ public final class SeedlessLayerBlock {
             ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
             H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs,
             numHeads: numHeads, numKV: numKV, headDim: headDim, ropeDim: ropeDim,
-            ropePos: ropePos, writePos: writePos, maxLen: maxLen, seqLen: seqLen, rotateFirst: rotate)
-        offset += 1
+            ropePos: ropePos, writePos: writePos, maxLen: maxLen, seqLen: seqLen,
+            rotateFirst: rotate, M: M)
+        offset += M
+    }
+
+    /// True when this layer can pack `M` tokens without SWA rotate / overflow.
+    public func canEncodeMrow(M: Int) -> Bool {
+        guard M >= 1, M <= maxM else { return false }
+        if !isSliding { return offset + M <= maxLen }
+        if offset >= maxLen { return M == 1 }  // rotateFirst is M=1 only
+        return offset + M <= maxLen
     }
 
     /// Encode without advancing offset (microbench helper).
@@ -245,18 +270,25 @@ public final class SeedlessLayerStack {
     public let layers: [SeedlessLayerBlock]
     public let hBuf: MTLBuffer
     public let H: Int
+    public let maxM: Int
 
-    public init(store: WeightStore, device: MTLDevice, fullMaxLen: Int = 2048) throws {
+    public init(store: WeightStore, device: MTLDevice, fullMaxLen: Int = 2048, maxM: Int = 1) throws {
         let n = store.config.numHiddenLayers
         H = store.config.hiddenSize
-        hBuf = device.makeBuffer(length: H * 2, options: .storageModeShared)!
+        self.maxM = max(1, maxM)
+        hBuf = device.makeBuffer(length: self.maxM * H * 2, options: .storageModeShared)!
         var built: [SeedlessLayerBlock] = []
         built.reserveCapacity(n)
         for i in 0 ..< n {
             let ml = store.config.isSliding(i) ? store.config.slidingWindow : fullMaxLen
-            built.append(try SeedlessLayerBlock(store: store, layer: i, device: device, sharedH: hBuf, maxLen: ml))
+            built.append(try SeedlessLayerBlock(
+                store: store, layer: i, device: device, sharedH: hBuf, maxLen: ml, maxM: self.maxM))
         }
         layers = built
+    }
+
+    public func canEncodeMrow(M: Int) -> Bool {
+        layers.allSatisfy { $0.canEncodeMrow(M: M) }
     }
 
     public func fillH(_ v: Float16) {

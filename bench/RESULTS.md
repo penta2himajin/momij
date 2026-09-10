@@ -486,6 +486,30 @@ Honest read:
   Production e2e still needs decode to call `encodeLayerBlock(..., M:)`
   (or hybrid) and size scratch to M. Do not default yet.
 
+## 2026-09-10 e2e: True M-row wired into `stepChainFeeds`
+
+Env: `MOMIJ_MROW=1` sizes layer scratch to `SPEC_MAX_M` and packs draft verify
+as one M-row forward (embed rows → `encodeStep(M:)` ×24L → FlashHead per row).
+Default remains M=1. SWA rotate mid-batch falls back to sequential.
+
+M1 Max, omlx stop, release, FlashHead fuse. Measured 2026-09-10:
+
+| Path | gen tok/s | notes |
+|---|---|---|
+| greedy p128/g128 n=3 | **~172–179** | baseline |
+| suffix-spec motif (accept≈0–0.25) | ~169 / batch ~105–122 | drafts miss → gate/restore tax |
+| chain1cb K=8, M×M=1 (`SPEC_BATCH`) | **~180–184** | match=true, ~1.04–1.06× seq |
+| **chain1cb K=8, True M-row (`MROW=1`)** | **~350–380** | **match=true, ~2.1–2.2× seq** |
+
+Verdict (e2e tok/s, not synthetic µs):
+
+1. **True M-row wins the forced full-accept chain verify** (~2.2× vs sequential
+   steps; ~2× vs packed M×M=1 in one CB). Lossless (`match=true`).
+2. Motif SuffixSpec still has near-zero draft accept, so product e2e tok/s stays
+   below greedy until drafts land. M-row cannot invent accept rate.
+3. Do **not** default `MOMIJ_MROW=1` for cold SuffixSpec; keep opt-in for
+   high-accept / oracle-draft / chain-verify paths.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

@@ -723,19 +723,20 @@ public enum SeedlessMetal {
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
-    /// `out[H] = embTable[ids[row], :]` (GPU gather; safe inside a multi-step CB).
+    /// `out[outRow, :] = embTable[ids[idRow], :]` (GPU gather; safe inside a multi-step CB).
     static func encodeEmbedToken(
         into enc: MTLComputeCommandEncoder,
         table: MTLBuffer, ids: MTLBuffer, out: MTLBuffer,
-        H: Int, row: Int
+        H: Int, row: Int, outRow: Int = 0
     ) {
         enc.setComputePipelineState(embedTokenPipeline!)
         enc.setBuffer(table, offset: 0, index: 0)
         enc.setBuffer(ids, offset: 0, index: 1)
         enc.setBuffer(out, offset: 0, index: 2)
-        var h32 = Int32(H), r32 = Int32(row)
+        var h32 = Int32(H), r32 = Int32(row), or32 = Int32(outRow)
         enc.setBytes(&h32, length: 4, index: 3)
         enc.setBytes(&r32, length: 4, index: 4)
+        enc.setBytes(&or32, length: 4, index: 5)
         enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
     }
@@ -823,13 +824,14 @@ public enum SeedlessMetal {
     /// Dense gemv y[M,E]=W[E,H]@x[M,H]. One simdgroup (32 threads) per (e,m) — no TG barriers.
     static func encodeBatchedGemv(
         into enc: MTLComputeCommandEncoder, w: MTLBuffer, x: MTLBuffer, y: MTLBuffer,
-        E: Int, H: Int, threadgroups: Int = 256, threadsPerTG: Int = 64, M: Int = 1
+        E: Int, H: Int, threadgroups: Int = 256, threadsPerTG: Int = 64, M: Int = 1,
+        xByteOffset: Int = 0, yByteOffset: Int = 0
     ) {
         _ = threadgroups; _ = threadsPerTG
         enc.setComputePipelineState(batchedGemvPipeline!)
         enc.setBuffer(w, offset: 0, index: 0)
-        enc.setBuffer(x, offset: 0, index: 1)
-        enc.setBuffer(y, offset: 0, index: 2)
+        enc.setBuffer(x, offset: xByteOffset, index: 1)
+        enc.setBuffer(y, offset: yByteOffset, index: 2)
         var e32 = Int32(E), h32 = Int32(H), m32 = Int32(M)
         enc.setBytes(&e32, length: 4, index: 3)
         enc.setBytes(&h32, length: 4, index: 4)
@@ -843,13 +845,13 @@ public enum SeedlessMetal {
         into enc: MTLComputeCommandEncoder,
         w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer, x: MTLBuffer,
         inds: MTLBuffer, y: MTLBuffer,
-        nProbes: Int, N: Int, K: Int, gs: Int
+        nProbes: Int, N: Int, K: Int, gs: Int, xByteOffset: Int = 0
     ) {
         enc.setComputePipelineState(qmm4GatherPipeline!)
         enc.setBuffer(w, offset: 0, index: 0)
         enc.setBuffer(scales, offset: 0, index: 1)
         enc.setBuffer(biases, offset: 0, index: 2)
-        enc.setBuffer(x, offset: 0, index: 3)
+        enc.setBuffer(x, offset: xByteOffset, index: 3)
         enc.setBuffer(inds, offset: 0, index: 4)
         enc.setBuffer(y, offset: 0, index: 5)
         var n32 = Int32(N), k32 = Int32(K), gs32 = Int32(gs), np32 = Int32(nProbes)
@@ -2515,18 +2517,19 @@ public enum SeedlessMetal {
         if (simd_lid == 0) { for (int i = 0; i < v_per_thread; i++) out[i] = half(o[i]); }
     }
 
-    // Gather one embedding row: out[H] = table[token, :]
+    // Gather one embedding row: out[outRow, :] = table[ids[row], :]
     kernel void maple_embed_token(
         device const half* table [[buffer(0)]],
         device const int* ids [[buffer(1)]],
         device half* out [[buffer(2)]],
         constant int& H [[buffer(3)]],
         constant int& row [[buffer(4)]],
+        constant int& outRow [[buffer(5)]],
         uint gid [[thread_position_in_grid]])
     {
         if (gid >= (uint)H) return;
         int tok = ids[row];
-        out[gid] = table[(size_t)tok * (size_t)H + gid];
+        out[(size_t)outRow * (size_t)H + gid] = table[(size_t)tok * (size_t)H + gid];
     }
 
     // FlashHead gather logits → token id + optional force-token override. One TG.

@@ -27,10 +27,14 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     private let H: Int
     /// Max chained verify feeds (draftK+1). Env `MOMIJ_SPEC_MAX_M`, default 9.
     private let specMaxM: Int
+    /// True M-row chain verify (`MOMIJ_MROW=1`). Default off until e2e wins.
+    private let useMrow: Bool
     private var specFeedIds: MTLBuffer?
     private var specNormSlots: [MTLBuffer] = []
     private var specIndsSlots: [MTLBuffer] = []
     private var specLogitsSlots: [MTLBuffer] = []
+    /// Packed final-norm rows for M-row FlashHead (`[maxM, H]`).
+    private var specPackedNorm: MTLBuffer?
 
     public struct PhaseMs: Sendable {
         public var embed = 0.0
@@ -48,7 +52,12 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         self.store = store
         self.config = store.config
         self.H = store.config.hiddenSize
-        self.stack = try SeedlessLayerStack(store: store, device: device, fullMaxLen: fullMaxLen)
+        let envM = ProcessInfo.processInfo.environment["MOMIJ_SPEC_MAX_M"].flatMap(Int.init)
+        specMaxM = max(2, envM ?? 9)
+        useMrow = ProcessInfo.processInfo.environment["MOMIJ_MROW"] == "1"
+        let stackM = useMrow ? specMaxM : 1
+        self.stack = try SeedlessLayerStack(
+            store: store, device: device, fullMaxLen: fullMaxLen, maxM: stackM)
         if let s = ProcessInfo.processInfo.environment["MOMIJ_LAYERS_PER_CB"], let v = Int(s), v > 0 {
             layersPerCB = v
         } else {
@@ -85,8 +94,6 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         embBuf = ebuf
         normWBuf = nbuf
         finalNormBuf = device.makeBuffer(length: H * 2, options: .storageModeShared)!
-        let envM = ProcessInfo.processInfo.environment["MOMIJ_SPEC_MAX_M"].flatMap(Int.init)
-        specMaxM = max(2, envM ?? 9)
     }
 
     private func ensureSpecSlots() {
@@ -98,10 +105,14 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             specIndsSlots.append(device.makeBuffer(length: fh.nProbes * 4, options: .storageModeShared)!)
             specLogitsSlots.append(device.makeBuffer(length: logitBytes, options: .storageModeShared)!)
         }
+        if useMrow {
+            specPackedNorm = device.makeBuffer(length: specMaxM * H * 2, options: .storageModeShared)
+        }
     }
 
     /// C2: draft-driven chain verify in **one CB / one wait** (GPU embed; Qwisp chained style).
     /// `feeds` = [y] + draft (length D+1). Returns greedy evals[0..<feeds.count].
+    /// With `MOMIJ_MROW=1` and capacity, packs True M-row layers instead of M×M=1.
     public func stepChainFeeds(_ feeds: [Int]) throws -> [Int] {
         precondition(!feeds.isEmpty && feeds.count <= specMaxM)
         guard useFlashHead, let fh = flashHead, fh.fuseIntoLayerCB else {
@@ -114,35 +125,68 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         guard let q = SeedlessMetal.queue, let feedBuf = specFeedIds else {
             throw SeedlessError.notReady
         }
-        let ip = feedBuf.contents().bindMemory(to: Int32.self, capacity: feeds.count)
+        let M = feeds.count
+        let ip = feedBuf.contents().bindMemory(to: Int32.self, capacity: M)
         for (i, t) in feeds.enumerated() { ip[i] = Int32(t) }
 
+        let packMrow = useMrow && M > 1 && stack.canEncodeMrow(M: M)
         let cb = q.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
-        for i in 0 ..< feeds.count {
-            SeedlessMetal.encodeEmbedToken(
-                into: enc, table: embBuf, ids: feedBuf, out: stack.hBuf, H: H, row: i)
-            for layer in stack.layers {
-                try layer.encodeStep(into: enc)
+        if packMrow, let packed = specPackedNorm {
+            for i in 0 ..< M {
+                SeedlessMetal.encodeEmbedToken(
+                    into: enc, table: embBuf, ids: feedBuf, out: stack.hBuf,
+                    H: H, row: i, outRow: i)
             }
-            let norm = specNormSlots[i]
-            let inds = specIndsSlots[i]
-            let logits = specLogitsSlots[i]
+            for layer in stack.layers {
+                try layer.encodeStep(into: enc, M: M)
+            }
             SeedlessMetal.encodeRms(
-                into: enc, h: stack.hBuf, w: normWBuf, out: norm, H: H, eps: config.rmsNormEps)
-            fh.encodeCentroids(into: enc, h: norm)
-            fh.encodeFusedAfterCentroids(into: enc, h: norm, inds: inds, logits: logits)
+                into: enc, h: stack.hBuf, w: normWBuf, out: packed,
+                H: H, eps: config.rmsNormEps, M: M)
+            for i in 0 ..< M {
+                let off = i * H * 2
+                let inds = specIndsSlots[i]
+                let logits = specLogitsSlots[i]
+                fh.encodeCentroids(into: enc, h: packed, hByteOffset: off)
+                fh.encodeFusedAfterCentroids(
+                    into: enc, h: packed, inds: inds, logits: logits, hByteOffset: off)
+            }
+        } else {
+            for i in 0 ..< M {
+                SeedlessMetal.encodeEmbedToken(
+                    into: enc, table: embBuf, ids: feedBuf, out: stack.hBuf, H: H, row: i)
+                for layer in stack.layers {
+                    try layer.encodeStep(into: enc)
+                }
+                let norm = specNormSlots[i]
+                let inds = specIndsSlots[i]
+                let logits = specLogitsSlots[i]
+                SeedlessMetal.encodeRms(
+                    into: enc, h: stack.hBuf, w: normWBuf, out: norm, H: H, eps: config.rmsNormEps)
+                fh.encodeCentroids(into: enc, h: norm)
+                fh.encodeFusedAfterCentroids(into: enc, h: norm, inds: inds, logits: logits)
+            }
         }
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
 
         var evals: [Int] = []
-        evals.reserveCapacity(feeds.count)
-        for i in 0 ..< feeds.count {
-            let ptr = specNormSlots[i].contents().bindMemory(to: Float16.self, capacity: H)
-            evals.append(fh.greedyAfterFusedGather(
-                hostH: ptr, inds: specIndsSlots[i], logits: specLogitsSlots[i]))
+        evals.reserveCapacity(M)
+        if packMrow, let packed = specPackedNorm {
+            let base = packed.contents().bindMemory(to: Float16.self, capacity: M * H)
+            for i in 0 ..< M {
+                evals.append(fh.greedyAfterFusedGather(
+                    hostH: base.advanced(by: i * H),
+                    inds: specIndsSlots[i], logits: specLogitsSlots[i]))
+            }
+        } else {
+            for i in 0 ..< M {
+                let ptr = specNormSlots[i].contents().bindMemory(to: Float16.self, capacity: H)
+                evals.append(fh.greedyAfterFusedGather(
+                    hostH: ptr, inds: specIndsSlots[i], logits: specLogitsSlots[i]))
+            }
         }
         return evals
     }

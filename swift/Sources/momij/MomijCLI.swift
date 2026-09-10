@@ -116,6 +116,8 @@ struct MomijMain {
         print(try SeedlessMetal.benchFusedExpertMrow(iters: 20))
         print(try SeedlessMetal.benchAttnMrow(iters: 20))
         print(try SeedlessMetal.benchAttnBlockMrow(iters: 20))
+        print(try SeedlessMetal.benchMoEBlockMrow(iters: 20))
+        print(try SeedlessMetal.benchLayerMrowConfigs(iters: 8))
         if FileManager.default.fileExists(atPath: model) {
             do {
                 let store = try WeightStore(modelDir: model)

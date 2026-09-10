@@ -452,6 +452,40 @@ block is like O-proj — M=2 ≈ no win, M≥4 is 0.39×**. Draft=2 will not mov
 sequential attn; QKV still packs but o-proj + epilogue dominate the block.
 Do not default decode to M-row. Next structural gap is router / e2e M≥2.
 
+## 2026-09-10 Router M-row + layer config sweep
+
+Wired `M` through `maple_rms_norm` (1 TG/token), `maple_batched_gemv` /
+`maple_gate_gemv` grid `(E,M)`, `maple_route_top8` (1 TG/token),
+`maple_resid_add` `[M,H]`. `encodeMoEBlock` / `encodeLayerBlock` take `M`
+(default 1). Decode still M=1. Parity: MoE block M=2 vs two sequential M=1,
+rel_l2 < 1e-3.
+
+Warm MoE-block (H=2048 I=512 E=256 K=8, 20 iters) and layer config sweep
+(`seq` = M×M=1, `full` = attn+moe M-row, `moe` = attn seq + moe M-row; 8 iters).
+omlx stopped.
+
+| probe | M=1 | M=2 vs | M=4 vs | M=8 vs |
+|---|---|---|---|---|
+| moe-block ms/tok vsM1 | 0.395 | **0.51** | 0.43 | 0.28 |
+
+| layer cfg | M=2 vsSeq | M=4 vsSeq |
+|---|---|---|
+| seq | 1.00 | 1.00 |
+| full | **0.81** | 0.57 |
+| moe (attn seq + moe M-row) | 0.89 | **0.38** |
+
+Honest read:
+
+- Router gap is closed; MoE block packs at M=2 (0.51×), matching fused-expert.
+- **Fastest M=2 layer config on this synthetic Maple-like probe: `full`**
+  (~0.81× vs sequential). Hybrid moe is close behind.
+- **Fastest M=4: `moe` hybrid** (0.38×) — attn M-row still weaker than MoE
+  packing, so sequential attn + batched MoE wins. Full is second (0.57×).
+- M=1 `full` outlier (~4× seq) is noise / first-touch; ignore for ranking.
+- `moe` hybrid pays an extra CB + host pack; numbers are GPU-ms sum.
+  Production e2e still needs decode to call `encodeLayerBlock(..., M:)`
+  (or hybrid) and size scratch to M. Do not default yet.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

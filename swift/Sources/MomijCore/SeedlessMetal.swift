@@ -452,6 +452,7 @@ public enum SeedlessMetal {
     }
 
     /// Encode one MoE block into an existing encoder (no commit/wait).
+    /// `M>1`: h/xNorm/moeOut `[M,H]`, logits `[M,E]`, inds/scores `[M·Ktop]`.
     public static func encodeMoEBlock(
         into enc: MTLComputeCommandEncoder,
         h: MTLBuffer, normW: MTLBuffer, gateW: MTLBuffer,
@@ -459,44 +460,18 @@ public enum SeedlessMetal {
         downW: MTLBuffer, downS: MTLBuffer, downB: MTLBuffer,
         xNorm: MTLBuffer, logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
         ugOut: MTLBuffer, act: MTLBuffer, downOut: MTLBuffer, moeOut: MTLBuffer,
-        H: Int, I: Int, E: Int, Ktop: Int, eps: Float, gs: Int = 128
+        H: Int, I: Int, E: Int, Ktop: Int, eps: Float, gs: Int = 128, M: Int = 1
     ) throws {
         try ensureCompiled()
-        guard let rms = rmsPipeline, let resid = residPipeline,
-              let gemv = gateGemvPipeline, let route = routeTop8Pipeline,
-              let stop = stopBuf
+        guard rmsPipeline != nil, residPipeline != nil,
+              gateGemvPipeline != nil, routeTop8Pipeline != nil,
+              stopBuf != nil
         else { throw SeedlessError.notReady }
+        guard M >= 1 else { throw SeedlessError.unsupportedShape(N: H, K: I, gs: gs) }
 
-        enc.setComputePipelineState(rms)
-        enc.setBuffer(h, offset: 0, index: 0)
-        enc.setBuffer(normW, offset: 0, index: 1)
-        enc.setBuffer(xNorm, offset: 0, index: 2)
-        var epsV = eps, h32 = Int32(H)
-        enc.setBytes(&epsV, length: 4, index: 3)
-        enc.setBytes(&h32, length: 4, index: 4)
-        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-
-        enc.setComputePipelineState(gemv)
-        enc.setBuffer(gateW, offset: 0, index: 0)
-        enc.setBuffer(xNorm, offset: 0, index: 1)
-        enc.setBuffer(logits, offset: 0, index: 2)
-        var e32 = Int32(E)
-        enc.setBytes(&e32, length: 4, index: 3)
-        enc.setBytes(&h32, length: 4, index: 4)
-        enc.dispatchThreadgroups(MTLSize(width: E, height: 1, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-
-        enc.setComputePipelineState(route)
-        enc.setBuffer(logits, offset: 0, index: 0)
-        enc.setBuffer(inds, offset: 0, index: 1)
-        enc.setBuffer(scores, offset: 0, index: 2)
-        enc.setBytes(&e32, length: 4, index: 3)
-        var k32 = Int32(Ktop)
-        enc.setBytes(&k32, length: 4, index: 4)
-        enc.setBuffer(stop, offset: 0, index: 5)
-        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        encodeRms(into: enc, h: h, w: normW, out: xNorm, H: H, eps: eps, M: M)
+        encodeGate(into: enc, w: gateW, x: xNorm, y: logits, E: E, H: H, M: M)
+        encodeRoute(into: enc, logits: logits, inds: inds, scores: scores, E: E, Ktop: Ktop, M: M)
 
         try encodeFusedExpert(
             into: enc, x: xNorm,
@@ -504,14 +479,9 @@ public enum SeedlessMetal {
             downW: downW, downS: downS, downB: downB,
             inds: inds, scores: scores,
             ugOut: ugOut, act: act, downOut: downOut, y: moeOut,
-            H: H, I: I, Ktop: Ktop, gs: gs)
+            H: H, I: I, Ktop: Ktop, gs: gs, M: M)
 
-        enc.setComputePipelineState(resid)
-        enc.setBuffer(h, offset: 0, index: 0)
-        enc.setBuffer(moeOut, offset: 0, index: 1)
-        enc.setBytes(&h32, length: 4, index: 2)
-        enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
+        encodeResid(into: enc, h: h, delta: moeOut, H: H, M: M)
     }
 
     public static func moeBlockOneCB(
@@ -520,7 +490,7 @@ public enum SeedlessMetal {
         downW: MTLBuffer, downS: MTLBuffer, downB: MTLBuffer,
         xNorm: MTLBuffer, logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
         ugOut: MTLBuffer, act: MTLBuffer, downOut: MTLBuffer, moeOut: MTLBuffer,
-        H: Int, I: Int, E: Int, Ktop: Int, eps: Float, gs: Int = 128
+        H: Int, I: Int, E: Int, Ktop: Int, eps: Float, gs: Int = 128, M: Int = 1
     ) throws {
         try ensureCompiled()
         guard let q = queue else { throw SeedlessError.notReady }
@@ -532,21 +502,22 @@ public enum SeedlessMetal {
             downW: downW, downS: downS, downB: downB,
             xNorm: xNorm, logits: logits, inds: inds, scores: scores,
             ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
-            H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs)
+            H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs, M: M)
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
     }
 
     public static func encodeResid(
-        into enc: MTLComputeCommandEncoder, h: MTLBuffer, delta: MTLBuffer, H: Int
+        into enc: MTLComputeCommandEncoder, h: MTLBuffer, delta: MTLBuffer, H: Int, M: Int = 1
     ) {
         enc.setComputePipelineState(residPipeline!)
         enc.setBuffer(h, offset: 0, index: 0)
         enc.setBuffer(delta, offset: 0, index: 1)
-        var h32 = Int32(H)
+        var h32 = Int32(H), m32 = Int32(M)
         enc.setBytes(&h32, length: 4, index: 2)
-        enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
+        enc.setBytes(&m32, length: 4, index: 3)
+        enc.dispatchThreads(MTLSize(width: H, height: M, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
     }
 
@@ -696,9 +667,10 @@ public enum SeedlessMetal {
         ugOut: MTLBuffer, act: MTLBuffer, downOut: MTLBuffer, moeOut: MTLBuffer,
         H: Int, I: Int, E: Int, Ktop: Int, eps: Float, gs: Int,
         numHeads: Int, numKV: Int, headDim: Int, ropeDim: Int,
-        ropePos: Int, writePos: Int, maxLen: Int, seqLen: Int, rotateFirst: Bool
+        ropePos: Int, writePos: Int, maxLen: Int, seqLen: Int, rotateFirst: Bool,
+        M: Int = 1
     ) throws {
-        encodeRms(into: enc, h: h, w: inNorm, out: xAttn, H: H, eps: eps)
+        encodeRms(into: enc, h: h, w: inNorm, out: xAttn, H: H, eps: eps, M: M)
         try encodeAttnBlock(
             into: enc, xNorm: xAttn,
             qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
@@ -708,15 +680,15 @@ public enum SeedlessMetal {
             kCache: kCache, vCache: vCache,
             H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
             ropeDim: ropeDim, ropePos: ropePos, writePos: writePos, maxLen: maxLen, seqLen: seqLen,
-            eps: eps, gs: gs, rotateFirst: rotateFirst)
-        encodeResid(into: enc, h: h, delta: attnOut, H: H)
+            eps: eps, gs: gs, M: M, rotateFirst: rotateFirst)
+        encodeResid(into: enc, h: h, delta: attnOut, H: H, M: M)
         try encodeMoEBlock(
             into: enc, h: h, normW: postNorm, gateW: gateW,
             upGateW: upGateW, upGateS: upGateS, upGateB: upGateB,
             downW: downW, downS: downS, downB: downB,
             xNorm: xMoe, logits: logits, inds: inds, scores: scores,
             ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
-            H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs)
+            H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs, M: M)
     }
 
     /// Wall + GPU time for one encoder body. GPU time is `gpuEndTime - gpuStartTime`.
@@ -737,16 +709,17 @@ public enum SeedlessMetal {
 
     static func encodeRms(
         into enc: MTLComputeCommandEncoder, h: MTLBuffer, w: MTLBuffer, out: MTLBuffer,
-        H: Int, eps: Float
+        H: Int, eps: Float, M: Int = 1
     ) {
         enc.setComputePipelineState(rmsPipeline!)
         enc.setBuffer(h, offset: 0, index: 0)
         enc.setBuffer(w, offset: 0, index: 1)
         enc.setBuffer(out, offset: 0, index: 2)
-        var epsV = eps, h32 = Int32(H)
+        var epsV = eps, h32 = Int32(H), m32 = Int32(M)
         enc.setBytes(&epsV, length: 4, index: 3)
         enc.setBytes(&h32, length: 4, index: 4)
-        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+        enc.setBytes(&m32, length: 4, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
@@ -807,58 +780,61 @@ public enum SeedlessMetal {
 
     static func encodeGate(
         into enc: MTLComputeCommandEncoder, w: MTLBuffer, x: MTLBuffer, y: MTLBuffer,
-        E: Int, H: Int, threadsPerTG: Int = 256
+        E: Int, H: Int, threadsPerTG: Int = 256, M: Int = 1
     ) {
         if useGateSimd {
-            encodeBatchedGemv(into: enc, w: w, x: x, y: y, E: E, H: H)
+            encodeBatchedGemv(into: enc, w: w, x: x, y: y, E: E, H: H, M: M)
             return
         }
         enc.setComputePipelineState(gateGemvPipeline!)
         enc.setBuffer(w, offset: 0, index: 0)
         enc.setBuffer(x, offset: 0, index: 1)
         enc.setBuffer(y, offset: 0, index: 2)
-        var e32 = Int32(E), h32 = Int32(H)
+        var e32 = Int32(E), h32 = Int32(H), m32 = Int32(M)
         enc.setBytes(&e32, length: 4, index: 3)
         enc.setBytes(&h32, length: 4, index: 4)
+        enc.setBytes(&m32, length: 4, index: 5)
         let tpt = max(32, min(256, threadsPerTG))
-        enc.dispatchThreadgroups(MTLSize(width: E, height: 1, depth: 1),
+        enc.dispatchThreadgroups(MTLSize(width: E, height: M, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: tpt, height: 1, depth: 1))
     }
 
     /// Force a specific gate path for tests (`simd: true` → batched; `false` → TG reduce).
     static func encodeGate(
         into enc: MTLComputeCommandEncoder, w: MTLBuffer, x: MTLBuffer, y: MTLBuffer,
-        E: Int, H: Int, simd: Bool
+        E: Int, H: Int, simd: Bool, M: Int = 1
     ) {
         if simd {
-            encodeBatchedGemv(into: enc, w: w, x: x, y: y, E: E, H: H)
+            encodeBatchedGemv(into: enc, w: w, x: x, y: y, E: E, H: H, M: M)
         } else {
             enc.setComputePipelineState(gateGemvPipeline!)
             enc.setBuffer(w, offset: 0, index: 0)
             enc.setBuffer(x, offset: 0, index: 1)
             enc.setBuffer(y, offset: 0, index: 2)
-            var e32 = Int32(E), h32 = Int32(H)
+            var e32 = Int32(E), h32 = Int32(H), m32 = Int32(M)
             enc.setBytes(&e32, length: 4, index: 3)
             enc.setBytes(&h32, length: 4, index: 4)
-            enc.dispatchThreadgroups(MTLSize(width: E, height: 1, depth: 1),
+            enc.setBytes(&m32, length: 4, index: 5)
+            enc.dispatchThreadgroups(MTLSize(width: E, height: M, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         }
     }
 
-    /// Dense gemv y[E]=W[E,H]@x[H]. One simdgroup (32 threads) per row — no TG barriers.
+    /// Dense gemv y[M,E]=W[E,H]@x[M,H]. One simdgroup (32 threads) per (e,m) — no TG barriers.
     static func encodeBatchedGemv(
         into enc: MTLComputeCommandEncoder, w: MTLBuffer, x: MTLBuffer, y: MTLBuffer,
-        E: Int, H: Int, threadgroups: Int = 256, threadsPerTG: Int = 64
+        E: Int, H: Int, threadgroups: Int = 256, threadsPerTG: Int = 64, M: Int = 1
     ) {
         _ = threadgroups; _ = threadsPerTG
         enc.setComputePipelineState(batchedGemvPipeline!)
         enc.setBuffer(w, offset: 0, index: 0)
         enc.setBuffer(x, offset: 0, index: 1)
         enc.setBuffer(y, offset: 0, index: 2)
-        var e32 = Int32(E), h32 = Int32(H)
+        var e32 = Int32(E), h32 = Int32(H), m32 = Int32(M)
         enc.setBytes(&e32, length: 4, index: 3)
         enc.setBytes(&h32, length: 4, index: 4)
-        enc.dispatchThreadgroups(MTLSize(width: E, height: 1, depth: 1),
+        enc.setBytes(&m32, length: 4, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: E, height: M, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     }
 
@@ -926,17 +902,18 @@ public enum SeedlessMetal {
 
     static func encodeRoute(
         into enc: MTLComputeCommandEncoder, logits: MTLBuffer, inds: MTLBuffer, scores: MTLBuffer,
-        E: Int, Ktop: Int
+        E: Int, Ktop: Int, M: Int = 1
     ) {
         enc.setComputePipelineState(routeTop8Pipeline!)
         enc.setBuffer(logits, offset: 0, index: 0)
         enc.setBuffer(inds, offset: 0, index: 1)
         enc.setBuffer(scores, offset: 0, index: 2)
-        var e32 = Int32(E), k32 = Int32(Ktop)
+        var e32 = Int32(E), k32 = Int32(Ktop), m32 = Int32(M)
         enc.setBytes(&e32, length: 4, index: 3)
         enc.setBytes(&k32, length: 4, index: 4)
         enc.setBuffer(stopBuf, offset: 0, index: 5)
-        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+        enc.setBytes(&m32, length: 4, index: 6)
+        enc.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
@@ -1453,6 +1430,296 @@ public enum SeedlessMetal {
         return lines.joined(separator: "\n")
     }
 
+    /// GPU-timed full MoE block M-row (rms + gate + route + fused expert + resid).
+    public static func benchMoEBlockMrow(
+        H: Int = 2048, I: Int = 512, E: Int = 256, Ktop: Int = 8,
+        maxM: Int = 8, iters: Int = 20
+    ) throws -> String {
+        try ensureCompiled()
+        guard let device else { throw SeedlessError.notReady }
+        let gs = 128
+        let packedH = H * 2 / 32
+        let packedI = I * 2 / 32
+        let nGH = H / gs
+        let nGI = I / gs
+
+        func fillX(_ buf: MTLBuffer, n: Int) {
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+        }
+        func fillA(_ buf: MTLBuffer, n: Int, v: Float16) {
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = v }
+        }
+
+        let h = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared)!
+        fillX(h, n: maxM * H)
+        let normW = device.makeBuffer(length: H * 2, options: .storageModeShared)!
+        fillA(normW, n: H, v: 1.0)
+        let gateW = device.makeBuffer(length: E * H * 2, options: .storageModeShared)!
+        fillX(gateW, n: E * H)
+        let ugW = device.makeBuffer(length: E * 2 * I * packedH * 4, options: .storageModeShared)!
+        let ugS = device.makeBuffer(length: E * 2 * I * nGH * 2, options: .storageModeShared)!
+        let ugB = device.makeBuffer(length: E * 2 * I * nGH * 2, options: .storageModeShared)!
+        fillA(ugS, n: E * 2 * I * nGH, v: 0.02)
+        fillA(ugB, n: E * 2 * I * nGH, v: -0.02)
+        let dW = device.makeBuffer(length: E * H * packedI * 4, options: .storageModeShared)!
+        let dS = device.makeBuffer(length: E * H * nGI * 2, options: .storageModeShared)!
+        let dB = device.makeBuffer(length: E * H * nGI * 2, options: .storageModeShared)!
+        fillA(dS, n: E * H * nGI, v: 0.02)
+        fillA(dB, n: E * H * nGI, v: -0.02)
+        let xNorm = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared)!
+        let logits = device.makeBuffer(length: maxM * E * 4, options: .storageModeShared)!
+        let inds = device.makeBuffer(length: maxM * Ktop * 4, options: .storageModeShared)!
+        let scores = device.makeBuffer(length: maxM * Ktop * 4, options: .storageModeShared)!
+        let ugOut = device.makeBuffer(length: maxM * Ktop * 2 * I * 2, options: .storageModeShared)!
+        let act = device.makeBuffer(length: maxM * Ktop * I * 2, options: .storageModeShared)!
+        let downOut = device.makeBuffer(length: maxM * Ktop * H * 2, options: .storageModeShared)!
+        let moeOut = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared)!
+
+        func time(M: Int) throws -> Double {
+            var gpu = 0.0
+            for _ in 0 ..< iters {
+                gpu += try timeCB { enc in
+                    try encodeMoEBlock(
+                        into: enc, h: h, normW: normW, gateW: gateW,
+                        upGateW: ugW, upGateS: ugS, upGateB: ugB,
+                        downW: dW, downS: dS, downB: dB,
+                        xNorm: xNorm, logits: logits, inds: inds, scores: scores,
+                        ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
+                        H: H, I: I, E: E, Ktop: Ktop, eps: 1e-6, gs: gs, M: M)
+                }.gpuMs
+            }
+            return gpu / Double(iters)
+        }
+
+        for _ in 0 ..< 8 {
+            _ = try timeCB { enc in
+                try encodeMoEBlock(
+                    into: enc, h: h, normW: normW, gateW: gateW,
+                    upGateW: ugW, upGateS: ugS, upGateB: ugB,
+                    downW: dW, downS: dS, downB: dB,
+                    xNorm: xNorm, logits: logits, inds: inds, scores: scores,
+                    ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
+                    H: H, I: I, E: E, Ktop: Ktop, eps: 1e-6, gs: gs, M: maxM)
+            }
+        }
+
+        var acc: [Int: (gpu: Double, n: Int)] = [:]
+        for M in [1, 2, 4, 8, 8, 4, 2, 1] where M <= maxM {
+            let gpu = try time(M: M)
+            let a = acc[M] ?? (0, 0)
+            acc[M] = (a.gpu + gpu, a.n + 1)
+        }
+        let gpu1 = (acc[1] ?? (0, 1)).gpu / Double((acc[1] ?? (0, 1)).n)
+        var lines = [
+            "moe-block M-row (H=\(H) I=\(I) E=\(E) K=\(Ktop), \(iters) iters, warm)",
+            "  mode        M   gpu_ms   ms/tok     vsM1    tok/s"
+        ]
+        for M in [1, 2, 4, 8] where M <= maxM {
+            let a = acc[M]!
+            let gpu = a.gpu / Double(a.n)
+            let per = gpu / Double(M)
+            let vs = gpu1 > 0 ? per / gpu1 : 0
+            let tps = per > 0 ? 1000.0 / per : 0
+            lines.append(
+                "  full    \(String(format: "%4d %8.3f %8.3f %8.3f %8.0f", M, gpu, per, vs, tps))"
+            )
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Layer-level M-row config sweep for picking the fastest M≥2 packing.
+    /// Compares: `full` (attn+moe M-row), `seq` (M× M=1 in one CB), `moe` (attn seq + moe M-row).
+    public static func benchLayerMrowConfigs(
+        H: Int = 2048, I: Int = 512, E: Int = 256, Ktop: Int = 8,
+        numHeads: Int = 16, numKV: Int = 4, headDim: Int = 128,
+        maxM: Int = 4, iters: Int = 12, writePos: Int = 32, maxLen: Int = 128
+    ) throws -> String {
+        try ensureCompiled()
+        guard let device else { throw SeedlessError.notReady }
+        let gs = 128, eps: Float = 1e-6
+        let qDim = numHeads * headDim
+        let kvDim = numKV * headDim
+        let qkvN = qDim + 2 * kvDim
+        let packedH = H * 2 / 32
+        let packedQ = qDim * 2 / 32
+        let packedI = I * 2 / 32
+        let nGH = H / gs
+        let nGQ = qDim / gs
+        let nGI = I / gs
+        let seqLen = writePos + 1
+
+        func fillX(_ buf: MTLBuffer, n: Int) {
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+        }
+        func fillA(_ buf: MTLBuffer, n: Int, v: Float16) {
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = v }
+        }
+        func buf(_ bytes: Int) -> MTLBuffer {
+            device.makeBuffer(length: bytes, options: .storageModeShared)!
+        }
+
+        let inNorm = buf(H * 2); fillA(inNorm, n: H, v: 1.0)
+        let postNorm = buf(H * 2); fillA(postNorm, n: H, v: 1.0)
+        let gateW = buf(E * H * 2); fillX(gateW, n: E * H)
+        let dens = buf(4); dens.contents().storeBytes(of: Int32(0), as: Int32.self)
+        let qkvW = buf(qkvN * packedH * 4)
+        let qkvS = buf(qkvN * nGH * 2); fillA(qkvS, n: qkvN * nGH, v: 0.02)
+        let qkvB = buf(qkvN * nGH * 2); fillA(qkvB, n: qkvN * nGH, v: -0.02)
+        let oW = buf(H * packedQ * 4)
+        let oS = buf(H * nGQ * 2); fillA(oS, n: H * nGQ, v: 0.02)
+        let oB = buf(H * nGQ * 2); fillA(oB, n: H * nGQ, v: -0.02)
+        let qkW = buf((numHeads + numKV) * headDim * 2)
+        fillA(qkW, n: (numHeads + numKV) * headDim, v: 1.0)
+        let inv = buf(32 * 4)
+        let ip = inv.contents().bindMemory(to: Float.self, capacity: 32)
+        for i in 0 ..< 32 { ip[i] = 0.1 / Float(i + 1) }
+        let ugW = buf(E * 2 * I * packedH * 4)
+        let ugS = buf(E * 2 * I * nGH * 2); fillA(ugS, n: E * 2 * I * nGH, v: 0.02)
+        let ugB = buf(E * 2 * I * nGH * 2); fillA(ugB, n: E * 2 * I * nGH, v: -0.02)
+        let dW = buf(E * H * packedI * 4)
+        let dS = buf(E * H * nGI * 2); fillA(dS, n: E * H * nGI, v: 0.02)
+        let dB = buf(E * H * nGI * 2); fillA(dB, n: E * H * nGI, v: -0.02)
+        let kCache = buf(numKV * maxLen * headDim * 2); fillX(kCache, n: numKV * maxLen * headDim)
+        let vCache = buf(numKV * maxLen * headDim * 2); fillX(vCache, n: numKV * maxLen * headDim)
+
+        let h = buf(maxM * H * 2); fillX(h, n: maxM * H)
+        let xAttn = buf(maxM * H * 2)
+        let qkvOut = buf(maxM * qkvN * 2)
+        let qkOut = buf(maxM * (qDim + kvDim) * 2)
+        let attnTmp = buf(maxM * qDim * 2)
+        let attnOut = buf(maxM * H * 2)
+        let xMoe = buf(maxM * H * 2)
+        let logits = buf(maxM * E * 4)
+        let inds = buf(maxM * Ktop * 4)
+        let scores = buf(maxM * Ktop * 4)
+        let ugOut = buf(maxM * Ktop * 2 * I * 2)
+        let act = buf(maxM * Ktop * I * 2)
+        let downOut = buf(maxM * Ktop * H * 2)
+        let moeOut = buf(maxM * H * 2)
+
+        var h1 = [MTLBuffer](); var xA1 = [MTLBuffer](); var qkv1 = [MTLBuffer]()
+        var qk1 = [MTLBuffer](); var tmp1 = [MTLBuffer](); var aOut1 = [MTLBuffer]()
+        var xM1 = [MTLBuffer](); var lg1 = [MTLBuffer](); var ind1 = [MTLBuffer]()
+        var sc1 = [MTLBuffer](); var ug1 = [MTLBuffer](); var ac1 = [MTLBuffer]()
+        var dn1 = [MTLBuffer](); var mo1 = [MTLBuffer]()
+        for m in 0 ..< maxM {
+            let hb = buf(H * 2)
+            let src = h.contents().bindMemory(to: Float16.self, capacity: maxM * H)
+            let dst = hb.contents().bindMemory(to: Float16.self, capacity: H)
+            for i in 0 ..< H { dst[i] = src[m * H + i] }
+            h1.append(hb)
+            xA1.append(buf(H * 2)); qkv1.append(buf(qkvN * 2)); qk1.append(buf((qDim + kvDim) * 2))
+            tmp1.append(buf(qDim * 2)); aOut1.append(buf(H * 2)); xM1.append(buf(H * 2))
+            lg1.append(buf(E * 4)); ind1.append(buf(Ktop * 4)); sc1.append(buf(Ktop * 4))
+            ug1.append(buf(Ktop * 2 * I * 2)); ac1.append(buf(Ktop * I * 2))
+            dn1.append(buf(Ktop * H * 2)); mo1.append(buf(H * 2))
+        }
+
+        func encodeFull(_ enc: MTLComputeCommandEncoder, M: Int) throws {
+            try encodeLayerBlock(
+                into: enc, h: h, inNorm: inNorm, postNorm: postNorm, gateW: gateW,
+                qkvW: qkvW, qkvS: qkvS, qkvB: qkvB, oW: oW, oS: oS, oB: oB,
+                qkW: qkW, invFreq: inv, densInds: dens,
+                upGateW: ugW, upGateS: ugS, upGateB: ugB, downW: dW, downS: dS, downB: dB,
+                xAttn: xAttn, qkvOut: qkvOut, qkOut: qkOut, attnTmp: attnTmp, attnOut: attnOut,
+                kCache: kCache, vCache: vCache,
+                xMoe: xMoe, logits: logits, inds: inds, scores: scores,
+                ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
+                H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs,
+                numHeads: numHeads, numKV: numKV, headDim: headDim, ropeDim: 64,
+                ropePos: writePos, writePos: writePos, maxLen: maxLen, seqLen: seqLen,
+                rotateFirst: false, M: M)
+        }
+
+        func encodeSeq(_ enc: MTLComputeCommandEncoder, M: Int) throws {
+            for m in 0 ..< M {
+                try encodeLayerBlock(
+                    into: enc, h: h1[m], inNorm: inNorm, postNorm: postNorm, gateW: gateW,
+                    qkvW: qkvW, qkvS: qkvS, qkvB: qkvB, oW: oW, oS: oS, oB: oB,
+                    qkW: qkW, invFreq: inv, densInds: dens,
+                    upGateW: ugW, upGateS: ugS, upGateB: ugB, downW: dW, downS: dS, downB: dB,
+                    xAttn: xA1[m], qkvOut: qkv1[m], qkOut: qk1[m], attnTmp: tmp1[m], attnOut: aOut1[m],
+                    kCache: kCache, vCache: vCache,
+                    xMoe: xM1[m], logits: lg1[m], inds: ind1[m], scores: sc1[m],
+                    ugOut: ug1[m], act: ac1[m], downOut: dn1[m], moeOut: mo1[m],
+                    H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs,
+                    numHeads: numHeads, numKV: numKV, headDim: headDim, ropeDim: 64,
+                    ropePos: writePos + m, writePos: writePos + m, maxLen: maxLen,
+                    seqLen: seqLen + m, rotateFirst: false, M: 1)
+            }
+        }
+
+        func encodeMoeAttn(_ enc: MTLComputeCommandEncoder, M: Int) throws {
+            for m in 0 ..< M {
+                encodeRms(into: enc, h: h1[m], w: inNorm, out: xA1[m], H: H, eps: eps, M: 1)
+                try encodeAttnBlock(
+                    into: enc, xNorm: xA1[m],
+                    qkvW: qkvW, qkvS: qkvS, qkvB: qkvB, oW: oW, oS: oS, oB: oB,
+                    qkW: qkW, invFreq: inv, densInds: dens,
+                    qkvOut: qkv1[m], qkOut: qk1[m], attnTmp: tmp1[m], attnOut: aOut1[m],
+                    kCache: kCache, vCache: vCache,
+                    H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
+                    ropeDim: 64, ropePos: writePos + m, writePos: writePos + m,
+                    maxLen: maxLen, seqLen: seqLen + m, eps: eps, gs: gs, M: 1)
+                encodeResid(into: enc, h: h1[m], delta: aOut1[m], H: H, M: 1)
+            }
+        }
+
+        func packH(M: Int) {
+            let dst = h.contents().bindMemory(to: Float16.self, capacity: maxM * H)
+            for m in 0 ..< M {
+                let src = h1[m].contents().bindMemory(to: Float16.self, capacity: H)
+                for i in 0 ..< H { dst[m * H + i] = src[i] }
+            }
+        }
+
+        func encodeMoeOnly(_ enc: MTLComputeCommandEncoder, M: Int) throws {
+            try encodeMoEBlock(
+                into: enc, h: h, normW: postNorm, gateW: gateW,
+                upGateW: ugW, upGateS: ugS, upGateB: ugB, downW: dW, downS: dS, downB: dB,
+                xNorm: xMoe, logits: logits, inds: inds, scores: scores,
+                ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
+                H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs, M: M)
+        }
+
+        for _ in 0 ..< 4 {
+            _ = try timeCB { enc in try encodeFull(enc, M: maxM) }
+        }
+
+        var lines = [
+            "layer M-row configs (H=\(H) Maple-like, N=\(seqLen), \(iters) iters, warm)",
+            "  cfg         M   gpu_ms   ms/tok     vsSeq    tok/s"
+        ]
+        for M in [1, 2, 4] where M <= maxM {
+            var seqG = 0.0, fullG = 0.0, moeG = 0.0
+            for _ in 0 ..< iters {
+                seqG += try timeCB { enc in try encodeSeq(enc, M: M) }.gpuMs
+                fullG += try timeCB { enc in try encodeFull(enc, M: M) }.gpuMs
+                let a = try timeCB { enc in try encodeMoeAttn(enc, M: M) }.gpuMs
+                packH(M: M)
+                let b = try timeCB { enc in try encodeMoeOnly(enc, M: M) }.gpuMs
+                moeG += a + b
+            }
+            let seq = seqG / Double(iters)
+            let full = fullG / Double(iters)
+            let moe = moeG / Double(iters)
+            let seqPer = seq / Double(M)
+            for (name, gpu) in [("seq", seq), ("full", full), ("moe", moe)] {
+                let per = gpu / Double(M)
+                let vs = seqPer > 0 ? per / seqPer : 0
+                let tps = per > 0 ? 1000.0 / per : 0
+                lines.append(
+                    "  \(name.padding(toLength: 8, withPad: " ", startingAt: 0)) \(String(format: "%4d %8.3f %8.3f %8.3f %8.0f", M, gpu, per, vs, tps))"
+                )
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: - Metal source
 
     private static let metalSource = """
@@ -1794,13 +2061,18 @@ public enum SeedlessMetal {
         device half* out [[buffer(2)]],
         constant float& eps [[buffer(3)]],
         constant int& H [[buffer(4)]],
+        constant int& M [[buffer(5)]],
         uint lid [[thread_position_in_threadgroup]],
-        uint tgs [[threads_per_threadgroup]])
+        uint tgs [[threads_per_threadgroup]],
+        uint m [[threadgroup_position_in_grid]])
     {
+        if (m >= (uint)M) return;
+        const device half* xm = x + (size_t)m * (size_t)H;
+        device half* om = out + (size_t)m * (size_t)H;
         threadgroup float red[256];
         float acc = 0.0f;
         for (uint i = lid; i < (uint)H; i += tgs) {
-            float xi = float(x[i]);
+            float xi = float(xm[i]);
             acc += xi * xi;
         }
         red[lid] = acc;
@@ -1811,7 +2083,7 @@ public enum SeedlessMetal {
         }
         float inv = precise::rsqrt(red[0] / float(H) + eps);
         for (uint i = lid; i < (uint)H; i += tgs) {
-            out[i] = half(float(x[i]) * inv * float(w[i]));
+            om[i] = half(float(xm[i]) * inv * float(w[i]));
         }
     }
 
@@ -1819,29 +2091,36 @@ public enum SeedlessMetal {
         device half* h [[buffer(0)]],
         device const half* delta [[buffer(1)]],
         constant int& H [[buffer(2)]],
-        uint gid [[thread_position_in_grid]])
+        constant int& M [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]])
     {
-        if (gid >= (uint)H) return;
-        h[gid] = half(float(h[gid]) + float(delta[gid]));
+        uint i = gid.x, m = gid.y;
+        if (i >= (uint)H || m >= (uint)M) return;
+        size_t off = (size_t)m * (size_t)H + i;
+        h[off] = half(float(h[off]) + float(delta[off]));
     }
 
     // Dense gate: y[e] = sum_k W[e,k] * x[k]  (1 TG / expert, parallel reduce)
     kernel void maple_gate_gemv(
         device const half* W [[buffer(0)]],  // [E, H]
-        device const half* x [[buffer(1)]],  // [H]
-        device float* y [[buffer(2)]],       // [E]
+        device const half* x [[buffer(1)]],  // [M, H]
+        device float* y [[buffer(2)]],       // [M, E]
         constant int& E [[buffer(3)]],
         constant int& H [[buffer(4)]],
-        uint e [[threadgroup_position_in_grid]],
-        uint tid [[thread_position_in_threadgroup]],
-        uint tgs [[threads_per_threadgroup]])
+        constant int& M [[buffer(5)]],
+        uint2 tgp [[threadgroup_position_in_grid]],
+        uint2 lid [[thread_position_in_threadgroup]],
+        uint2 tgsv [[threads_per_threadgroup]])
     {
-        if (e >= (uint)E) return;
+        uint e = tgp.x, m = tgp.y;
+        uint tid = lid.x, tgs = tgsv.x;
+        if (e >= (uint)E || m >= (uint)M) return;
         threadgroup float red[256];
         const device half* row = W + (size_t)e * (size_t)H;
+        const device half* xm = x + (size_t)m * (size_t)H;
         float acc = 0.0f;
         for (uint k = tid; k < (uint)H; k += tgs) {
-            acc += float(row[k]) * float(x[k]);
+            acc += float(row[k]) * float(xm[k]);
         }
         red[tid] = acc;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1849,27 +2128,32 @@ public enum SeedlessMetal {
             if (tid < s) red[tid] += red[tid + s];
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        if (tid == 0) y[e] = red[0];
+        if (tid == 0) y[(size_t)m * (size_t)E + e] = red[0];
     }
 
     // One simdgroup per output row — simd_sum, no threadgroup barriers.
+    // Grid: (E, M). y[m,e] = W[e,:] · x[m,:].
     kernel void maple_batched_gemv(
         device const half* W [[buffer(0)]],
         device const half* x [[buffer(1)]],
         device float* y [[buffer(2)]],
         constant int& E [[buffer(3)]],
         constant int& H [[buffer(4)]],
-        uint e [[threadgroup_position_in_grid]],
-        uint tid [[thread_position_in_threadgroup]])
+        constant int& M [[buffer(5)]],
+        uint2 tgp [[threadgroup_position_in_grid]],
+        uint2 lid [[thread_position_in_threadgroup]])
     {
-        if (e >= (uint)E) return;
+        uint e = tgp.x, m = tgp.y;
+        uint tid = lid.x;
+        if (e >= (uint)E || m >= (uint)M) return;
         const device half* row = W + (size_t)e * (size_t)H;
+        const device half* xm = x + (size_t)m * (size_t)H;
         float acc = 0.0f;
         for (uint k = tid; k < (uint)H; k += 32) {
-            acc += float(row[k]) * float(x[k]);
+            acc += float(row[k]) * float(xm[k]);
         }
         acc = simd_sum(acc);
-        if (tid == 0) y[e] = acc;
+        if (tid == 0) y[(size_t)m * (size_t)E + e] = acc;
     }
 
     // 4-bit affine gather-qmv: one TG per probe; one simdgroup per row (tgs = N*32).
@@ -1994,6 +2278,7 @@ public enum SeedlessMetal {
     }
 
     // Softmax + top-K with renorm. E<=256, K<=8. scores are float (for score_reduce).
+    // One TG per token; logits[M,E] → inds/scores[M,K].
     kernel void maple_route_top8(
         device const float* logits [[buffer(0)]],
         device int* inds [[buffer(1)]],
@@ -2001,16 +2286,22 @@ public enum SeedlessMetal {
         constant int& E [[buffer(3)]],
         constant int& K [[buffer(4)]],
         device const int* stopFlag [[buffer(5)]],
+        constant int& M [[buffer(6)]],
         uint tid [[thread_position_in_threadgroup]],
-        uint tgs [[threads_per_threadgroup]])
+        uint tgs [[threads_per_threadgroup]],
+        uint m [[threadgroup_position_in_grid]])
     {
         if (stopFlag[0] != 0) return;
+        if (m >= (uint)M) return;
+        const device float* lgIn = logits + (size_t)m * (size_t)E;
+        device int* indsM = inds + (size_t)m * (size_t)K;
+        device float* scoresM = scores + (size_t)m * (size_t)K;
         threadgroup float red[256];
         threadgroup int redi[256];
         threadgroup float gates[256];
         threadgroup float work[256];
         threadgroup float bcast[1];
-        float lg = (tid < (uint)E) ? logits[tid] : -INFINITY;
+        float lg = (tid < (uint)E) ? lgIn[tid] : -INFINITY;
         red[tid] = lg;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint s = tgs / 2; s > 0; s >>= 1) {
@@ -2019,8 +2310,8 @@ public enum SeedlessMetal {
         }
         if (tid == 0) bcast[0] = red[0];
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float m = bcast[0];
-        float e = (tid < (uint)E) ? precise::exp(lg - m) : 0.0f;
+        float mx = bcast[0];
+        float e = (tid < (uint)E) ? precise::exp(lg - mx) : 0.0f;
         red[tid] = e;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint s = tgs / 2; s > 0; s >>= 1) {
@@ -2048,16 +2339,16 @@ public enum SeedlessMetal {
             }
             if (tid == 0) {
                 int bi = redi[0];
-                inds[k] = bi;
-                scores[k] = gates[bi];
+                indsM[k] = bi;
+                scoresM[k] = gates[bi];
                 work[bi] = -INFINITY;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         if (tid == 0) {
             float ss = 0.0f;
-            for (int k = 0; k < K; k++) ss += scores[k];
-            for (int k = 0; k < K; k++) scores[k] = scores[k] / ss;
+            for (int k = 0; k < K; k++) ss += scoresM[k];
+            for (int k = 0; k < K; k++) scoresM[k] = scoresM[k] / ss;
         }
     }
 

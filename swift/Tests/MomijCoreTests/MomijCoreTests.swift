@@ -789,6 +789,99 @@ final class SeedlessMetalTests: XCTestCase {
         let yp = x.contents().bindMemory(to: Float16.self, capacity: H)
         XCTAssertTrue(yp[0].isFinite)
     }
+
+    /// Batched MoE block M=2 must match two sequential M=1 steps.
+    func testMoEBlockMrowMatchesSequential() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, SeedlessMetal.queue != nil else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 512, I = 512, E = 16, Ktop = 2, M = 2, gs = 128
+        func buf(_ bytes: Int) -> MTLBuffer {
+            device.makeBuffer(length: bytes, options: .storageModeShared)!
+        }
+        let packedH = H * 2 / 32
+        let packedI = I * 2 / 32
+        let nGH = H / gs
+        let nGI = I / gs
+        let h = buf(M * H * 2)
+        let hp = h.contents().bindMemory(to: Float16.self, capacity: M * H)
+        for i in 0 ..< (M * H) { hp[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+        let hSeq = buf(M * H * 2)
+        let hsp = hSeq.contents().bindMemory(to: Float16.self, capacity: M * H)
+        for i in 0 ..< (M * H) { hsp[i] = hp[i] }
+        let normW = buf(H * 2)
+        let np = normW.contents().bindMemory(to: Float16.self, capacity: H)
+        for i in 0 ..< H { np[i] = 1.0 }
+        let gateW = buf(E * H * 2)
+        let gp = gateW.contents().bindMemory(to: Float16.self, capacity: E * H)
+        for i in 0 ..< (E * H) { gp[i] = Float16((Float(i % 13) - 6.0) * 0.01) }
+        let ugW = buf(E * 2 * I * packedH * 4)
+        let dW = buf(E * H * packedI * 4)
+        let u8 = ugW.contents().bindMemory(to: UInt8.self, capacity: E * 2 * I * packedH * 4)
+        for i in 0 ..< (E * 2 * I * packedH * 4) { u8[i] = UInt8((i * 17 + 3) & 0xff) }
+        let u8d = dW.contents().bindMemory(to: UInt8.self, capacity: E * H * packedI * 4)
+        for i in 0 ..< (E * H * packedI * 4) { u8d[i] = UInt8((i * 13 + 7) & 0xff) }
+        let ugS = buf(E * 2 * I * nGH * 2)
+        let ugB = buf(E * 2 * I * nGH * 2)
+        let dS = buf(E * H * nGI * 2)
+        let dB = buf(E * H * nGI * 2)
+        let ugSp = ugS.contents().bindMemory(to: Float16.self, capacity: E * 2 * I * nGH)
+        let ugBp = ugB.contents().bindMemory(to: Float16.self, capacity: E * 2 * I * nGH)
+        for i in 0 ..< (E * 2 * I * nGH) { ugSp[i] = 0.02; ugBp[i] = -0.02 }
+        let dSp = dS.contents().bindMemory(to: Float16.self, capacity: E * H * nGI)
+        let dBp = dB.contents().bindMemory(to: Float16.self, capacity: E * H * nGI)
+        for i in 0 ..< (E * H * nGI) { dSp[i] = 0.02; dBp[i] = -0.02 }
+
+        let xNorm = buf(M * H * 2)
+        let logits = buf(M * E * 4)
+        let inds = buf(M * Ktop * 4)
+        let scores = buf(M * Ktop * 4)
+        let ugOut = buf(M * Ktop * 2 * I * 2)
+        let act = buf(M * Ktop * I * 2)
+        let downOut = buf(M * Ktop * H * 2)
+        let moeOut = buf(M * H * 2)
+
+        try SeedlessMetal.moeBlockOneCB(
+            h: h, normW: normW, gateW: gateW,
+            upGateW: ugW, upGateS: ugS, upGateB: ugB,
+            downW: dW, downS: dS, downB: dB,
+            xNorm: xNorm, logits: logits, inds: inds, scores: scores,
+            ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
+            H: H, I: I, E: E, Ktop: Ktop, eps: 1e-6, gs: gs, M: M)
+
+        for m in 0 ..< M {
+            let h1 = buf(H * 2)
+            let hs = hSeq.contents().bindMemory(to: Float16.self, capacity: M * H)
+            let hd = h1.contents().bindMemory(to: Float16.self, capacity: H)
+            for i in 0 ..< H { hd[i] = hs[m * H + i] }
+            let x1 = buf(H * 2), lg1 = buf(E * 4), i1 = buf(Ktop * 4), s1 = buf(Ktop * 4)
+            let ug1 = buf(Ktop * 2 * I * 2), a1 = buf(Ktop * I * 2)
+            let dn1 = buf(Ktop * H * 2), mo1 = buf(H * 2)
+            try SeedlessMetal.moeBlockOneCB(
+                h: h1, normW: normW, gateW: gateW,
+                upGateW: ugW, upGateS: ugS, upGateB: ugB,
+                downW: dW, downS: dS, downB: dB,
+                xNorm: x1, logits: lg1, inds: i1, scores: s1,
+                ugOut: ug1, act: a1, downOut: dn1, moeOut: mo1,
+                H: H, I: I, E: E, Ktop: Ktop, eps: 1e-6, gs: gs, M: 1)
+            let ySrc = h1.contents().bindMemory(to: Float16.self, capacity: H)
+            for i in 0 ..< H { hs[m * H + i] = ySrc[i] }
+        }
+
+        let a = h.contents().bindMemory(to: Float16.self, capacity: M * H)
+        let bOut = hSeq.contents().bindMemory(to: Float16.self, capacity: M * H)
+        var maxAbs: Float = 0
+        var num = 0.0, den = 0.0
+        for i in 0 ..< (M * H) {
+            let dlt = abs(Float(a[i]) - Float(bOut[i]))
+            maxAbs = max(maxAbs, dlt)
+            num += Double(dlt * dlt)
+            den += Double(Float(a[i]) * Float(a[i]))
+        }
+        let rel = sqrt(num / max(den, 1e-30))
+        XCTAssertLessThan(rel, 1e-3, "M-row MoE block must match sequential M=1; rel_l2=\(rel) maxAbs=\(maxAbs)")
+    }
 }
 
 final class SeedlessMoEStackTests: XCTestCase {

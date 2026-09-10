@@ -376,6 +376,34 @@ First sweep without warmup was invalid (cold M=1). Honest read:
   M-row and a path that actually runs M≥4. Do not default decode to M-row
   until that stack exists.
 
+## 2026-09-10 True M-row fused expert (warm)
+
+Wired `encodeFusedExpert(..., M:)`: up/down `gqmm2` depth `M·Ktop`, SwiGLU
+over stacked `M·Ktop` rows, `maple_score_reduce` now `y[m,h]` with `gid.y=m`.
+`gqmm2_up_swiglu` depth likewise (opt-in fuse path). Decode still `M=1`.
+Parity: M=2 batched vs two sequential M=1, rel_l2 < 1e-3.
+
+Same warm interleaved protocol as gqmm2 (8× warmup at maxM, then
+`M=1,2,4,8,8,4,2,1`). Maple-like H=2048 I=512 Ktop=8 E=256. omlx stopped.
+
+| mode | M | gpu_ms | ms/tok | vsM1 |
+|---|---|---|---|---|
+| shared | 1 | 0.147 | 0.147 | 1.00 |
+| shared | 2 | 0.200 | 0.100 | **0.68** |
+| shared | 4 | 0.395 | 0.099 | 0.67 |
+| shared | 8 | 0.600 | 0.075 | 0.51 |
+| disjoint | 1 | 0.158 | 0.158 | 1.00 |
+| disjoint | 2 | 0.220 | 0.110 | 0.69 |
+| disjoint | 4 | 0.393 | 0.098 | 0.62 |
+| disjoint | 8 | 0.686 | 0.086 | 0.54 |
+
+Same session's gqmm2 up shared M=2 was still ~0.96. Fused-expert M=2 at
+0.68 is launch/epilogue amortization across up+SwiGLU+down+reduce, not a
+contradiction of the kernel-only issue wall. M=4 is a plateau vs M=2;
+M=8 reaches 0.51×. Draft=2 can move the **expert block**; peak 250 still
+needs attn + router M-row and a path that runs M≥2 end-to-end. Do not
+default decode to M-row yet.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

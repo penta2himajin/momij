@@ -149,6 +149,97 @@ final class SeedlessMetalTests: XCTestCase {
         XCTAssertLessThan(rel, 1e-3, "M-row gqmm2 must match sequential M=1; rel_l2=\(rel) maxAbs=\(maxAbs)")
     }
 
+    /// Batched M=2 fused expert must match two sequential M=1 steps (per-token x / inds / scores).
+    func testFusedExpertMrowMatchesSequential() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, SeedlessMetal.queue != nil else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 512, I = 512, E = 8, Ktop = 2, M = 2, gs = 128
+        func buf(_ bytes: Int) -> MTLBuffer {
+            device.makeBuffer(length: bytes, options: .storageModeShared)!
+        }
+        let packedH = H * 2 / 32
+        let packedI = I * 2 / 32
+        let nGH = H / gs
+        let nGI = I / gs
+        let x = buf(M * H * 2)
+        let xp = x.contents().bindMemory(to: Float16.self, capacity: M * H)
+        for i in 0 ..< (M * H) { xp[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+        let ugW = buf(E * 2 * I * packedH * 4)
+        let dW = buf(E * H * packedI * 4)
+        let u8ug = ugW.contents().bindMemory(to: UInt8.self, capacity: E * 2 * I * packedH * 4)
+        for i in 0 ..< (E * 2 * I * packedH * 4) { u8ug[i] = UInt8((i * 17 + 3) & 0xff) }
+        let u8d = dW.contents().bindMemory(to: UInt8.self, capacity: E * H * packedI * 4)
+        for i in 0 ..< (E * H * packedI * 4) { u8d[i] = UInt8((i * 13 + 7) & 0xff) }
+        let ugS = buf(E * 2 * I * nGH * 2)
+        let ugB = buf(E * 2 * I * nGH * 2)
+        let dS = buf(E * H * nGI * 2)
+        let dB = buf(E * H * nGI * 2)
+        let ugSp = ugS.contents().bindMemory(to: Float16.self, capacity: E * 2 * I * nGH)
+        let ugBp = ugB.contents().bindMemory(to: Float16.self, capacity: E * 2 * I * nGH)
+        for i in 0 ..< (E * 2 * I * nGH) { ugSp[i] = 0.02; ugBp[i] = -0.02 }
+        let dSp = dS.contents().bindMemory(to: Float16.self, capacity: E * H * nGI)
+        let dBp = dB.contents().bindMemory(to: Float16.self, capacity: E * H * nGI)
+        for i in 0 ..< (E * H * nGI) { dSp[i] = 0.02; dBp[i] = -0.02 }
+        let inds = buf(M * Ktop * 4)
+        let scores = buf(M * Ktop * 4)
+        let ip = inds.contents().bindMemory(to: Int32.self, capacity: M * Ktop)
+        let sp = scores.contents().bindMemory(to: Float.self, capacity: M * Ktop)
+        ip[0] = 1; ip[1] = 3; ip[2] = 2; ip[3] = 5
+        for i in 0 ..< (M * Ktop) { sp[i] = 1.0 / Float(Ktop) }
+        let ugOut = buf(M * Ktop * 2 * I * 2)
+        let act = buf(M * Ktop * I * 2)
+        let downOut = buf(M * Ktop * H * 2)
+        let yM = buf(M * H * 2)
+        let ySeq = buf(M * H * 2)
+
+        try SeedlessMetal.fusedExpertStep(
+            x: x, upGateW: ugW, upGateS: ugS, upGateB: ugB,
+            downW: dW, downS: dS, downB: dB, inds: inds, scores: scores,
+            ugOut: ugOut, act: act, downOut: downOut, y: yM,
+            H: H, I: I, Ktop: Ktop, gs: gs, M: M)
+
+        for m in 0 ..< M {
+            let x1 = buf(H * 2)
+            let xSrc = x.contents().bindMemory(to: Float16.self, capacity: M * H)
+            let xDst = x1.contents().bindMemory(to: Float16.self, capacity: H)
+            for i in 0 ..< H { xDst[i] = xSrc[m * H + i] }
+            let inds1 = buf(Ktop * 4)
+            let iSrc = inds.contents().bindMemory(to: Int32.self, capacity: M * Ktop)
+            let iDst = inds1.contents().bindMemory(to: Int32.self, capacity: Ktop)
+            for k in 0 ..< Ktop { iDst[k] = iSrc[m * Ktop + k] }
+            let sc1 = buf(Ktop * 4)
+            let sSrc = scores.contents().bindMemory(to: Float.self, capacity: M * Ktop)
+            let sDst = sc1.contents().bindMemory(to: Float.self, capacity: Ktop)
+            for k in 0 ..< Ktop { sDst[k] = sSrc[m * Ktop + k] }
+            let ug1 = buf(Ktop * 2 * I * 2)
+            let act1 = buf(Ktop * I * 2)
+            let dn1 = buf(Ktop * H * 2)
+            let y1 = buf(H * 2)
+            try SeedlessMetal.fusedExpertStep(
+                x: x1, upGateW: ugW, upGateS: ugS, upGateB: ugB,
+                downW: dW, downS: dS, downB: dB, inds: inds1, scores: sc1,
+                ugOut: ug1, act: act1, downOut: dn1, y: y1,
+                H: H, I: I, Ktop: Ktop, gs: gs, M: 1)
+            let ySrc = y1.contents().bindMemory(to: Float16.self, capacity: H)
+            let yDst = ySeq.contents().bindMemory(to: Float16.self, capacity: M * H)
+            for i in 0 ..< H { yDst[m * H + i] = ySrc[i] }
+        }
+        let a = yM.contents().bindMemory(to: Float16.self, capacity: M * H)
+        let bOut = ySeq.contents().bindMemory(to: Float16.self, capacity: M * H)
+        var maxAbs: Float = 0
+        var num = 0.0, den = 0.0
+        for i in 0 ..< (M * H) {
+            let d = abs(Float(a[i]) - Float(bOut[i]))
+            maxAbs = max(maxAbs, d)
+            num += Double(d * d)
+            den += Double(Float(a[i]) * Float(a[i]))
+        }
+        let rel = sqrt(num / max(den, 1e-30))
+        XCTAssertLessThan(rel, 1e-3, "M-row fused expert must match sequential M=1; rel_l2=\(rel) maxAbs=\(maxAbs)")
+    }
+
     func testFusedExpertFasterThanNaiveFloor() throws {
         try SeedlessMetal.ensureCompiled()
         let rate = try SeedlessMetal.benchFusedExpert(E: 256, iters: 30)

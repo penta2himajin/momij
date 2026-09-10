@@ -113,6 +113,7 @@ struct MomijMain {
             K: 512, N: 2048, Ktop: 8, iters: 30, lhsPerExpert: true))
         let fused = try SeedlessMetal.benchFusedExpert(E: 256, iters: 100)
         print(String(format: "seedless fused-expert (E=256,K=8) steps/s=%.1f", fused))
+        print(try SeedlessMetal.benchFusedExpertMrow(iters: 20))
         if FileManager.default.fileExists(atPath: model) {
             do {
                 let store = try WeightStore(modelDir: model)

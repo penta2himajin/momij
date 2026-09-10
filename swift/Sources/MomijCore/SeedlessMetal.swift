@@ -329,13 +329,13 @@ public enum SeedlessMetal {
     public static func gqmm2UpSwiglu(
         x: MTLBuffer, w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer, inds: MTLBuffer,
         out: MTLBuffer,
-        Ktop: Int, K: Int, I: Int, gs: Int = 128,
+        Ktop: Int, K: Int, I: Int, gs: Int = 128, M: Int = 1,
         into encoder: MTLComputeCommandEncoder? = nil,
         commandQueue: MTLCommandQueue? = nil
     ) throws {
         try ensureCompiled()
         guard let pipe = gqmm2UpSwigluPipeline, let stop = stopBuf else { throw SeedlessError.notReady }
-        guard I % 8 == 0, K % 512 == 0, gs == 64 || gs == 128 else {
+        guard M >= 1, I % 8 == 0, K % 512 == 0, gs == 64 || gs == 128 else {
             throw SeedlessError.unsupportedShape(N: I, K: K, gs: gs)
         }
 
@@ -359,7 +359,7 @@ public enum SeedlessMetal {
         var gsv = Int32(gs)
         enc.setBytes(&gsv, length: 4, index: 10)
         enc.dispatchThreadgroups(
-            MTLSize(width: 1, height: I / 8, depth: Ktop),
+            MTLSize(width: 1, height: I / 8, depth: M * Ktop),
             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
 
         if ownsCB {
@@ -384,6 +384,7 @@ public enum SeedlessMetal {
     }
 
     /// Encode fused expert block into an existing encoder (no commit/wait).
+    /// `M>1`: x[M,H], inds/scores[M·Ktop], ug/act/down stacked as [M·Ktop, …], y[M,H].
     public static func encodeFusedExpert(
         into enc: MTLComputeCommandEncoder,
         x: MTLBuffer,
@@ -391,23 +392,24 @@ public enum SeedlessMetal {
         downW: MTLBuffer, downS: MTLBuffer, downB: MTLBuffer,
         inds: MTLBuffer, scores: MTLBuffer,
         ugOut: MTLBuffer, act: MTLBuffer, downOut: MTLBuffer, y: MTLBuffer,
-        H: Int, I: Int, Ktop: Int, gs: Int = 128
+        H: Int, I: Int, Ktop: Int, gs: Int = 128, M: Int = 1
     ) throws {
         try ensureCompiled()
         guard let reduce = scoreReducePipeline, let stop = stopBuf
         else { throw SeedlessError.notReady }
+        guard M >= 1 else { throw SeedlessError.unsupportedShape(N: H, K: I, gs: gs) }
 
         if fuseUpSwiglu {
             try gqmm2UpSwiglu(x: x, w: upGateW, scales: upGateS, biases: upGateB, inds: inds,
-                             out: act, Ktop: Ktop, K: H, I: I, gs: gs, into: enc)
+                             out: act, Ktop: Ktop, K: H, I: I, gs: gs, M: M, into: enc)
         } else {
             try gqmm2(x: x, w: upGateW, scales: upGateS, biases: upGateB, inds: inds, out: ugOut,
-                      Ktop: Ktop, K: H, N: 2 * I, gs: gs, lhsPerExpert: false, into: enc)
-            encodeClampedSwiglu(into: enc, ug: ugOut, act: act, I: I, Ktop: Ktop)
+                      Ktop: Ktop, K: H, N: 2 * I, gs: gs, lhsPerExpert: false, M: M, into: enc)
+            encodeClampedSwiglu(into: enc, ug: ugOut, act: act, I: I, Ktop: M * Ktop)
         }
 
         try gqmm2(x: act, w: downW, scales: downS, biases: downB, inds: inds, out: downOut,
-                  Ktop: Ktop, K: I, N: H, gs: gs, lhsPerExpert: true, into: enc)
+                  Ktop: Ktop, K: I, N: H, gs: gs, lhsPerExpert: true, M: M, into: enc)
 
         enc.setComputePipelineState(reduce)
         enc.setBuffer(downOut, offset: 0, index: 0)
@@ -415,21 +417,23 @@ public enum SeedlessMetal {
         enc.setBuffer(y, offset: 0, index: 2)
         var h32 = Int32(H)
         var kt32 = Int32(Ktop)
+        var m32 = Int32(M)
         enc.setBytes(&h32, length: 4, index: 3)
         enc.setBytes(&kt32, length: 4, index: 4)
         enc.setBuffer(stop, offset: 0, index: 5)
-        enc.dispatchThreads(MTLSize(width: H, height: 1, depth: 1),
+        enc.setBytes(&m32, length: 4, index: 6)
+        enc.dispatchThreads(MTLSize(width: H, height: M, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
     }
 
-    /// One-token fused MoE expert block on a single command buffer (wait once).
+    /// Fused MoE expert block on a single command buffer (wait once). `M=1` is one token.
     public static func fusedExpertStep(
         x: MTLBuffer,
         upGateW: MTLBuffer, upGateS: MTLBuffer, upGateB: MTLBuffer,
         downW: MTLBuffer, downS: MTLBuffer, downB: MTLBuffer,
         inds: MTLBuffer, scores: MTLBuffer,
         ugOut: MTLBuffer, act: MTLBuffer, downOut: MTLBuffer, y: MTLBuffer,
-        H: Int, I: Int, Ktop: Int, gs: Int = 128
+        H: Int, I: Int, Ktop: Int, gs: Int = 128, M: Int = 1
     ) throws {
         try ensureCompiled()
         guard let q = queue else { throw SeedlessError.notReady }
@@ -441,7 +445,7 @@ public enum SeedlessMetal {
             downW: downW, downS: downS, downB: downB,
             inds: inds, scores: scores,
             ugOut: ugOut, act: act, downOut: downOut, y: y,
-            H: H, I: I, Ktop: Ktop, gs: gs)
+            H: H, I: I, Ktop: Ktop, gs: gs, M: M)
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
@@ -1066,6 +1070,108 @@ public enum SeedlessMetal {
         return Double(iters) / (CFAbsoluteTimeGetCurrent() - t0)
     }
 
+    /// GPU-timed M-row fused expert (up + SwiGLU + down + score reduce). Same shared/disjoint
+    /// expert layout as `benchGqmm2Mrow`. Warm interleaved `M=1,2,4,8,8,4,2,1`.
+    public static func benchFusedExpertMrow(
+        H: Int = 2048, I: Int = 512, E: Int = 256, Ktop: Int = 8,
+        maxM: Int = 8, iters: Int = 30
+    ) throws -> String {
+        try ensureCompiled()
+        guard let device else { throw SeedlessError.notReady }
+        let gs = 128
+        let packedH = H * 2 / 32
+        let packedI = I * 2 / 32
+        let nGroupsH = H / gs
+        let nGroupsI = I / gs
+        let x = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared)!
+        let xp = x.contents().bindMemory(to: Float16.self, capacity: maxM * H)
+        for i in 0 ..< (maxM * H) { xp[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+        let ugW = device.makeBuffer(length: E * 2 * I * packedH * 4, options: .storageModeShared)!
+        let ugS = device.makeBuffer(length: E * 2 * I * nGroupsH * 2, options: .storageModeShared)!
+        let ugB = device.makeBuffer(length: E * 2 * I * nGroupsH * 2, options: .storageModeShared)!
+        let dW = device.makeBuffer(length: E * H * packedI * 4, options: .storageModeShared)!
+        let dS = device.makeBuffer(length: E * H * nGroupsI * 2, options: .storageModeShared)!
+        let dB = device.makeBuffer(length: E * H * nGroupsI * 2, options: .storageModeShared)!
+        let nUG = E * 2 * I * nGroupsH
+        let nDN = E * H * nGroupsI
+        let ugSp = ugS.contents().bindMemory(to: Float16.self, capacity: nUG)
+        let ugBp = ugB.contents().bindMemory(to: Float16.self, capacity: nUG)
+        for i in 0 ..< nUG { ugSp[i] = 0.02; ugBp[i] = -0.02 }
+        let dSp = dS.contents().bindMemory(to: Float16.self, capacity: nDN)
+        let dBp = dB.contents().bindMemory(to: Float16.self, capacity: nDN)
+        for i in 0 ..< nDN { dSp[i] = 0.02; dBp[i] = -0.02 }
+        let inds = device.makeBuffer(length: maxM * Ktop * 4, options: .storageModeShared)!
+        let scores = device.makeBuffer(length: maxM * Ktop * 4, options: .storageModeShared)!
+        let ugOut = device.makeBuffer(length: maxM * Ktop * 2 * I * 2, options: .storageModeShared)!
+        let act = device.makeBuffer(length: maxM * Ktop * I * 2, options: .storageModeShared)!
+        let downOut = device.makeBuffer(length: maxM * Ktop * H * 2, options: .storageModeShared)!
+        let y = device.makeBuffer(length: maxM * H * 2, options: .storageModeShared)!
+
+        func fill(M: Int, shared: Bool) {
+            let ip = inds.contents().bindMemory(to: Int32.self, capacity: M * Ktop)
+            let sp = scores.contents().bindMemory(to: Float.self, capacity: M * Ktop)
+            for m in 0 ..< M {
+                for k in 0 ..< Ktop {
+                    let e = shared ? k : (m * Ktop + k)
+                    ip[m * Ktop + k] = Int32(e % E)
+                    sp[m * Ktop + k] = 1.0 / Float(Ktop)
+                }
+            }
+        }
+
+        func time(M: Int, shared: Bool) throws -> Double {
+            fill(M: M, shared: shared)
+            var gpu = 0.0
+            for _ in 0 ..< iters {
+                let t = try timeCB { enc in
+                    try encodeFusedExpert(
+                        into: enc, x: x,
+                        upGateW: ugW, upGateS: ugS, upGateB: ugB,
+                        downW: dW, downS: dS, downB: dB,
+                        inds: inds, scores: scores,
+                        ugOut: ugOut, act: act, downOut: downOut, y: y,
+                        H: H, I: I, Ktop: Ktop, gs: gs, M: M)
+                }
+                gpu += t.gpuMs
+            }
+            return gpu / Double(iters)
+        }
+
+        fill(M: maxM, shared: true)
+        for _ in 0 ..< 8 {
+            try fusedExpertStep(
+                x: x, upGateW: ugW, upGateS: ugS, upGateB: ugB,
+                downW: dW, downS: dS, downB: dB, inds: inds, scores: scores,
+                ugOut: ugOut, act: act, downOut: downOut, y: y,
+                H: H, I: I, Ktop: Ktop, gs: gs, M: maxM)
+        }
+
+        var lines: [String] = []
+        lines.append("fused-expert M-row (H=\(H) I=\(I) Ktop=\(Ktop) E=\(E), \(iters) iters, warm)")
+        lines.append("  mode        M   gpu_ms   ms/tok     vsM1    tok/s")
+        for shared in [true, false] {
+            let mode = shared ? "shared" : "disjoint"
+            var acc: [Int: (gpu: Double, n: Int)] = [:]
+            for M in [1, 2, 4, 8, 8, 4, 2, 1] where M <= maxM {
+                let gpu = try time(M: M, shared: shared)
+                let a = acc[M] ?? (0, 0)
+                acc[M] = (a.gpu + gpu, a.n + 1)
+            }
+            let gpu1 = (acc[1] ?? (0, 1)).gpu / Double((acc[1] ?? (0, 1)).n)
+            for M in [1, 2, 4, 8] where M <= maxM {
+                let a = acc[M]!
+                let gpu = a.gpu / Double(a.n)
+                let per = gpu / Double(M)
+                let vs = gpu1 > 0 ? per / gpu1 : 0
+                let tps = per > 0 ? 1000.0 / per : 0
+                lines.append(
+                    "  \(mode.padding(toLength: 8, withPad: " ", startingAt: 0)) \(String(format: "%4d %8.3f %8.3f %8.3f %8.0f", M, gpu, per, vs, tps))"
+                )
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: - Metal source
 
     private static let metalSource = """
@@ -1381,21 +1487,23 @@ public enum SeedlessMetal {
     }
 
     kernel void maple_score_reduce(
-        device const half* down [[buffer(0)]],   // [Ktop, H]
-        device const float* scores [[buffer(1)]], // [Ktop]
-        device half* y [[buffer(2)]],             // [H]
+        device const half* down [[buffer(0)]],   // [M·Ktop, H]
+        device const float* scores [[buffer(1)]], // [M·Ktop]
+        device half* y [[buffer(2)]],             // [M, H]
         constant int& H [[buffer(3)]],
         constant int& Ktop [[buffer(4)]],
         device const int* stopFlag [[buffer(5)]],
-        uint gid [[thread_position_in_grid]])
+        constant int& M [[buffer(6)]],
+        uint2 gid [[thread_position_in_grid]])
     {
         if (stopFlag[0] != 0) return;
-        if (gid >= (uint)H) return;
+        uint h = gid.x, m = gid.y;
+        if (h >= (uint)H || m >= (uint)M) return;
         float acc = 0.0f;
         for (int ki = 0; ki < Ktop; ++ki) {
-            acc += float(down[ki * H + gid]) * scores[ki];
+            acc += float(down[(m * (uint)Ktop + (uint)ki) * (uint)H + h]) * scores[m * (uint)Ktop + (uint)ki];
         }
-        y[gid] = half(acc);
+        y[m * (uint)H + h] = half(acc);
     }
 
     // Milestone A helpers: RMSNorm / residual / dense gate / top-8 route.

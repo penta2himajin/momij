@@ -9,6 +9,42 @@ final class SuffixSpecTests: XCTestCase {
         XCTAssertEqual(draft, [9, 8])
     }
 
+    /// Match need not abut the current suffix (classic PLD long-distance hit).
+    func testFindsDistantPromptLookupDraft() {
+        // prompt-like span [10,11,12,13,14] appears early; generation ends with [10,11]
+        let history = [10, 11, 12, 13, 14, 99, 98, 10, 11]
+        let draft = SuffixSpec.suffixDraft(history: history, k: 3)
+        XCTAssertEqual(draft, [12, 13, 14])
+    }
+
+    /// Prefer continuation from the prompt span when `promptLen` is set.
+    func testPrefersPromptRegionMatch() {
+        // prompt = [1,2,3,4,5]; later gen also has [1,2] followed by noise continuation
+        let history = [1, 2, 3, 4, 5, 1, 2, 90, 91, 1, 2]
+        let draft = SuffixSpec.suffixDraft(history: history, k: 3, promptLen: 5)
+        XCTAssertEqual(draft, [3, 4, 5])
+    }
+
+    /// Bigram fallback must be a contiguous continuation, not a bag of successors.
+    func testBigramFallbackIsContiguous() {
+        // last=5; earlier "... 5, 7, 8, 9 ..." then unrelated 5-successors must not scramble
+        let history = [5, 7, 8, 9, 1, 2, 5]
+        let draft = SuffixSpec.suffixDraft(history: history, k: 3)
+        XCTAssertEqual(draft, [7, 8, 9])
+    }
+
+    /// Longer pattern match → longer adaptive draft (capped by k).
+    func testAdaptiveDraftLengthTracksMatch() {
+        let history = [1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4]
+        let d2 = SuffixSpec.suffixDraft(history: history, k: 8)
+        // pattern [1,2,3,4] → contiguous continuation after earliest/most-recent match
+        XCTAssertEqual(d2, [5, 6, 0, 1, 2, 3, 4])
+        XCTAssertEqual(SuffixSpec.adaptiveDraftK(meanAccept: 0.0, draftK: 8), 2)
+        XCTAssertEqual(SuffixSpec.adaptiveDraftK(meanAccept: 0.9, draftK: 8), 4)
+        XCTAssertEqual(SuffixSpec.adaptiveDraftK(meanAccept: 1.6, draftK: 8), 6)
+        XCTAssertEqual(SuffixSpec.adaptiveDraftK(meanAccept: 3.0, draftK: 8), 8)
+    }
+
     func testSpecAcceptsMatchingDraft() throws {
         // Deterministic "model": always emits next = last+1
         var seq = 10

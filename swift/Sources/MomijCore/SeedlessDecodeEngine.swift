@@ -394,32 +394,41 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             first: y, promptIds: prompt, maxTokens: maxTokens, draftK: draftK, eos: eos)
     }
 
-    /// Compare greedy vs SuffixSpec effective tok/s on a repeating prompt (high draft hit rate).
+    /// Compare greedy vs SuffixSpec effective tok/s.
+    /// Default prompt is a long repeated block (PLD-friendly). Pass `prompt` for real text ids.
     public func benchmarkSuffixSpec(
-        promptTokens: Int, genTokens: Int, trials: Int, draftK: Int = 8
+        promptTokens: Int, genTokens: Int, trials: Int, draftK: Int = 8,
+        prompt: [Int]? = nil
     ) throws -> String {
-        var prompt: [Int] = []
-        let motif = [101, 102, 103, 104, 105, 106, 107, 108]
-        while prompt.count < promptTokens {
-            prompt.append(contentsOf: motif)
+        var promptIds: [Int]
+        if let prompt, !prompt.isEmpty {
+            promptIds = prompt
+        } else {
+            // Longer unique block so PLD can copy contiguous spans (not a tiny motif).
+            let block = Array(100 ..< 132)  // 32 tokens
+            promptIds = []
+            while promptIds.count < promptTokens {
+                promptIds.append(contentsOf: block)
+            }
+            promptIds = Array(promptIds.prefix(promptTokens))
         }
-        prompt = Array(prompt.prefix(promptTokens))
 
-        _ = try generate(prompt: Array(prompt.prefix(min(32, promptTokens))), maxTokens: 4, eos: nil)
+        _ = try generate(prompt: Array(promptIds.prefix(min(32, promptIds.count))), maxTokens: 4, eos: nil)
 
         var greedyTps: [Double] = []
         var specTps: [Double] = []
         var acc = 0, att = 0, gat = 0
         var equal = true
+        var acceptedTok = 0
+        var producedTok = 0
         for _ in 0 ..< trials {
-            // Match `benchmark`: time gen only (prefill untimed).
             reset()
-            var last = prompt[0]
-            for i in 0 ..< prompt.count {
-                if i + 1 < prompt.count {
-                    _ = try step(prompt[i])
+            var last = promptIds[0]
+            for i in 0 ..< promptIds.count {
+                if i + 1 < promptIds.count {
+                    _ = try step(promptIds[i])
                 } else {
-                    last = try step(prompt[i])
+                    last = try step(promptIds[i])
                 }
             }
             let t0 = CFAbsoluteTimeGetCurrent()
@@ -432,31 +441,34 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             greedyTps.append(Double(gOut.count) / max(CFAbsoluteTimeGetCurrent() - t0, 1e-9))
 
             let r = try generateSuffixSpec(
-                prompt: prompt, maxTokens: genTokens, draftK: draftK, eos: nil)
-            // Retimed: regenerate with timed gen-only
+                prompt: promptIds, maxTokens: genTokens, draftK: draftK, eos: nil)
             reset()
-            last = prompt[0]
-            for i in 0 ..< prompt.count {
-                if i + 1 < prompt.count {
-                    _ = try step(prompt[i])
+            last = promptIds[0]
+            for i in 0 ..< promptIds.count {
+                if i + 1 < promptIds.count {
+                    _ = try step(promptIds[i])
                 } else {
-                    last = try step(prompt[i])
+                    last = try step(promptIds[i])
                 }
             }
             let t1 = CFAbsoluteTimeGetCurrent()
             let r2 = try generateSuffixSpecFromPrefill(
-                first: last, promptIds: prompt, maxTokens: genTokens, draftK: draftK, eos: nil)
+                first: last, promptIds: promptIds, maxTokens: genTokens, draftK: draftK, eos: nil)
             specTps.append(Double(r2.tokens.count) / max(CFAbsoluteTimeGetCurrent() - t1, 1e-9))
             acc += r2.accepted; att += r2.attempts; gat += r2.gated
+            acceptedTok += r2.accepted
+            producedTok += r2.tokens.count
             if gOut != r.tokens { equal = false }
             _ = r
         }
         let g = greedyTps.reduce(0, +) / Double(trials)
         let s = specTps.reduce(0, +) / Double(trials)
         let aps = att > 0 ? Double(acc) / Double(att) : 0
+        let frac = producedTok > 0 ? Double(acceptedTok) / Double(producedTok) : 0
         let base = String(
-            format: "suffix-spec bench (repeat-motif, draftK=%d, n=%d): greedy=%.1f tok/s  spec=%.1f tok/s  accept/attempt=%.2f  attempts=%d gated=%d  lossless=%@",
-            draftK, trials, g, s, aps, att, gat, equal ? "true" : "false")
+            format: "suffix-spec bench (draftK=%d, n=%d, prompt=%d): greedy=%.1f tok/s  spec=%.1f tok/s  accept/attempt=%.2f  accept/gen=%.2f  attempts=%d gated=%d  lossless=%@  mrow=%@",
+            draftK, trials, promptIds.count, g, s, aps, frac, att, gat,
+            equal ? "true" : "false", useMrow ? "on" : "off")
         let chain = (try? benchmarkChainVerify(steps: 8, trials: 5)) ?? ""
         return base + (chain.isEmpty ? "" : "\n" + chain)
     }
@@ -546,12 +558,22 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         while out.count < maxTokens {
             if let eos, y == eos { break }
             let remain = maxTokens - out.count
-            let draft = SuffixSpec.suffixDraft(history: ids, k: min(draftK, remain, specMaxM - 1))
             let meanAccept = acceptWindow.isEmpty ? 1.0
                 : Double(acceptWindow.reduce(0, +)) / Double(acceptWindow.count)
-            let suspend = gateOn && acceptWindow.count >= gateWindow && meanAccept < 1.0
+            // Cold / low-accept → shorter drafts; M-row makes verify cheap enough to try more often.
+            let effK = SuffixSpec.adaptiveDraftK(
+                meanAccept: meanAccept, draftK: min(draftK, remain, specMaxM - 1))
+            let draft = SuffixSpec.suffixDraft(
+                history: ids, k: effK, promptLen: promptIds.count)
+            // Soft gate: park on greedy after sustained misses. M-row verify is cheaper but
+            // still loses when accept≈0 (measured ~80 tok/s vs ~180 greedy).
+            let gateFloor = useMrow ? 0.5 : 1.0
+            let suspend = gateOn
+                && acceptWindow.count >= gateWindow && meanAccept < gateFloor
+            // Periodic re-probe after gated stretch (late self-similarity / echo).
+            let reprobe = suspend && (out.count % 24 == 0) && !draft.isEmpty
 
-            if draft.isEmpty || suspend {
+            if (draft.isEmpty || suspend) && !reprobe {
                 if !draft.isEmpty { gated += 1 }
                 y = try step(y)
                 out.append(y)
@@ -560,6 +582,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             }
 
             attempts += 1
+            // Batch/M-row verify wins only when drafts land; otherwise sequential
+            // early-exit is cheaper (no snapshot restore). Force with MOMIJ_SPEC_BATCH=1.
             let useBatch = !batchOff && useFlashHead && flashFused
                 && (batchForce || meanAccept >= 1.5)
             let accepted: Int

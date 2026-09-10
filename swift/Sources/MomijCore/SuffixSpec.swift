@@ -1,44 +1,64 @@
 import Foundation
 
-/// Learning-free suffix speculative decoding (Qwisp Tell / SuffixSpec style).
+/// Learning-free suffix speculative decoding (Prompt Lookup / SuffixDecoding style).
 ///
-/// Draft: copy a repeated suffix from recent history when one is found.
-/// Verify: run the target model on the draft prefix; accept matching greedy tokens.
+/// Draft: find the longest recent n-gram that already occurred earlier in history
+/// (prompt + generated), then copy the contiguous tokens that followed that match.
+/// Verify: run the target model on the draft; accept matching greedy tokens.
 public enum SuffixSpec {
     public enum SpecError: Error { case stepFailed }
 
-    /// Find a draft of up to `k` tokens by matching the longest repeating suffix.
-    public static func suffixDraft(history: [Int], k: Int) -> [Int] {
-        guard history.count >= 4, k > 0 else { return [] }
+    /// Adaptive draft length from recent mean accepted tokens per attempt.
+    public static func adaptiveDraftK(meanAccept: Double, draftK: Int) -> Int {
+        let k = max(1, draftK)
+        if meanAccept >= 2.5 { return k }
+        if meanAccept >= 1.5 { return min(k, 6) }
+        if meanAccept >= 0.8 { return min(k, 4) }
+        if meanAccept >= 0.4 { return min(k, 3) }
+        return min(k, 2)
+    }
+
+    /// Find a draft of up to `k` tokens by matching the longest repeating suffix (PLD).
+    ///
+    /// Searches **all** earlier starts (not only the abutting window). Continuation is
+    /// always a contiguous slice after the match. When `promptLen` is set, prefer matches
+    /// whose pattern starts inside the prompt (classic Prompt Lookup Decoding).
+    public static func suffixDraft(
+        history: [Int], k: Int, maxNgram: Int = 16, promptLen: Int? = nil
+    ) -> [Int] {
+        guard history.count >= 2, k > 0 else { return [] }
         let n = history.count
-        let maxLen = min(k, n / 2)
-        for len in stride(from: maxLen, through: 1, by: -1) {
-            let suffix = Array(history[(n - len) ..< n])
-            // search earlier occurrence
-            if n - 2 * len < 0 { continue }
-            for start in stride(from: n - 2 * len, through: 0, by: -1) {
-                if Array(history[start ..< (start + len)]) == suffix {
-                    let draftStart = start + len
-                    let avail = min(k, n - draftStart)
-                    if avail > 0 {
-                        return Array(history[draftStart ..< (draftStart + avail)])
+        let maxPattern = min(maxNgram, n - 1)
+        let pLen = promptLen ?? 0
+
+        func search(preferPrompt: Bool) -> [Int] {
+            for patternLen in stride(from: maxPattern, through: 1, by: -1) {
+                let patternStart = n - patternLen
+                for start in stride(from: patternStart - 1, through: 0, by: -1) {
+                    if preferPrompt, pLen > 0, start >= pLen { continue }
+                    var ok = true
+                    for j in 0 ..< patternLen {
+                        if history[start + j] != history[patternStart + j] {
+                            ok = false
+                            break
+                        }
                     }
+                    guard ok else { continue }
+                    let contStart = start + patternLen
+                    let avail = n - contStart
+                    guard avail > 0 else { continue }
+                    let take = min(k, avail)
+                    return Array(history[contStart ..< (contStart + take)])
                 }
             }
+            return []
         }
-        // n-gram fallback: last token repeated patterns of length 1..k from bigrams
-        if let last = history.last {
-            var draft: [Int] = []
-            for i in stride(from: n - 2, through: 0, by: -1) {
-                if history[i] == last, i + 1 < n {
-                    draft.append(history[i + 1])
-                    if draft.count >= k { break }
-                    // continue chain
-                }
-            }
-            return draft
+
+        if pLen > 0 {
+            let fromPrompt = search(preferPrompt: true)
+            if !fromPrompt.isEmpty { return fromPrompt }
         }
-        return []
+        return search(preferPrompt: false)
     }
 
     /// Run speculative loop. `step` returns next greedy token given full prompt ids.
@@ -53,8 +73,12 @@ public enum SuffixSpec {
     ) throws -> [Int] {
         var ids = prompt
         var out: [Int] = []
+        var acceptWindow: [Int] = []
         while out.count < maxTokens {
-            let draft = suffixDraft(history: ids, k: min(draftK, maxTokens - out.count))
+            let mean = acceptWindow.isEmpty ? 1.0
+                : Double(acceptWindow.reduce(0, +)) / Double(acceptWindow.count)
+            let k = adaptiveDraftK(meanAccept: mean, draftK: min(draftK, maxTokens - out.count))
+            let draft = suffixDraft(history: ids, k: k, promptLen: prompt.count)
             if draft.isEmpty {
                 guard let t = try step(ids) else { break }
                 ids.append(t); out.append(t)
@@ -82,6 +106,8 @@ public enum SuffixSpec {
                     break
                 }
             }
+            acceptWindow.append(accepted)
+            if acceptWindow.count > 8 { acceptWindow.removeFirst() }
             if accepted == 0 {
                 // reject all — commit first verified token if any
                 if let t = verified.first {

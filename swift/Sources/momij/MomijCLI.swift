@@ -74,7 +74,13 @@ struct MomijMain {
             let fullLen = max(p + g + 64, 2048)
             let eng = try SeedlessDecodeEngine(store: store, fullMaxLen: fullLen)
             if has(args, "--suffix-spec") {
-                print(try eng.benchmarkSuffixSpec(promptTokens: p, genTokens: g, trials: n, draftK: 8))
+                var promptIds: [Int]? = nil
+                if let promptText = flag(args, "--prompt") {
+                    let tokenizer = try await loadTokenizer(modelDir: model)
+                    promptIds = try tokenizer.encode(promptText)
+                }
+                print(try eng.benchmarkSuffixSpec(
+                    promptTokens: p, genTokens: g, trials: n, draftK: 8, prompt: promptIds))
             } else {
                 let r = try eng.benchmark(promptTokens: p, genTokens: g, trials: n, profile: true)
                 let ph = r.phase

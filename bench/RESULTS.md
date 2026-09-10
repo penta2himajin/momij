@@ -510,6 +510,32 @@ Verdict (e2e tok/s, not synthetic µs):
 3. Do **not** default `MOMIJ_MROW=1` for cold SuffixSpec; keep opt-in for
    high-accept / oracle-draft / chain-verify paths.
 
+## 2026-09-10 SuffixSpec PLD drafts — raise accept%
+
+Fixes: full-history PLD search (was abutting-window only), contiguous n-gram
+(no scrambled successor bag), prefer prompt-span matches, adaptive `draftK`,
+soft gate + periodic re-probe. Batch/M-row verify only when `meanAccept≥1.5`
+(forced `MOMIJ_SPEC_BATCH=1` still available).
+
+M1 Max, omlx stop, release. Code-echo prompt (`fib` rewrite):
+
+| Config | accept/attempt | accept/gen | spec tok/s | greedy | lossless |
+|---|---|---|---|---|---|
+| seq verify | **0.96** | 0.26 | **~196** | ~193 | true |
+| MROW + auto batch | **0.89** | **0.44** | ~178 | ~191 | true |
+| MROW + `SPEC_BATCH=1` | 0.88 | 0.39 | ~88 | ~190 | true |
+
+Notes:
+
+1. **Accept is workload-dependent.** Copy-doc English ≈0.07; code echo ≈0.9.
+   PLD helps when the model reuses prompt spans (code/agentic), not open chat.
+2. chain1cb M-row still **~420–450 tok/s** (oracle draft) — upper bound when
+   drafts are perfect; not product e2e on arbitrary prompts.
+3. Forced batch with mid accept regresses (restore/replay tax). Default stays
+   sequential early-exit until mean accept is hot.
+4. Next: SuffixDecoding-style tree / online output index for agentic; keep
+   gate when accept stays cold.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

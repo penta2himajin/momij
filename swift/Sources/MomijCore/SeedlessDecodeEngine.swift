@@ -489,8 +489,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     }
 
     /// Sampled decode with model-free draft + rejection sampling.
-    /// Hot accept → same M-row `encodeChainFeeds` as greedy SuffixSpec; host walks
-    /// Leviathan accept/reject on per-row FlashHead logits. Cold stays sequential.
+    /// Cold 1-step is the 150 tok/s floor. Periodic probes (and a warm accept
+    /// window) enable sequential Leviathan; M-row batch only when drafts land.
     public func generateSampledSpeculative(
         prompt: [Int], maxTokens: Int,
         processor: LogitsProcessor,
@@ -515,7 +515,19 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                     id, processor: processor, seen: seen, counts: counts, rng: &rng)
             }
         }
+        let r = try generateSampledSpeculativeFromPrefill(
+            first: last, promptIds: prompt, maxTokens: maxTokens,
+            processor: processor, draftK: draftK, eos: eos,
+            rng: &rng, seen: &seen, counts: &counts)
+        return r.tokens
+    }
 
+    /// Prefill already done; `first` is the first generated token.
+    func generateSampledSpeculativeFromPrefill(
+        first: Int, promptIds: [Int], maxTokens: Int,
+        processor: LogitsProcessor, draftK: Int, eos: Int?,
+        rng: inout SplitMix64, seen: inout Set<Int>, counts: inout [Int: Int]
+    ) throws -> (tokens: [Int], accepted: Int, attempts: Int, batched: Int) {
         let localIndex = SuffixDraftIndex(maxDepth: 64)
         let useTree = ProcessInfo.processInfo.environment["MOMIJ_SPEC_TREE"] != "0"
         let batchEnv = ProcessInfo.processInfo.environment["MOMIJ_SPEC_BATCH"]
@@ -523,11 +535,15 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         let batchOff = batchEnv == "0"
         let gateWindow = 8
         var acceptWindow: [Int] = []
-        var idsHist = prompt
-        idsHist.append(last)
+        var idsHist = promptIds
+        idsHist.append(first)
+        var acceptedTotal = 0
+        var attempts = 0
+        var batched = 0
+        var batching = false
 
         var out: [Int] = []
-        var y = last
+        var y = first
         while out.count < maxTokens {
             out.append(y)
             seen.insert(y)
@@ -536,19 +552,33 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             let remain = maxTokens - out.count
             if remain == 0 { break }
 
-            let meanAccept = acceptWindow.isEmpty ? 1.0
+            let meanAccept = acceptWindow.isEmpty ? 0.0
                 : Double(acceptWindow.reduce(0, +)) / Double(acceptWindow.count)
-            let effK = SuffixSpec.adaptiveDraftK(
+            let wantDraft = batchForce || SpeculativeSampling.SampledSpecPolicy.useDraft(
+                generated: out.count, meanAccept: meanAccept,
+                windowCount: acceptWindow.count, currentlyBatching: batching)
+            if !wantDraft {
+                batching = false
+                y = try stepSampled(
+                    y, processor: processor, seen: seen, counts: counts, rng: &rng)
+                idsHist.append(y)
+                continue
+            }
+
+            let effK = SpeculativeSampling.SampledSpecPolicy.draftK(
                 meanAccept: meanAccept, draftK: min(draftK, remain, specMaxM - 1))
             localIndex.clear()
-            localIndex.insert(idsHist)
+            let treeSlice = idsHist.count > localIndex.maxDepth * 2
+                ? Array(idsHist.suffix(localIndex.maxDepth * 2))
+                : idsHist
+            localIndex.insert(treeSlice)
             let treeHit = useTree
                 ? SuffixDraftIndex.bestDraft(
                     local: localIndex, global: globalSuffixIndex,
                     history: idsHist, maxK: effK, alpha: specAlpha)
                 : (matchLen: 0, tokens: [Int]())
             let pld = SuffixSpec.suffixDraft(
-                history: idsHist, k: effK, promptLen: prompt.count)
+                history: idsHist, k: effK, promptLen: promptIds.count)
             let recycled = useRecycle ? recycleIndex.draft(from: y, maxK: min(effK, 4)) : []
             let fromTree: Bool
             let draft: [Int]
@@ -575,12 +605,16 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 continue
             }
 
-            let hotEnough = meanAccept >= 1.5
+            attempts += 1
             let useBatch = !batchOff && useFlashHead && flashFused
-                && (batchForce || hotEnough)
+                && (batchForce || SpeculativeSampling.SampledSpecPolicy.useBatch(
+                    meanAccept: meanAccept, windowCount: acceptWindow.count,
+                    currentlyBatching: batching))
+            batching = useBatch
 
             let accepted: Int
             if useBatch {
+                batched += 1
                 let r = try verifyDraftSampled(
                     y: y, draft: draft, processor: processor,
                     seen: seen, counts: counts, rng: &rng, draftQ: qDraft)
@@ -646,6 +680,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 }
                 accepted = acc
             }
+            acceptedTotal += accepted
             acceptWindow.append(accepted)
             if acceptWindow.count > gateWindow { acceptWindow.removeFirst() }
         }
@@ -653,7 +688,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             out = Array(out.prefix(maxTokens))
         }
         globalSuffixIndex.insert(out)
-        return out
+        return (out, acceptedTotal, attempts, batched)
     }
 
     /// One token: embed → Metal layers (+final RMS + FlashHead centroids) → gather/sample.
@@ -1168,31 +1203,37 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         return (p, g, accum)
     }
 
-    /// Sampled decode floor (1 token / forward) vs speculative Leviathan (includes prefill in spec).
+    /// Sampled decode floor (1 token / forward) vs speculative Leviathan, both gen-only.
     public func benchmarkSampled(
         promptTokens: Int, genTokens: Int, trials: Int,
-        temperature: Float = 0.7
-    ) throws -> (seqTps: Double, specTps: Double) {
-        let prompt = Array(repeating: 100, count: promptTokens)
+        temperature: Float = 0.7,
+        prompt: [Int]? = nil
+    ) throws -> (seqTps: Double, specTps: Double, acceptPerAttempt: Double, batched: Int) {
+        let promptIds: [Int]
+        if let given = prompt, !given.isEmpty {
+            promptIds = given
+        } else {
+            promptIds = Array(repeating: 100, count: promptTokens)
+        }
         let proc = LogitsProcessor(temperature: temperature, topP: 1)
         _ = try generateSampled(
-            prompt: Array(prompt.prefix(min(16, promptTokens))), maxTokens: 4,
+            prompt: Array(promptIds.prefix(min(16, promptIds.count))), maxTokens: 4,
             processor: proc, eos: nil, seed: 1)
 
         var seq: [Double] = []
         for trial in 0 ..< trials {
             reset()
             var rng = SplitMix64(seed: UInt64(trial) &+ 1)
-            var seen = Set(prompt)
+            var seen = Set(promptIds)
             var counts: [Int: Int] = [:]
-            for t in prompt { counts[t, default: 0] += 1 }
-            var last = prompt[0]
-            for i in 0 ..< prompt.count {
-                if i + 1 < prompt.count {
-                    _ = try step(prompt[i])
+            for t in promptIds { counts[t, default: 0] += 1 }
+            var last = promptIds[0]
+            for i in 0 ..< promptIds.count {
+                if i + 1 < promptIds.count {
+                    _ = try step(promptIds[i])
                 } else {
                     last = try stepSampled(
-                        prompt[i], processor: proc, seen: seen, counts: counts, rng: &rng)
+                        promptIds[i], processor: proc, seen: seen, counts: counts, rng: &rng)
                 }
             }
             let t0 = CFAbsoluteTimeGetCurrent()
@@ -1206,17 +1247,38 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         }
 
         var spec: [Double] = []
+        var acc = 0
+        var att = 0
+        var bat = 0
         for trial in 0 ..< trials {
             reset()
+            var rng = SplitMix64(seed: UInt64(trial) &+ 11)
+            var seen = Set(promptIds)
+            var counts: [Int: Int] = [:]
+            for t in promptIds { counts[t, default: 0] += 1 }
+            var last = promptIds[0]
+            for i in 0 ..< promptIds.count {
+                if i + 1 < promptIds.count {
+                    _ = try step(promptIds[i])
+                } else {
+                    last = try stepSampled(
+                        promptIds[i], processor: proc, seen: seen, counts: counts, rng: &rng)
+                }
+            }
             let t0 = CFAbsoluteTimeGetCurrent()
-            let out = try generateSampledSpeculative(
-                prompt: prompt, maxTokens: genTokens, processor: proc,
-                draftK: 8, eos: nil, seed: UInt64(trial) &+ 11)
-            spec.append(Double(out.count) / max(CFAbsoluteTimeGetCurrent() - t0, 1e-9))
+            let r = try generateSampledSpeculativeFromPrefill(
+                first: last, promptIds: promptIds, maxTokens: genTokens,
+                processor: proc, draftK: 8, eos: nil,
+                rng: &rng, seen: &seen, counts: &counts)
+            spec.append(Double(r.tokens.count) / max(CFAbsoluteTimeGetCurrent() - t0, 1e-9))
+            acc += r.accepted
+            att += r.attempts
+            bat += r.batched
         }
         let s = seq.reduce(0, +) / Double(seq.count)
         let p = spec.reduce(0, +) / Double(spec.count)
-        return (s, p)
+        let apa = att > 0 ? Double(acc) / Double(att) : 0
+        return (s, p, apa, bat)
     }
 
     /// L0 hidden vs MapleEngine MLX (decode step after same prompt token). Rel L2.

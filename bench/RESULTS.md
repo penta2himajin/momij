@@ -615,7 +615,7 @@ Routing (`SeedlessBackend`, serve default `--backend seedless`):
 | Request | Path |
 |---|---|
 | `isGreedyCompatible` (temp≈0, top_p≥1, penalties default) | existing greedy / SuffixSpec + M-row (**unchanged**) |
-| otherwise | FlashHead **candidate-set** `LogitsProcessor` sample; default **rejection-sampling** drafts (`generateSampledSpeculative`). Hot (`meanAccept≥1.5` or `MOMIJ_SPEC_BATCH=1`) packs the **same M-row chain** as greedy and walks Leviathan on per-row logits. Cold sequential. `MOMIJ_SPEC_SAMPLE=0` → `generateSampled` only |
+| otherwise | FlashHead **candidate-set** `LogitsProcessor` sample; default **rejection-sampling** drafts (`generateSampledSpeculative`). Cold 1-step; probe every 8 then M-row only when `meanAccept≥1.5` (short K 2–4). `MOMIJ_SPEC_SAMPLE=0` → `generateSampled` only |
 
 Notes:
 
@@ -657,6 +657,33 @@ Release, mlx.metallib colocated, p128/g64 n=2:
 
 150 tok/s on the sampled 1-step path is in. 250–300 remains the **greedy spec + M-row**
 path when drafts hit — not the sequential sample floor.
+
+### 2026-09-12 sampled spec ~200 without draft head
+
+Cold sampled decode stays 1-step (`SampledSpecPolicy`: probe every 8, fill a
+4-hit window, M-row only at `meanAccept≥1.5`, hysteresis hold at 0.8). Draft
+K is capped at 2–4 (Leviathan rarely copies greedy-length drafts).
+
+`snapshotCaches` copied the **full KV allocation** (`numKV×maxLen`) per layer
+on every verify. That memcpy dominated sampled M-row (accept ~1.5–2 → frequent
+restore) and also taxed greedy SuffixSpec. Live snapshot is the filled prefix
+(`offset`, or full SWA window after wrap).
+
+Release, mlx.metallib colocated, n=2:
+
+| Path | tok/s |
+|---|---|
+| greedy `bench` p128/g64 | **~166** |
+| SuffixSpec motif (tree) | **~343** (was ~260; chain1cb K=8 **~402**, match=true) |
+| sampled sequential `temp=0.7` dummy-100s (gen-only) | **~183** |
+| sampled spec dummy-100s (drafts miss, batched=0) | **~180–185** (floor held) |
+| sampled spec fib `temp=0.7` p128/g128 | **~208** (accept/attempt=2.12, batched=28) |
+| sampled spec fib `temp=0.3` | **~216** |
+| sampled spec numbered-list `temp=0.3` | **~209** |
+
+Bar: **≥150 with sampling params; ~200 without a trained draft head when
+suffix drafts land.** 250–300 is still greedy SuffixSpec+M-row on copyable
+text, not the sampling path.
 
 ## Baseline (oracle / mlx-lm-deepgrove)
 

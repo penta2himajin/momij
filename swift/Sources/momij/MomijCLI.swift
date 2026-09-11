@@ -82,10 +82,16 @@ struct MomijMain {
                 print(try eng.benchmarkSuffixSpec(
                     promptTokens: p, genTokens: g, trials: n, draftK: 8, prompt: promptIds))
             } else if let ts = flag(args, "--temperature"), let temp = Float(ts), temp > 0 {
+                var promptIds: [Int]? = nil
+                if let promptText = flag(args, "--prompt") {
+                    let tokenizer = try await loadTokenizer(modelDir: model)
+                    promptIds = try tokenizer.encode(promptText)
+                }
                 let r = try eng.benchmarkSampled(
-                    promptTokens: p, genTokens: g, trials: n, temperature: temp)
-                print(String(format: "backend=seedless sampled temp=%.2f seq=%.1f tok/s  spec=%.1f tok/s (spec includes prefill)",
-                             temp, r.seqTps, r.specTps))
+                    promptTokens: p, genTokens: g, trials: n, temperature: temp,
+                    prompt: promptIds)
+                print(String(format: "backend=seedless sampled temp=%.2f seq=%.1f tok/s  spec=%.1f tok/s (gen-only)  accept/attempt=%.2f  batched=%d",
+                             temp, r.seqTps, r.specTps, r.acceptPerAttempt, r.batched))
             } else {
                 let r = try eng.benchmark(promptTokens: p, genTokens: g, trials: n, profile: true)
                 let ph = r.phase

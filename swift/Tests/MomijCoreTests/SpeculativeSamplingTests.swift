@@ -106,4 +106,39 @@ final class SpeculativeSamplingTests: XCTestCase {
         XCTAssertEqual(r.accepted, 1)
         XCTAssertEqual(r.next, 21)
     }
+
+    func testSampledSpecPolicyStaysSequentialUntilProbe() {
+        XCTAssertFalse(SpeculativeSampling.SampledSpecPolicy.useDraft(
+            generated: 0, meanAccept: 1, windowCount: 0))
+        XCTAssertFalse(SpeculativeSampling.SampledSpecPolicy.useDraft(
+            generated: 3, meanAccept: 1, windowCount: 0))
+        XCTAssertTrue(SpeculativeSampling.SampledSpecPolicy.useDraft(
+            generated: 8, meanAccept: 1, windowCount: 0))
+    }
+
+    func testSampledSpecPolicyBatchesOnlyWhenHot() {
+        XCTAssertFalse(SpeculativeSampling.SampledSpecPolicy.useBatch(
+            meanAccept: 2.0, windowCount: 2))
+        XCTAssertFalse(SpeculativeSampling.SampledSpecPolicy.useBatch(
+            meanAccept: 0.2, windowCount: 8))
+        XCTAssertFalse(SpeculativeSampling.SampledSpecPolicy.useBatch(
+            meanAccept: 1.0, windowCount: 4))
+        XCTAssertTrue(SpeculativeSampling.SampledSpecPolicy.useBatch(
+            meanAccept: 1.5, windowCount: 4))
+        XCTAssertTrue(SpeculativeSampling.SampledSpecPolicy.useDraft(
+            generated: 9, meanAccept: 1.5, windowCount: 4))
+        XCTAssertTrue(SpeculativeSampling.SampledSpecPolicy.useDraft(
+            generated: 9, meanAccept: 1.0, windowCount: 1))
+        XCTAssertFalse(SpeculativeSampling.SampledSpecPolicy.useDraft(
+            generated: 9, meanAccept: 1.0, windowCount: 4))
+        XCTAssertFalse(SpeculativeSampling.SampledSpecPolicy.useDraft(
+            generated: 9, meanAccept: 0.0, windowCount: 1))
+        XCTAssertTrue(SpeculativeSampling.SampledSpecPolicy.useBatch(
+            meanAccept: 0.9, windowCount: 4, currentlyBatching: true))
+        XCTAssertFalse(SpeculativeSampling.SampledSpecPolicy.useBatch(
+            meanAccept: 0.5, windowCount: 4, currentlyBatching: true))
+        XCTAssertEqual(SpeculativeSampling.SampledSpecPolicy.draftK(meanAccept: 0.4, draftK: 8), 2)
+        XCTAssertEqual(SpeculativeSampling.SampledSpecPolicy.draftK(meanAccept: 1.6, draftK: 8), 3)
+        XCTAssertEqual(SpeculativeSampling.SampledSpecPolicy.draftK(meanAccept: 3.0, draftK: 8), 4)
+    }
 }

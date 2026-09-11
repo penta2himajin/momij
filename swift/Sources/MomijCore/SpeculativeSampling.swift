@@ -97,4 +97,50 @@ public enum SpeculativeSampling {
             tokenIds: prepared.ids, logits: prepared.logits, rng: &rng)
         return (draft.count, next)
     }
+
+    /// When to spend draft work on the sampled path. Cold 1-step is the 150 tok/s floor;
+    /// probe periodically (1-forward early-exit); M-row batch only when accepts land.
+    public enum SampledSpecPolicy {
+        public static let probeEvery = 8
+        public static let batchMean = 1.5
+        public static let batchHoldMean = 0.8
+        public static let batchMinWindow = 4
+
+        public static func useBatch(
+            meanAccept: Double, windowCount: Int, currentlyBatching: Bool = false
+        ) -> Bool {
+            if currentlyBatching {
+                return windowCount >= 2 && meanAccept >= batchHoldMean
+            }
+            return windowCount >= batchMinWindow && meanAccept >= batchMean
+        }
+
+        /// Short drafts: sampled Leviathan rarely copies 6–8 tokens, and long M-row
+        /// plus restore is slower than 1-step. Cap well below greedy `adaptiveDraftK`.
+        public static func draftK(meanAccept: Double, draftK: Int) -> Int {
+            let k = max(1, draftK)
+            if meanAccept >= 2.5 { return min(k, 4) }
+            if meanAccept >= 1.5 { return min(k, 3) }
+            return min(k, 2)
+        }
+
+        /// Draft/verify this step? False → caller should `stepSampled` only.
+        /// After a probe lands, draft every step until the window is full so we can
+        /// decide to batch; collapsed / not-hot returns to periodic probes.
+        public static func useDraft(
+            generated: Int, meanAccept: Double, windowCount: Int,
+            probeEvery: Int = probeEvery,
+            currentlyBatching: Bool = false
+        ) -> Bool {
+            if useBatch(
+                meanAccept: meanAccept, windowCount: windowCount,
+                currentlyBatching: currentlyBatching)
+            { return true }
+            if windowCount >= 1 && windowCount < batchMinWindow && meanAccept >= 0.5 {
+                return true
+            }
+            guard probeEvery > 0, generated > 0 else { return false }
+            return generated % probeEvery == 0
+        }
+    }
 }

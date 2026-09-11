@@ -174,11 +174,59 @@ public final class SeedlessLayerBlock {
         memset(vCache.contents(), 0, numKV * maxLen * headDim * 2)
     }
 
+    /// Filled KV timesteps that decode actually reads (`offset`, or full SWA window).
+    public static func liveSeq(offset: Int, maxLen: Int, isSliding: Bool) -> Int {
+        if isSliding && offset >= maxLen { return maxLen }
+        return min(max(0, offset), maxLen)
+    }
+
+    public static func liveBytes(seq: Int, numKV: Int, headDim: Int) -> Int {
+        numKV * seq * headDim * 2
+    }
+
+    var liveSeq: Int { Self.liveSeq(offset: offset, maxLen: maxLen, isSliding: isSliding) }
+
+    /// Per-head live prefix (layout `[numKV][maxLen][headDim]`). Full allocation is not copied.
+    func snapshotCache() -> (offset: Int, k: Data, v: Data) {
+        let seq = liveSeq
+        let perHead = seq * headDim * 2
+        let stride = maxLen * headDim * 2
+        var k = Data(count: numKV * perHead)
+        var v = Data(count: numKV * perHead)
+        guard perHead > 0 else { return (offset, k, v) }
+        k.withUnsafeMutableBytes { kd in
+            v.withUnsafeMutableBytes { vd in
+                guard let kDst = kd.baseAddress, let vDst = vd.baseAddress else { return }
+                let kSrc = kCache.contents()
+                let vSrc = vCache.contents()
+                for h in 0 ..< numKV {
+                    memcpy(kDst.advanced(by: h * perHead), kSrc.advanced(by: h * stride), perHead)
+                    memcpy(vDst.advanced(by: h * perHead), vSrc.advanced(by: h * stride), perHead)
+                }
+            }
+        }
+        return (offset, k, v)
+    }
+
     func restoreCache(offset: Int, k: Data, v: Data) {
         self.offset = offset
-        precondition(k.count == kCache.length && v.count == vCache.length)
-        k.withUnsafeBytes { kCache.contents().copyMemory(from: $0.baseAddress!, byteCount: k.count) }
-        v.withUnsafeBytes { vCache.contents().copyMemory(from: $0.baseAddress!, byteCount: v.count) }
+        let seq = Self.liveSeq(offset: offset, maxLen: maxLen, isSliding: isSliding)
+        let perHead = seq * headDim * 2
+        let expect = numKV * perHead
+        precondition(k.count == expect && v.count == expect)
+        guard perHead > 0 else { return }
+        let stride = maxLen * headDim * 2
+        k.withUnsafeBytes { kd in
+            v.withUnsafeBytes { vd in
+                guard let kSrc = kd.baseAddress, let vSrc = vd.baseAddress else { return }
+                let kDst = kCache.contents()
+                let vDst = vCache.contents()
+                for h in 0 ..< numKV {
+                    memcpy(kDst.advanced(by: h * stride), kSrc.advanced(by: h * perHead), perHead)
+                    memcpy(vDst.advanced(by: h * stride), vSrc.advanced(by: h * perHead), perHead)
+                }
+            }
+        }
     }
 
     /// Encode `M` decode tokens at current `offset`, then advance offset by M.
@@ -350,8 +398,9 @@ public final class SeedlessLayerStack {
         vData.reserveCapacity(layers.count)
         for l in layers {
             offsets.append(l.offset)
-            kData.append(Data(bytes: l.kCache.contents(), count: l.kCache.length))
-            vData.append(Data(bytes: l.vCache.contents(), count: l.vCache.length))
+            let snap = l.snapshotCache()
+            kData.append(snap.k)
+            vData.append(snap.v)
         }
         return CacheSnapshot(offsets: offsets, kData: kData, vData: vData)
     }

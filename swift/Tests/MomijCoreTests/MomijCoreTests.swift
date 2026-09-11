@@ -64,6 +64,17 @@ final class SuffixSpecTests: XCTestCase {
         XCTAssertEqual(SuffixDraftIndex.maxSpec(matchLen: 0, maxK: 8, alpha: 1.0), 0)
     }
 
+    func testLiveKVSeqIsPrefixNotFullAllocation() {
+        XCTAssertEqual(SeedlessLayerBlock.liveSeq(offset: 128, maxLen: 2048, isSliding: false), 128)
+        XCTAssertEqual(SeedlessLayerBlock.liveSeq(offset: 0, maxLen: 2048, isSliding: false), 0)
+        XCTAssertEqual(SeedlessLayerBlock.liveSeq(offset: 100, maxLen: 512, isSliding: true), 100)
+        XCTAssertEqual(SeedlessLayerBlock.liveSeq(offset: 600, maxLen: 512, isSliding: true), 512)
+        XCTAssertEqual(SeedlessLayerBlock.liveBytes(seq: 128, numKV: 8, headDim: 64), 128 * 8 * 64 * 2)
+        XCTAssertLessThan(
+            SeedlessLayerBlock.liveBytes(seq: 128, numKV: 8, headDim: 64),
+            8 * 2048 * 64 * 2)
+    }
+
     func testGlobalIndexBeatsEmptyLocal() {
         let global = SuffixDraftIndex(maxDepth: 32)
         global.insert([1, 2, 3, 4, 5, 6])

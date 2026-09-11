@@ -685,6 +685,30 @@ Bar: **≥150 with sampling params; ~200 without a trained draft head when
 suffix drafts land.** 250–300 is still greedy SuffixSpec+M-row on copyable
 text, not the sampling path.
 
+### 2026-09-12 offset rewind + layersPerCB (fans on)
+
+M-row / sequential chain writes are append-only unless SWA `maple_shift_kv`
+runs. Reject rollback then only rewinds `offset` (`snapshotForChain`); dirty
+tail is unread. Live prefix copy remains the fallback near a SWA wrap.
+
+`layersPerCB` re-sweep under cooling (p128/g64, warmed): **g=4 still wins**
+(~166 tok/s) vs g=6 (~153). Default stays 4. gqmm2 ALU variants remain
+opt-in; they have not raised the packed 1-step floor.
+
+Release, fans on, mlx.metallib colocated, n=2:
+
+| Path | tok/s |
+|---|---|
+| greedy `bench` p128/g64 | **~165** |
+| SuffixSpec motif | **~338** (chain1cb K=8 **~438**, match=true) |
+| sampled sequential `temp=0.7` dummy-100s | **~182** |
+| sampled spec dummy-100s (batched=0) | **~181** |
+| sampled spec fib `temp=0.7` p128/g128 | **~200** |
+
+Offset rewind did not beat live-prefix at p128 (partial-accept memcpy was
+already small). It removes that copy on the hot path and stays correct
+(`chain-verify match=true`). 1-step floor is still layers (~5.9 ms).
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

@@ -919,7 +919,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 if i + 1 < prompt.count { _ = try step(prompt[i]) }
                 else { last = try step(prompt[i]) }
             }
-            let snap = stack.snapshotCaches()
+            let snap = stack.snapshotForChain(steps: K)
 
             let t0 = CFAbsoluteTimeGetCurrent()
             cur = last
@@ -1093,7 +1093,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         draftQ: [Float]
     ) throws -> (accepted: Int, next: Int) {
         let feeds = [y] + draft
-        let snap = stack.snapshotCaches()
+        let snap = stack.snapshotForChain(steps: feeds.count)
         let rows = try stepChainCandidateRows(feeds)
         if useRecycle {
             for i in 0 ..< min(feeds.count, specIndsSlots.count) {
@@ -1119,7 +1119,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     /// Snapshot → one-CB chain verify → restore+replay on partial accept.
     private func verifyDraftChain(y: Int, draft: [Int]) throws -> (accepted: Int, next: Int) {
         let feeds = [y] + draft  // M = D+1; evals[i] vs draft[i] for i<D; evals[D] is bonus next
-        let snap = stack.snapshotCaches()
+        let snap = stack.snapshotForChain(steps: feeds.count)
         let evals = try stepChainFeeds(feeds)
         // Refresh recycle adjacency from each FlashHead row (open-chat TR).
         if useRecycle {

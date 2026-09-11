@@ -71,6 +71,10 @@ struct MomijMain {
                          r["prompt_tps"] ?? 0, r["generation_tps"] ?? 0, r["peak_memory"] ?? 0))
         } else if backend == "seedless" {
             let store = try WeightStore(modelDir: model)
+            if has(args, "--sweep-cb") {
+                print(try SeedlessDecodeEngine.sweepLayersPerCB(store: store, prompt: p, gen: g))
+                return
+            }
             let fullLen = max(p + g + 64, 2048)
             let eng = try SeedlessDecodeEngine(store: store, fullMaxLen: fullLen)
             if has(args, "--suffix-spec") {

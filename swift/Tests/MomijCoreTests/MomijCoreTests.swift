@@ -75,6 +75,14 @@ final class SuffixSpecTests: XCTestCase {
             8 * 2048 * 64 * 2)
     }
 
+    func testCanRewindWhenWritesAreAppendOnly() {
+        XCTAssertTrue(SeedlessLayerBlock.canRewind(isSliding: false, offset: 200, maxLen: 2048, steps: 8))
+        XCTAssertTrue(SeedlessLayerBlock.canRewind(isSliding: true, offset: 100, maxLen: 512, steps: 8))
+        XCTAssertFalse(SeedlessLayerBlock.canRewind(isSliding: true, offset: 508, maxLen: 512, steps: 8))
+        XCTAssertTrue(SeedlessLayerBlock.canRewind(isSliding: true, offset: 504, maxLen: 512, steps: 8))
+        XCTAssertFalse(SeedlessLayerBlock.canRewind(isSliding: true, offset: 512, maxLen: 512, steps: 1))
+    }
+
     func testGlobalIndexBeatsEmptyLocal() {
         let global = SuffixDraftIndex(maxDepth: 32)
         global.insert([1, 2, 3, 4, 5, 6])

@@ -184,6 +184,14 @@ public final class SeedlessLayerBlock {
         numKV * seq * headDim * 2
     }
 
+    /// True when `steps` append-only KV writes will not `maple_shift_kv`.
+    /// Then reject rollback is `offset` rewind; dirty tail is unread.
+    public static func canRewind(isSliding: Bool, offset: Int, maxLen: Int, steps: Int) -> Bool {
+        guard steps >= 0 else { return false }
+        if !isSliding { return true }
+        return offset + steps <= maxLen
+    }
+
     var liveSeq: Int { Self.liveSeq(offset: offset, maxLen: maxLen, isSliding: isSliding) }
 
     /// Per-head live prefix (layout `[numKV][maxLen][headDim]`). Full allocation is not copied.
@@ -265,6 +273,11 @@ public final class SeedlessLayerBlock {
         offset += M
     }
 
+    func rewindOffset(_ newOffset: Int) {
+        precondition(newOffset >= 0 && newOffset <= offset)
+        offset = newOffset
+    }
+
     /// True when this layer can pack `M` tokens without SWA rotate / overflow.
     public func canEncodeMrow(M: Int) -> Bool {
         guard M >= 1, M <= maxM else { return false }
@@ -339,6 +352,14 @@ public final class SeedlessLayerStack {
         layers.allSatisfy { $0.canEncodeMrow(M: M) }
     }
 
+    /// Append-only chain of `n` tokens: offset rewind is a correct KV rollback.
+    public func canRewindAfter(steps n: Int) -> Bool {
+        layers.allSatisfy {
+            SeedlessLayerBlock.canRewind(
+                isSliding: $0.isSliding, offset: $0.offset, maxLen: $0.maxLen, steps: n)
+        }
+    }
+
     public func fillH(_ v: Float16) {
         let p = hBuf.contents().bindMemory(to: Float16.self, capacity: H)
         for i in 0 ..< H { p[i] = v }
@@ -383,10 +404,24 @@ public final class SeedlessLayerStack {
     }
 
     /// Host-side KV + offset snapshot for SuffixSpec reject rollback.
+    /// `offsetOnly`: rewind `offset` without copying caches (append-only chains).
     public struct CacheSnapshot {
         public let offsets: [Int]
         public let kData: [Data]
         public let vData: [Data]
+        public let offsetOnly: Bool
+    }
+
+    public func snapshotOffsets() -> CacheSnapshot {
+        CacheSnapshot(
+            offsets: layers.map(\.offset),
+            kData: Array(repeating: Data(), count: layers.count),
+            vData: Array(repeating: Data(), count: layers.count),
+            offsetOnly: true)
+    }
+
+    public func snapshotForChain(steps: Int) -> CacheSnapshot {
+        canRewindAfter(steps: steps) ? snapshotOffsets() : snapshotCaches()
     }
 
     public func snapshotCaches() -> CacheSnapshot {
@@ -402,11 +437,17 @@ public final class SeedlessLayerStack {
             kData.append(snap.k)
             vData.append(snap.v)
         }
-        return CacheSnapshot(offsets: offsets, kData: kData, vData: vData)
+        return CacheSnapshot(offsets: offsets, kData: kData, vData: vData, offsetOnly: false)
     }
 
     public func restoreCaches(_ snap: CacheSnapshot) {
         precondition(snap.offsets.count == layers.count)
+        if snap.offsetOnly {
+            for (i, l) in layers.enumerated() {
+                l.rewindOffset(snap.offsets[i])
+            }
+            return
+        }
         for (i, l) in layers.enumerated() {
             l.restoreCache(offset: snap.offsets[i], k: snap.kData[i], v: snap.vData[i])
         }

@@ -768,6 +768,64 @@ final class SeedlessMetalTests: XCTestCase {
         XCTAssertLessThan(rel, 1e-3, "w16 gqmm2 must match default; rel_l2=\(rel) maxAbs=\(maxAbs)")
     }
 
+    /// Qwisp TG shape `(32,2)` must match momij `(64,1)` on the default fold kernel.
+    func testGqmm2Tg2dMatchesDefault() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 512, N = 256, E = 4, Ktop = 2, gs = 128
+        func fill(_ buf: MTLBuffer) {
+            let n = buf.length
+            let p = buf.contents().bindMemory(to: UInt8.self, capacity: n)
+            for i in 0 ..< n { p[i] = UInt8((i * 17 + 3) & 0xff) }
+        }
+        func fillHalf(_ buf: MTLBuffer, _ v: Float16) {
+            let n = buf.length / 2
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = v }
+        }
+        func buf(_ bytes: Int) -> MTLBuffer {
+            device.makeBuffer(length: bytes, options: .storageModeShared)!
+        }
+        let packedK = H * 2 / 32
+        let nGroups = H / gs
+        let x = buf(H * 2); fillHalf(x, 0.01)
+        let w = buf(E * N * packedK * 4); fill(w)
+        let s = buf(E * N * nGroups * 2); fillHalf(s, 0.02)
+        let b = buf(E * N * nGroups * 2); fillHalf(b, 0.001)
+        let inds = buf(Ktop * 4)
+        let ip = inds.contents().bindMemory(to: Int32.self, capacity: Ktop)
+        ip[0] = 1; ip[1] = 2
+        let y0 = buf(Ktop * N * 2)
+        let y1 = buf(Ktop * N * 2)
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        try SeedlessMetal.gqmm2(
+            x: x, w: w, scales: s, biases: b, inds: inds, out: y0,
+            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: false, w16: false)
+        try SeedlessMetal.gqmm2(
+            x: x, w: w, scales: s, biases: b, inds: inds, out: y1,
+            Ktop: Ktop, K: H, N: N, gs: gs, into: enc, splitK: false, w16: false, tg2d: true)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let a = y0.contents().bindMemory(to: Float16.self, capacity: Ktop * N)
+        let bOut = y1.contents().bindMemory(to: Float16.self, capacity: Ktop * N)
+        var maxAbs: Float = 0
+        var num = 0.0, den = 0.0
+        for i in 0 ..< (Ktop * N) {
+            let d = abs(Float(a[i]) - Float(bOut[i]))
+            maxAbs = max(maxAbs, d)
+            num += Double(d * d)
+            den += Double(Float(a[i]) * Float(a[i]))
+        }
+        let rel = sqrt(num / max(den, 1e-30))
+        XCTAssertLessThan(rel, 1e-5, "tg2d gqmm2 must match 1D TG; rel_l2=\(rel) maxAbs=\(maxAbs)")
+    }
+
     func testUpSwigluFusedMatchesSeparate() throws {
         try SeedlessMetal.ensureCompiled()
         guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
@@ -891,6 +949,51 @@ final class SeedlessMetalTests: XCTestCase {
             H: H, I: I, E: E, Ktop: Ktop, eps: 1e-6, gs: gs)
         let yp = x.contents().bindMemory(to: Float16.self, capacity: H)
         XCTAssertTrue(yp[0].isFinite)
+    }
+
+    /// Qwisp-style combine→resid fold: `score_reduce` + `resid_add` ≡ `score_resid`.
+    func testScoreResidMatchesReduceThenAdd() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 2048, Ktop = 8, M = 2
+        func buf(_ n: Int, bpe: Int) -> MTLBuffer {
+            device.makeBuffer(length: n * bpe, options: .storageModeShared)!
+        }
+        let down = buf(M * Ktop * H, bpe: 2)
+        let scores = buf(M * Ktop, bpe: 4)
+        let y = buf(M * H, bpe: 2)
+        let hA = buf(M * H, bpe: 2)
+        let hB = buf(M * H, bpe: 2)
+        let dp = down.contents().bindMemory(to: Float16.self, capacity: M * Ktop * H)
+        let sp = scores.contents().bindMemory(to: Float.self, capacity: M * Ktop)
+        let ap = hA.contents().bindMemory(to: Float16.self, capacity: M * H)
+        let bp = hB.contents().bindMemory(to: Float16.self, capacity: M * H)
+        for i in 0 ..< (M * Ktop * H) { dp[i] = Float16(Float((i * 13) % 50) * 0.01 - 0.2) }
+        for i in 0 ..< (M * Ktop) { sp[i] = Float((i % 7) + 1) / 28.0 }
+        for i in 0 ..< (M * H) {
+            let v = Float16(Float(i % 11) * 0.03)
+            ap[i] = v
+            bp[i] = v
+        }
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        SeedlessMetal.encodeScoreReduce(
+            into: enc, down: down, scores: scores, y: y, H: H, Ktop: Ktop, M: M)
+        SeedlessMetal.encodeResid(into: enc, h: hA, delta: y, H: H, M: M)
+        SeedlessMetal.encodeScoreResid(
+            into: enc, down: down, scores: scores, h: hB, H: H, Ktop: Ktop, M: M)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        var num: Double = 0, den: Double = 0
+        for i in 0 ..< (M * H) {
+            let d = Float(ap[i]) - Float(bp[i])
+            num += Double(d * d)
+            den += Double(Float(ap[i]) * Float(ap[i]))
+        }
+        XCTAssertLessThan(sqrt(num / max(den, 1e-30)), 1e-5)
     }
 
     /// Batched MoE block M=2 must match two sequential M=1 steps.

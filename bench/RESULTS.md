@@ -709,6 +709,41 @@ Offset rewind did not beat live-prefix at p128 (partial-accept memcpy was
 already small). It removes that copy on the hot path and stays correct
 (`chain-verify match=true`). 1-step floor is still layers (~5.9 ms).
 
+### 2026-09-12 `maple_score_resid` (Qwisp combine→S2 analog)
+
+Fold `maple_score_reduce` + `maple_resid_add` into one kernel:
+`h[i] += half(Σ_k down[k,i]·scores[k])` (two-kernel rounding). Drops one
+dispatch and the `moeOut` roundtrip on `encodeMoEBlock`. Maple has no
+shared expert, so this is the fold that exists. Env: `MOMIJ_FUSE_SCORE_RESID`
+default **on**; `=0` restores two dispatches.
+
+Parity: `testScoreResidMatchesReduceThenAdd` rel_l2 < 1e-5. L0 vs MLX
+unchanged at `1.9291e-4`. MoE M-row tests still pass.
+
+Release, omlx stop, mlx.metallib colocated, p128/g64 (warm n=3, interleaved):
+
+| Path | tok/s | layers ms/tok |
+|---|---|---|
+| fused (default) | **182.1 / 183.3** | 5.28 / 5.25 |
+| two-dispatch `=0` | 180.2 / 179.9 | 5.36 / 5.35 |
+
+Packed e2e is the product metric → keep default **on** (~+2 tok/s, ~0.1 ms/tok
+on layers ≈ 24 extra dispatches). Isolated `moe-block-1cb` micro slightly
+favored unfused (2359 vs 2314 blocks/s) — ignore vs packed CB.
+
+Scratch overlay does **not** cut traffic: `ug` rows are stride `2I`, so
+in-place SwiGLU cannot feed down without an x-stride change. `ugOut` and
+`downOut` are not live together (alias = RAM only). Next real traffic cut
+would fold scores into the down-gqmm2 epilogue.
+
+Qwisp `gqmm2_rows` vs momij: same `tid.z = M·Ktop`, same 8 rows/TG, same 2-bit
+packing. Remaining delta tried: TG shape `(32,2)` vs momij `(64,1)`
+(`MOMIJ_GQMM2_TG2D=1`, same 2 simdgroups; parity rel_l2 < 1e-5).
+
+Warm p128/g64 n=3 interleaved: default **185.7** / TG2D **185.2** then **183.5**.
+Wash — keep `TG2D` opt-in **off**. ALU/packing rewrites already lost; this
+was the last cheap grid-shape delta.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

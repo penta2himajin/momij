@@ -6,11 +6,12 @@ import MLX
 ///
 /// `gqmm2_rows` is ported from Qwisp Seedless (MLX gather_qmv_fast bits=2 layout)
 /// with `group_size` 64|128. Expert path = up_gate gather → clamped SwiGLU →
-/// down gather → score reduce on one command buffer. Optional `gqmm2_up_swiglu`
+/// down gather → score reduce (or fused `maple_score_resid`) on one command buffer. Optional `gqmm2_up_swiglu`
 /// (`MOMIJ_FUSE_UP_SWIGLU=1`) fuses the first two; default keeps them separate (faster e2e).
 /// Experimental (default off): `MOMIJ_GQMM2_SPLITK=1` (micro↑ e2e↓), `MOMIJ_GQMM2_W16=1` (mild).
 /// `MOMIJ_GQMM2_TERNARY=1` Maple signed-trit path (separate metallib; packed/e2e regress).
 /// Default gqmm2: Maple fold (hoisted row α, bias=-α, stock qd2). `MOMIJ_GQMM2_FOLD=0` restores per-group affine.
+/// `MOMIJ_GQMM2_TG2D=1` uses Qwisp TG shape 32×2 (same 2 simdgroups; opt-in until e2e wins).
 /// `MOMIJ_GQMM2_DEFER_A=1` applies α after simd_sum (separate metallib; opt-in).
 /// `MOMIJ_GQMM2_FOLD_A=1` fold epilogue `α·(accum−sum)` (separate metallib; opt-in).
 /// `gqmm2_rows_vec` (vectorized loads) and `gqmm2_rows_pf` measured packed-CB regress — not shipped.
@@ -31,6 +32,7 @@ public enum SeedlessMetal {
     nonisolated(unsafe) static var gqmm2SKPartialsBytes: Int = 0
     nonisolated(unsafe) static var swigluPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var scoreReducePipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var scoreResidPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var rmsPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var residPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var gateGemvPipeline: MTLComputePipelineState?
@@ -69,6 +71,7 @@ public enum SeedlessMetal {
         gqmm2UpSwigluPipeline = try pipe("gqmm2_up_swiglu")
         swigluPipeline = try pipe("maple_clamped_swiglu")
         scoreReducePipeline = try pipe("maple_score_reduce")
+        scoreResidPipeline = try pipe("maple_score_resid")
         rmsPipeline = try pipe("maple_rms_norm")
         residPipeline = try pipe("maple_resid_add")
         gateGemvPipeline = try pipe("maple_gate_gemv")
@@ -139,9 +142,22 @@ public enum SeedlessMetal {
         return String(cString: raw) == "1"
     }
 
+    /// Fold `score_reduce` into residual add (Qwisp combine→S2 analog). Default on.
+    /// `MOMIJ_FUSE_SCORE_RESID=0` restores two dispatches + `moeOut` roundtrip.
+    public static var fuseScoreResid: Bool {
+        guard let raw = getenv("MOMIJ_FUSE_SCORE_RESID") else { return true }
+        return String(cString: raw) != "0"
+    }
+
     /// Wider TG: 16 output rows / TG (4 simdgroups). Env: `MOMIJ_GQMM2_W16=1`.
     public static var useW16: Bool {
         guard let raw = getenv("MOMIJ_GQMM2_W16") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    /// Qwisp TG shape: 32×2 instead of 64×1 (same 2 simdgroups). Env: `MOMIJ_GQMM2_TG2D=1`.
+    public static var useTg2d: Bool {
+        guard let raw = getenv("MOMIJ_GQMM2_TG2D") else { return false }
         return String(cString: raw) == "1"
     }
 
@@ -233,7 +249,8 @@ public enum SeedlessMetal {
         ternary: Bool? = nil,
         fold: Bool? = nil,
         deferA: Bool? = nil,
-        foldA: Bool? = nil
+        foldA: Bool? = nil,
+        tg2d: Bool? = nil
     ) throws {
         try ensureCompiled()
         guard let stop = stopBuf else { throw SeedlessError.notReady }
@@ -333,9 +350,12 @@ public enum SeedlessMetal {
             var gsv = Int32(gs)
             enc.setBytes(&gsv, length: 4, index: 11)
             let tptg = doW16 ? 128 : 64
+            let tg2 = !doW16 && (tg2d ?? useTg2d)
             enc.dispatchThreadgroups(
                 MTLSize(width: 1, height: N / rowsPerTG, depth: M * Ktop),
-                threadsPerThreadgroup: MTLSize(width: tptg, height: 1, depth: 1))
+                threadsPerThreadgroup: tg2
+                    ? MTLSize(width: 32, height: 2, depth: 1)
+                    : MTLSize(width: tptg, height: 1, depth: 1))
         }
 
         if ownsCB {
@@ -380,7 +400,9 @@ public enum SeedlessMetal {
         enc.setBytes(&gsv, length: 4, index: 10)
         enc.dispatchThreadgroups(
             MTLSize(width: 1, height: I / 8, depth: M * Ktop),
-            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+            threadsPerThreadgroup: useTg2d
+                ? MTLSize(width: 32, height: 2, depth: 1)
+                : MTLSize(width: 64, height: 1, depth: 1))
 
         if ownsCB {
             enc.endEncoding()
@@ -405,6 +427,7 @@ public enum SeedlessMetal {
 
     /// Encode fused expert block into an existing encoder (no commit/wait).
     /// `M>1`: x[M,H], inds/scores[M·Ktop], ug/act/down stacked as [M·Ktop, …], y[M,H].
+    /// `residInto`: fold score-reduce into `h += Σ score·down` (skips `y`).
     public static func encodeFusedExpert(
         into enc: MTLComputeCommandEncoder,
         x: MTLBuffer,
@@ -412,10 +435,11 @@ public enum SeedlessMetal {
         downW: MTLBuffer, downS: MTLBuffer, downB: MTLBuffer,
         inds: MTLBuffer, scores: MTLBuffer,
         ugOut: MTLBuffer, act: MTLBuffer, downOut: MTLBuffer, y: MTLBuffer,
-        H: Int, I: Int, Ktop: Int, gs: Int = 128, M: Int = 1
+        H: Int, I: Int, Ktop: Int, gs: Int = 128, M: Int = 1,
+        residInto: MTLBuffer? = nil
     ) throws {
         try ensureCompiled()
-        guard let reduce = scoreReducePipeline, let stop = stopBuf
+        guard scoreReducePipeline != nil, scoreResidPipeline != nil, stopBuf != nil
         else { throw SeedlessError.notReady }
         guard M >= 1 else { throw SeedlessError.unsupportedShape(N: H, K: I, gs: gs) }
 
@@ -431,19 +455,13 @@ public enum SeedlessMetal {
         try gqmm2(x: act, w: downW, scales: downS, biases: downB, inds: inds, out: downOut,
                   Ktop: Ktop, K: I, N: H, gs: gs, lhsPerExpert: true, M: M, into: enc)
 
-        enc.setComputePipelineState(reduce)
-        enc.setBuffer(downOut, offset: 0, index: 0)
-        enc.setBuffer(scores, offset: 0, index: 1)
-        enc.setBuffer(y, offset: 0, index: 2)
-        var h32 = Int32(H)
-        var kt32 = Int32(Ktop)
-        var m32 = Int32(M)
-        enc.setBytes(&h32, length: 4, index: 3)
-        enc.setBytes(&kt32, length: 4, index: 4)
-        enc.setBuffer(stop, offset: 0, index: 5)
-        enc.setBytes(&m32, length: 4, index: 6)
-        enc.dispatchThreads(MTLSize(width: H, height: M, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
+        if let residH = residInto {
+            encodeScoreResid(
+                into: enc, down: downOut, scores: scores, h: residH, H: H, Ktop: Ktop, M: M)
+        } else {
+            encodeScoreReduce(
+                into: enc, down: downOut, scores: scores, y: y, H: H, Ktop: Ktop, M: M)
+        }
     }
 
     /// Fused MoE expert block on a single command buffer (wait once). `M=1` is one token.
@@ -499,9 +517,11 @@ public enum SeedlessMetal {
             downW: downW, downS: downS, downB: downB,
             inds: inds, scores: scores,
             ugOut: ugOut, act: act, downOut: downOut, y: moeOut,
-            H: H, I: I, Ktop: Ktop, gs: gs, M: M)
-
-        encodeResid(into: enc, h: h, delta: moeOut, H: H, M: M)
+            H: H, I: I, Ktop: Ktop, gs: gs, M: M,
+            residInto: fuseScoreResid ? h : nil)
+        if !fuseScoreResid {
+            encodeResid(into: enc, h: h, delta: moeOut, H: H, M: M)
+        }
     }
 
     public static func moeBlockOneCB(
@@ -537,6 +557,42 @@ public enum SeedlessMetal {
         var h32 = Int32(H), m32 = Int32(M)
         enc.setBytes(&h32, length: 4, index: 2)
         enc.setBytes(&m32, length: 4, index: 3)
+        enc.dispatchThreads(MTLSize(width: H, height: M, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
+    }
+
+    static func encodeScoreReduce(
+        into enc: MTLComputeCommandEncoder,
+        down: MTLBuffer, scores: MTLBuffer, y: MTLBuffer,
+        H: Int, Ktop: Int, M: Int
+    ) {
+        enc.setComputePipelineState(scoreReducePipeline!)
+        enc.setBuffer(down, offset: 0, index: 0)
+        enc.setBuffer(scores, offset: 0, index: 1)
+        enc.setBuffer(y, offset: 0, index: 2)
+        var h32 = Int32(H), kt32 = Int32(Ktop), m32 = Int32(M)
+        enc.setBytes(&h32, length: 4, index: 3)
+        enc.setBytes(&kt32, length: 4, index: 4)
+        enc.setBuffer(stopBuf, offset: 0, index: 5)
+        enc.setBytes(&m32, length: 4, index: 6)
+        enc.dispatchThreads(MTLSize(width: H, height: M, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
+    }
+
+    static func encodeScoreResid(
+        into enc: MTLComputeCommandEncoder,
+        down: MTLBuffer, scores: MTLBuffer, h: MTLBuffer,
+        H: Int, Ktop: Int, M: Int
+    ) {
+        enc.setComputePipelineState(scoreResidPipeline!)
+        enc.setBuffer(down, offset: 0, index: 0)
+        enc.setBuffer(scores, offset: 0, index: 1)
+        enc.setBuffer(h, offset: 0, index: 2)
+        var h32 = Int32(H), kt32 = Int32(Ktop), m32 = Int32(M)
+        enc.setBytes(&h32, length: 4, index: 3)
+        enc.setBytes(&kt32, length: 4, index: 4)
+        enc.setBuffer(stopBuf, offset: 0, index: 5)
+        enc.setBytes(&m32, length: 4, index: 6)
         enc.dispatchThreads(MTLSize(width: H, height: M, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: min(256, H), height: 1, depth: 1))
     }
@@ -2074,6 +2130,29 @@ public enum SeedlessMetal {
             acc += float(down[(m * (uint)Ktop + (uint)ki) * (uint)H + h]) * scores[m * (uint)Ktop + (uint)ki];
         }
         y[m * (uint)H + h] = half(acc);
+    }
+
+    // Fold score_reduce + resid_add: h += half(Σ down·score). Two-kernel rounding:
+    // h = half(float(h) + float(half(acc))), Ktop loop ki=0..<Ktop.
+    kernel void maple_score_resid(
+        device const half* down [[buffer(0)]],   // [M·Ktop, H]
+        device const float* scores [[buffer(1)]], // [M·Ktop]
+        device half* h [[buffer(2)]],             // [M, H]
+        constant int& H [[buffer(3)]],
+        constant int& Ktop [[buffer(4)]],
+        device const int* stopFlag [[buffer(5)]],
+        constant int& M [[buffer(6)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        if (stopFlag[0] != 0) return;
+        uint hx = gid.x, m = gid.y;
+        if (hx >= (uint)H || m >= (uint)M) return;
+        float acc = 0.0f;
+        for (int ki = 0; ki < Ktop; ++ki) {
+            acc += float(down[(m * (uint)Ktop + (uint)ki) * (uint)H + hx]) * scores[m * (uint)Ktop + (uint)ki];
+        }
+        size_t off = (size_t)m * (size_t)H + hx;
+        h[off] = half(float(h[off]) + float(half(acc)));
     }
 
     // Milestone A helpers: RMSNorm / residual / dense gate / top-8 route.

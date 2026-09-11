@@ -103,6 +103,26 @@ public enum SeedlessMetal {
         return a.asMTLBuffer(device: device, noCopy: false)
     }
 
+    /// Owned copy via host bytes. Does not alias MLX storage.
+    static func mtlBufHostCopy(_ a: MLXArray, _ device: MTLDevice) -> MTLBuffer? {
+        a.eval()
+        let data = a.asData(access: .copy)
+        let n = data.data.count
+        guard n > 0, let buf = device.makeBuffer(length: n, options: .storageModeShared) else {
+            return nil
+        }
+        data.data.withUnsafeBytes { raw in
+            guard let p = raw.baseAddress else { return }
+            buf.contents().copyMemory(from: p, byteCount: n)
+        }
+        return buf
+    }
+
+    /// Owned copy. Use at init when the MLXArray will not outlive the buffer.
+    static func mtlBufCopy(_ a: MLXArray, _ device: MTLDevice) -> MTLBuffer? {
+        a.asMTLBuffer(device: device, noCopy: false)
+    }
+
     // MARK: - Public API
 
     /// When true, up gather + clamped SwiGLU run as one kernel.

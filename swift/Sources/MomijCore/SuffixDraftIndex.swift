@@ -122,6 +122,41 @@ public final class SuffixDraftIndex: @unchecked Sendable {
         }
         return best
     }
+
+    /// Draft-model q along `draft` from this tree: child_count / sibling_mass.
+    /// Positions that leave the tree stay 1 (deterministic). Empty draft → `[]`.
+    public func qAlong(history: [Int], draft: [Int]) -> [Float] {
+        guard !draft.isEmpty else { return [] }
+        var q = [Float](repeating: 1, count: draft.count)
+        let n = history.count
+        guard n > 0 else { return q }
+
+        var start: Node?
+        let maxP = min(maxDepth, n)
+        for p in stride(from: maxP, through: 1, by: -1) {
+            var node = root
+            var ok = true
+            for j in (n - p) ..< n {
+                guard let child = node.children[history[j]] else {
+                    ok = false
+                    break
+                }
+                node = child
+            }
+            if ok {
+                start = node
+                break
+            }
+        }
+        guard var node = start else { return q }
+        for i in 0 ..< draft.count {
+            let total = node.children.values.reduce(0) { $0 + $1.count }
+            guard total > 0, let child = node.children[draft[i]] else { break }
+            q[i] = max(1e-6, Float(child.count) / Float(total))
+            node = child
+        }
+        return q
+    }
 }
 
 extension SuffixSpec {

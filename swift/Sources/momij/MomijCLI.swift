@@ -81,6 +81,11 @@ struct MomijMain {
                 }
                 print(try eng.benchmarkSuffixSpec(
                     promptTokens: p, genTokens: g, trials: n, draftK: 8, prompt: promptIds))
+            } else if let ts = flag(args, "--temperature"), let temp = Float(ts), temp > 0 {
+                let r = try eng.benchmarkSampled(
+                    promptTokens: p, genTokens: g, trials: n, temperature: temp)
+                print(String(format: "backend=seedless sampled temp=%.2f seq=%.1f tok/s  spec=%.1f tok/s (spec includes prefill)",
+                             temp, r.seqTps, r.specTps))
             } else {
                 let r = try eng.benchmark(promptTokens: p, genTokens: g, trials: n, profile: true)
                 let ph = r.phase
@@ -188,6 +193,7 @@ struct MomijMain {
         default:
             backend = try OracleBackend(modelDir: model, flashHead: has(args, "--flash-head"))
         }
+        let t0 = CFAbsoluteTimeGetCurrent()
         var out: [Int] = []
         for try await t in backend.generate(ids, options: opts) {
             out.append(t)
@@ -196,8 +202,9 @@ struct MomijMain {
                 fflush(stdout)
             }
         }
+        let dt = max(CFAbsoluteTimeGetCurrent() - t0, 1e-9)
         print()
-        print("[momij] tokens=\(out.count)")
+        print(String(format: "[momij] tokens=%d  tok/s=%.1f", out.count, Double(out.count) / dt))
     }
 
     static func runServeCmd(_ args: [String]) async throws {

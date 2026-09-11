@@ -615,16 +615,48 @@ Routing (`SeedlessBackend`, serve default `--backend seedless`):
 | Request | Path |
 |---|---|
 | `isGreedyCompatible` (temp≈0, top_p≥1, penalties default) | existing greedy / SuffixSpec + M-row (**unchanged**) |
-| otherwise | FlashHead **candidate-set** `LogitsProcessor` sample; default **rejection-sampling** drafts (`generateSampledSpeculative`). `MOMIJ_SPEC_SAMPLE=0` → sequential `generateSampled` only |
+| otherwise | FlashHead **candidate-set** `LogitsProcessor` sample; default **rejection-sampling** drafts (`generateSampledSpeculative`). Hot (`meanAccept≥1.5` or `MOMIJ_SPEC_BATCH=1`) packs the **same M-row chain** as greedy and walks Leviathan on per-row logits. Cold sequential. `MOMIJ_SPEC_SAMPLE=0` → `generateSampled` only |
 
 Notes:
 
 - Sampling is **not** full-vocab OpenAI-exact (probe gather). Widen with `MOMIJ_SAMPLE_PROBES`.
-- Unit tests: `LogitsProcessorTests`, `SpeculativeSamplingTests`.
+- Unit tests: `LogitsProcessorTests`, `SpeculativeSamplingTests` (`walkDraft` greedy-equivalent full/partial/zero accept).
 - Smoke (debug, mlx.metallib colocated): greedy `bench -p 128 -g 64` ≈ **94 gen tok/s**;
   `generate --temperature 0.8 --repetition-penalty 1.2` emits tokens (path live).
   Release FlashHead init still SIGSEGV in this workspace after clean rebuild — measure
   greedy product band from prior RESULTS (~170+ release); do not claim regress from debug.
+
+### 2026-09-11 sampling M-row integration
+
+Greedy `verifyDraftChain` and sampled `verifyDraftSampled` share `encodeChainFeeds`
+(True M-row when `useMrow && M>1`). Sampled path does **not** use argmax match;
+it runs `SpeculativeSampling.walkDraft` on FlashHead candidate rows, then
+restore+replay on partial reject (same KV contract as greedy).
+
+### 2026-09-12 Leviathan q: deterministic + tree frequency
+
+Uniform-q over FlashHead candidates is gone. Model-free drafts are **deterministic**
+(`q(x*)=1`); suffix-tree drafts use child-frequency q. Reject samples residual
+`max(0,p−q)`.
+
+### 2026-09-12 release SIGSEGV (TDD)
+
+Bisect: `c94f5bf` release greedy lives (~169 tok/s). `57535f7` (sampling methods
+inlined into `SeedlessFlashHead`) **SIGSEGV in `FlashHead.init` / objc_release**.
+Debug never caught it. Red: `FlashHeadLifetimeTests` under `swift test -c release`.
+Fix: keep last-good init in `SeedlessFlashHead.swift`; sampling APIs live in
+`SeedlessFlashHead+Sampling.swift` (same type, separate compile unit).
+
+Release, mlx.metallib colocated, p128/g64 n=2:
+
+| Path | tok/s |
+|---|---|
+| greedy `bench` | **~163–165** |
+| SuffixSpec (motif/tree) | **~260** (chain1cb K=8 **~373**, match=true) |
+| sampled sequential `temp=0.7` (gen-only) | **~152** |
+
+150 tok/s on the sampled 1-step path is in. 250–300 remains the **greedy spec + M-row**
+path when drafts hit — not the sequential sample floor.
 
 ## Baseline (oracle / mlx-lm-deepgrove)
 

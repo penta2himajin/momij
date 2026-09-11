@@ -42,7 +42,7 @@ Phase profile: [bench/RESULTS.md](../bench/RESULTS.md) (2026-09-09).
 | Lever | Status | Notes |
 |---|---|---|
 | SuffixSpec / Tell | `SuffixSpec` + suffix trie + FlashHead-approx Token Recycling | Tree+global+`MOMIJ_SPEC_ALPHA`; recycle via FlashHead top-k. **MROW default on**; batch only when `meanAccept≥1.5` (cold → sequential/greedy). `MOMIJ_MROW=0` to opt out |
-| OpenAI API + continuous batch | `/v1/chat/completions` streaming; CB deferred | **seedless default serve**. Dual-path: greedyCompatible → SuffixSpec/M-row; else FlashHead candidate sampling (+ rejection-sampling drafts, `MOMIJ_SPEC_SAMPLE=0` to disable). Accepts `temperature`/`top_p`/`presence_penalty`/`frequency_penalty`/`repetition_penalty`/`seed`. Not full-vocab exact. |
+| OpenAI API + continuous batch | `/v1/chat/completions` streaming; CB deferred | **seedless default serve**. Dual-path: greedyCompatible → SuffixSpec/M-row; else FlashHead candidate sampling. Leviathan **deterministic q** (tree child-frequency when available). Hot sampled spec shares M-row `encodeChainFeeds`. Sequential sample ≈ 0.9× greedy. |
 | P-EAGLE / DFlash | **deferred — needs draft training** | Maple has `num_nextn_predict_layers=0`. Draft must be ≫2.5× target on AS ([AtomGradient](https://atomgradient.github.io/apple-silicon-llm-inference/paper.pdf)). Sources: [P-EAGLE](https://arxiv.org/abs/2602.01469), [DFlash](https://arxiv.org/abs/2602.06036) |
 
 ## P2 — revisit later

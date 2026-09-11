@@ -133,11 +133,67 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     public func stepChainFeeds(_ feeds: [Int]) throws -> [Int] {
         precondition(!feeds.isEmpty && feeds.count <= specMaxM)
         guard useFlashHead, let fh = flashHead, fh.fuseIntoLayerCB else {
-            // Fallback: sequential steps.
             var out: [Int] = []
             for t in feeds { out.append(try step(t)) }
             return out
         }
+        let packMrow = try encodeChainFeeds(feeds)
+        let M = feeds.count
+        var evals: [Int] = []
+        evals.reserveCapacity(M)
+        if packMrow, let packed = specPackedNorm {
+            let base = packed.contents().bindMemory(to: Float16.self, capacity: M * H)
+            for i in 0 ..< M {
+                evals.append(fh.greedyAfterFusedGather(
+                    hostH: base.advanced(by: i * H),
+                    inds: specIndsSlots[i], logits: specLogitsSlots[i]))
+            }
+        } else {
+            for i in 0 ..< M {
+                let ptr = specNormSlots[i].contents().bindMemory(to: Float16.self, capacity: H)
+                evals.append(fh.greedyAfterFusedGather(
+                    hostH: ptr, inds: specIndsSlots[i], logits: specLogitsSlots[i]))
+            }
+        }
+        return evals
+    }
+
+    /// Same GPU chain as `stepChainFeeds`, but returns FlashHead candidate logits per row
+    /// for rejection sampling (not argmax). Sequential fallback uses `stepCandidates`.
+    public func stepChainCandidateRows(_ feeds: [Int]) throws -> [(ids: [Int], logits: [Float])] {
+        precondition(!feeds.isEmpty && feeds.count <= specMaxM)
+        guard useFlashHead, let fh = flashHead, fh.fuseIntoLayerCB else {
+            var rows: [(ids: [Int], logits: [Float])] = []
+            rows.reserveCapacity(feeds.count)
+            for t in feeds { rows.append(try stepCandidates(t)) }
+            return rows
+        }
+        let packMrow = try encodeChainFeeds(feeds)
+        let M = feeds.count
+        var rows: [(ids: [Int], logits: [Float])] = []
+        rows.reserveCapacity(M)
+        if packMrow, let packed = specPackedNorm {
+            let base = packed.contents().bindMemory(to: Float16.self, capacity: M * H)
+            for i in 0 ..< M {
+                rows.append(fh.candidateLogits(
+                    inds: specIndsSlots[i], logits: specLogitsSlots[i],
+                    hostH: base.advanced(by: i * H)))
+            }
+        } else {
+            for i in 0 ..< M {
+                let ptr = specNormSlots[i].contents().bindMemory(to: Float16.self, capacity: H)
+                rows.append(fh.candidateLogits(
+                    inds: specIndsSlots[i], logits: specLogitsSlots[i], hostH: ptr))
+            }
+        }
+        return rows
+    }
+
+    /// One CB: embed `feeds` × layers ± packed M-row → per-row FlashHead gather into spec slots.
+    /// Returns whether True M-row packing ran.
+    @discardableResult
+    private func encodeChainFeeds(_ feeds: [Int]) throws -> Bool {
+        guard let fh = flashHead else { throw SeedlessError.notReady }
         ensureSpecSlots()
         guard let q = SeedlessMetal.queue, let feedBuf = specFeedIds else {
             throw SeedlessError.notReady
@@ -163,11 +219,10 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 H: H, eps: config.rmsNormEps, M: M)
             for i in 0 ..< M {
                 let off = i * H * 2
-                let inds = specIndsSlots[i]
-                let logits = specLogitsSlots[i]
                 fh.encodeCentroids(into: enc, h: packed, hByteOffset: off)
                 fh.encodeFusedAfterCentroids(
-                    into: enc, h: packed, inds: inds, logits: logits, hByteOffset: off)
+                    into: enc, h: packed, inds: specIndsSlots[i],
+                    logits: specLogitsSlots[i], hByteOffset: off)
             }
         } else {
             for i in 0 ..< M {
@@ -177,35 +232,17 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                     try layer.encodeStep(into: enc)
                 }
                 let norm = specNormSlots[i]
-                let inds = specIndsSlots[i]
-                let logits = specLogitsSlots[i]
                 SeedlessMetal.encodeRms(
                     into: enc, h: stack.hBuf, w: normWBuf, out: norm, H: H, eps: config.rmsNormEps)
                 fh.encodeCentroids(into: enc, h: norm)
-                fh.encodeFusedAfterCentroids(into: enc, h: norm, inds: inds, logits: logits)
+                fh.encodeFusedAfterCentroids(
+                    into: enc, h: norm, inds: specIndsSlots[i], logits: specLogitsSlots[i])
             }
         }
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
-
-        var evals: [Int] = []
-        evals.reserveCapacity(M)
-        if packMrow, let packed = specPackedNorm {
-            let base = packed.contents().bindMemory(to: Float16.self, capacity: M * H)
-            for i in 0 ..< M {
-                evals.append(fh.greedyAfterFusedGather(
-                    hostH: base.advanced(by: i * H),
-                    inds: specIndsSlots[i], logits: specLogitsSlots[i]))
-            }
-        } else {
-            for i in 0 ..< M {
-                let ptr = specNormSlots[i].contents().bindMemory(to: Float16.self, capacity: H)
-                evals.append(fh.greedyAfterFusedGather(
-                    hostH: ptr, inds: specIndsSlots[i], logits: specLogitsSlots[i]))
-            }
-        }
-        return evals
+        return packMrow
     }
 
     /// Greedy GPU token-feedback chain with **layersPerCB commits** + MTLSharedEvent
@@ -451,9 +488,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         return out
     }
 
-    /// Sampled decode with model-free draft + rejection sampling (Phase 2).
-    /// Falls back to single-token sample when drafts are empty. Not distribution-exact
-    /// vs full-vocab OpenAI sampling (FlashHead candidate support).
+    /// Sampled decode with model-free draft + rejection sampling.
+    /// Hot accept → same M-row `encodeChainFeeds` as greedy SuffixSpec; host walks
+    /// Leviathan accept/reject on per-row FlashHead logits. Cold stays sequential.
     public func generateSampledSpeculative(
         prompt: [Int], maxTokens: Int,
         processor: LogitsProcessor,
@@ -481,6 +518,11 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
 
         let localIndex = SuffixDraftIndex(maxDepth: 64)
         let useTree = ProcessInfo.processInfo.environment["MOMIJ_SPEC_TREE"] != "0"
+        let batchEnv = ProcessInfo.processInfo.environment["MOMIJ_SPEC_BATCH"]
+        let batchForce = batchEnv == "1"
+        let batchOff = batchEnv == "0"
+        let gateWindow = 8
+        var acceptWindow: [Int] = []
         var idsHist = prompt
         idsHist.append(last)
 
@@ -494,7 +536,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             let remain = maxTokens - out.count
             if remain == 0 { break }
 
-            let meanAccept = 1.0  // opportunistic drafts; reject handles misses
+            let meanAccept = acceptWindow.isEmpty ? 1.0
+                : Double(acceptWindow.reduce(0, +)) / Double(acceptWindow.count)
             let effK = SuffixSpec.adaptiveDraftK(
                 meanAccept: meanAccept, draftK: min(draftK, remain, specMaxM - 1))
             localIndex.clear()
@@ -507,14 +550,23 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             let pld = SuffixSpec.suffixDraft(
                 history: idsHist, k: effK, promptLen: prompt.count)
             let recycled = useRecycle ? recycleIndex.draft(from: y, maxK: min(effK, 4)) : []
+            let fromTree: Bool
             let draft: [Int]
             if treeHit.matchLen >= 1, !treeHit.tokens.isEmpty {
                 draft = treeHit.tokens
+                fromTree = true
             } else if !recycled.isEmpty {
                 draft = recycled
+                fromTree = false
             } else {
                 draft = pld
+                fromTree = false
             }
+            let qDraft: [Float] = fromTree
+                ? Self.mergedDraftQ(
+                    local: localIndex, global: globalSuffixIndex,
+                    history: idsHist, draft: draft)
+                : [Float](repeating: 1, count: draft.count)
 
             if draft.isEmpty {
                 y = try stepSampled(
@@ -523,55 +575,79 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 continue
             }
 
-            // Rejection-sample along the draft; sample bonus if all accepted.
-            var cur = y
-            var accepted = 0
-            var stopped = false
-            for (i, d) in draft.enumerated() {
-                let cands = try stepCandidates(cur)
-                let prepared = processor.prepare(
-                    tokenIds: cands.ids, logits: cands.logits, seen: seen, counts: counts)
-                let decision = SpeculativeSampling.tryAccept(
-                    draftToken: d,
-                    ids: prepared.ids, logits: prepared.logits,
-                    processor: processor, rng: &rng)
-                if decision.accepted {
-                    accepted += 1
-                    out.append(d)
-                    seen.insert(d)
-                    counts[d, default: 0] += 1
-                    idsHist.append(d)
-                    cur = d
-                    if let eos, d == eos {
-                        y = d
-                        stopped = true
-                        break
+            let hotEnough = meanAccept >= 1.5
+            let useBatch = !batchOff && useFlashHead && flashFused
+                && (batchForce || hotEnough)
+
+            let accepted: Int
+            if useBatch {
+                let r = try verifyDraftSampled(
+                    y: y, draft: draft, processor: processor,
+                    seen: seen, counts: counts, rng: &rng, draftQ: qDraft)
+                accepted = r.accepted
+                if accepted > 0 {
+                    let chunk = Array(draft.prefix(accepted))
+                    out.append(contentsOf: chunk)
+                    idsHist.append(contentsOf: chunk)
+                    for t in chunk {
+                        seen.insert(t)
+                        counts[t, default: 0] += 1
                     }
-                    if out.count >= maxTokens {
-                        y = d
-                        stopped = true
-                        break
-                    }
-                    if i + 1 == draft.count {
-                        // Bonus token from a fresh forward.
-                        y = try stepSampled(
-                            d, processor: processor, seen: seen, counts: counts, rng: &rng)
+                }
+                y = r.next
+                idsHist.append(y)
+            } else {
+                var acc = 0
+                var cur = y
+                var stopped = false
+                for (i, d) in draft.enumerated() {
+                    let cands = try stepCandidates(cur)
+                    let prepared = processor.prepare(
+                        tokenIds: cands.ids, logits: cands.logits, seen: seen, counts: counts)
+                    let decision = SpeculativeSampling.tryAccept(
+                        draftToken: d,
+                        ids: prepared.ids, logits: prepared.logits,
+                        processor: processor, rng: &rng,
+                        draftQ: i < qDraft.count ? qDraft[i] : 1)
+                    if decision.accepted {
+                        acc += 1
+                        out.append(d)
+                        seen.insert(d)
+                        counts[d, default: 0] += 1
+                        idsHist.append(d)
+                        cur = d
+                        if let eos, d == eos {
+                            y = d
+                            stopped = true
+                            break
+                        }
+                        if out.count >= maxTokens {
+                            y = d
+                            stopped = true
+                            break
+                        }
+                        if i + 1 == draft.count {
+                            y = try stepSampled(
+                                d, processor: processor, seen: seen, counts: counts, rng: &rng)
+                            idsHist.append(y)
+                            stopped = true
+                        }
+                    } else {
+                        y = decision.token
                         idsHist.append(y)
                         stopped = true
+                        break
                     }
-                } else {
-                    y = decision.token
-                    idsHist.append(y)
-                    stopped = true
-                    break
                 }
+                if !stopped {
+                    y = try stepSampled(
+                        cur, processor: processor, seen: seen, counts: counts, rng: &rng)
+                    idsHist.append(y)
+                }
+                accepted = acc
             }
-            if !stopped {
-                y = try stepSampled(
-                    cur, processor: processor, seen: seen, counts: counts, rng: &rng)
-                idsHist.append(y)
-            }
-            _ = accepted
+            acceptWindow.append(accepted)
+            if acceptWindow.count > gateWindow { acceptWindow.removeFirst() }
         }
         if out.count > maxTokens {
             out = Array(out.prefix(maxTokens))
@@ -963,6 +1039,48 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         return (out, acceptedTotal, attempts, gated, srcTree, srcRecycle, srcPld)
     }
 
+    private static func mergedDraftQ(
+        local: SuffixDraftIndex, global: SuffixDraftIndex,
+        history: [Int], draft: [Int]
+    ) -> [Float] {
+        let a = local.qAlong(history: history, draft: draft)
+        if a.contains(where: { $0 < 1 - 1e-5 }) { return a }
+        return global.qAlong(history: history, draft: draft)
+    }
+
+    /// Snapshot → one-CB chain (M-row when packed) → host reject walk → restore+replay.
+    private func verifyDraftSampled(
+        y: Int, draft: [Int],
+        processor: LogitsProcessor,
+        seen: Set<Int>,
+        counts: [Int: Int],
+        rng: inout SplitMix64,
+        draftQ: [Float]
+    ) throws -> (accepted: Int, next: Int) {
+        let feeds = [y] + draft
+        let snap = stack.snapshotCaches()
+        let rows = try stepChainCandidateRows(feeds)
+        if useRecycle {
+            for i in 0 ..< min(feeds.count, specIndsSlots.count) {
+                observeRecycle(fromToken: feeds[i], inds: specIndsSlots[i], logits: specLogitsSlots[i])
+            }
+        }
+        let walk = SpeculativeSampling.walkDraft(
+            draft: draft, rows: rows, processor: processor,
+            seen: seen, counts: counts, rng: &rng, draftQ: draftQ)
+        if walk.accepted == draft.count {
+            return walk
+        }
+        stack.restoreCaches(snap)
+        if walk.accepted == 0 {
+            _ = try step(y)
+            return walk
+        }
+        let replay = [y] + Array(draft.prefix(walk.accepted))
+        _ = try stepChainFeeds(replay)
+        return walk
+    }
+
     /// Snapshot → one-CB chain verify → restore+replay on partial accept.
     private func verifyDraftChain(y: Int, draft: [Int]) throws -> (accepted: Int, next: Int) {
         let feeds = [y] + draft  // M = D+1; evals[i] vs draft[i] for i<D; evals[D] is bonus next
@@ -1048,6 +1166,57 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         let p = pTps.reduce(0, +) / Double(pTps.count)
         let g = gTps.reduce(0, +) / Double(gTps.count)
         return (p, g, accum)
+    }
+
+    /// Sampled decode floor (1 token / forward) vs speculative Leviathan (includes prefill in spec).
+    public func benchmarkSampled(
+        promptTokens: Int, genTokens: Int, trials: Int,
+        temperature: Float = 0.7
+    ) throws -> (seqTps: Double, specTps: Double) {
+        let prompt = Array(repeating: 100, count: promptTokens)
+        let proc = LogitsProcessor(temperature: temperature, topP: 1)
+        _ = try generateSampled(
+            prompt: Array(prompt.prefix(min(16, promptTokens))), maxTokens: 4,
+            processor: proc, eos: nil, seed: 1)
+
+        var seq: [Double] = []
+        for trial in 0 ..< trials {
+            reset()
+            var rng = SplitMix64(seed: UInt64(trial) &+ 1)
+            var seen = Set(prompt)
+            var counts: [Int: Int] = [:]
+            for t in prompt { counts[t, default: 0] += 1 }
+            var last = prompt[0]
+            for i in 0 ..< prompt.count {
+                if i + 1 < prompt.count {
+                    _ = try step(prompt[i])
+                } else {
+                    last = try stepSampled(
+                        prompt[i], processor: proc, seen: seen, counts: counts, rng: &rng)
+                }
+            }
+            let t0 = CFAbsoluteTimeGetCurrent()
+            var y = last
+            for _ in 0 ..< genTokens {
+                seen.insert(y)
+                counts[y, default: 0] += 1
+                y = try stepSampled(y, processor: proc, seen: seen, counts: counts, rng: &rng)
+            }
+            seq.append(Double(genTokens) / max(CFAbsoluteTimeGetCurrent() - t0, 1e-9))
+        }
+
+        var spec: [Double] = []
+        for trial in 0 ..< trials {
+            reset()
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let out = try generateSampledSpeculative(
+                prompt: prompt, maxTokens: genTokens, processor: proc,
+                draftK: 8, eos: nil, seed: UInt64(trial) &+ 11)
+            spec.append(Double(out.count) / max(CFAbsoluteTimeGetCurrent() - t0, 1e-9))
+        }
+        let s = seq.reduce(0, +) / Double(seq.count)
+        let p = spec.reduce(0, +) / Double(spec.count)
+        return (s, p)
     }
 
     /// L0 hidden vs MapleEngine MLX (decode step after same prompt token). Rel L2.

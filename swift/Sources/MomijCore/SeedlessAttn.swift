@@ -420,7 +420,6 @@ public final class SeedlessLayerStack {
             do {
                 for j in i ..< end {
                     try layers[j].encodeStep(into: enc, M: M)
-                    enc.memoryBarrier(scope: .buffers)
                 }
                 if end == layers.count, let tail { tail(enc) }
                 enc.endEncoding()

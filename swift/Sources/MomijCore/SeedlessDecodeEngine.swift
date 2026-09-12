@@ -1378,9 +1378,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             var last = prompt[0]
             for i in 0 ..< prompt.count {
                 if i + 1 < prompt.count {
-                    _ = try step(prompt[i], profile: false)
+                    _ = try step(prompt[i], profile: false, skipFlash: true)
                 } else {
-                    last = try step(prompt[i], profile: false)
+                    last = try step(prompt[i], profile: false, skipFlash: true)
                 }
             }
             let t1 = CFAbsoluteTimeGetCurrent()
@@ -1394,7 +1394,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                     produced += toks.count
                     y = toks.last!
                 } else {
-                    y = try step(y, profile: profile)
+                    y = try step(y, profile: profile, skipFlash: true)
                     produced += 1
                     if profile {
                         accum.embed += lastPhase.embed

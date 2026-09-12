@@ -885,6 +885,130 @@ final class SeedlessMetalTests: XCTestCase {
         XCTAssertLessThan(rel, 1e-3, "rel_l2=\(rel) maxAbs=\(maxAbs)")
     }
 
+    /// Fold gqmm2 + SwiGLU ≡ Ktop-in-TG fold-up-swiglu (shared-x, two-kernel rounding).
+    func testUpKtopSwigluMatchesFoldThenSwiglu() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 512, I = 128, E = 4, Ktop = 2, M = 2, gs = 128
+        func fill(_ buf: MTLBuffer) {
+            let n = buf.length
+            let p = buf.contents().bindMemory(to: UInt8.self, capacity: n)
+            for i in 0 ..< n { p[i] = UInt8((i * 17 + 3) & 0xff) }
+        }
+        func fillHalf(_ buf: MTLBuffer, _ v: Float16) {
+            let n = buf.length / 2
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = v }
+        }
+        func buf(_ bytes: Int) -> MTLBuffer {
+            device.makeBuffer(length: bytes, options: .storageModeShared)!
+        }
+        let packedH = H * 2 / 32
+        let nGroupsH = H / gs
+        let x = buf(M * H * 2); fillHalf(x, 0.01)
+        let ugW = buf(E * 2 * I * packedH * 4); fill(ugW)
+        let ugS = buf(E * 2 * I * nGroupsH * 2); fillHalf(ugS, 0.02)
+        let ugB = buf(E * 2 * I * nGroupsH * 2); fillHalf(ugB, 0.001)
+        let inds = buf(M * Ktop * 4)
+        let ip = inds.contents().bindMemory(to: Int32.self, capacity: M * Ktop)
+        ip[0] = 1; ip[1] = 3; ip[2] = 2; ip[3] = 0
+        let ugOut = buf(M * Ktop * 2 * I * 2)
+        let actSep = buf(M * Ktop * I * 2)
+        let actFused = buf(M * Ktop * I * 2)
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        try SeedlessMetal.gqmm2(
+            x: x, w: ugW, scales: ugS, biases: ugB, inds: inds, out: ugOut,
+            Ktop: Ktop, K: H, N: 2 * I, gs: gs, lhsPerExpert: false, M: M,
+            into: enc, splitK: false, w16: false, ternary: false, fold: true,
+            deferA: false, foldA: false)
+        SeedlessMetal.encodeClampedSwiglu(into: enc, ug: ugOut, act: actSep, I: I, Ktop: M * Ktop)
+        try SeedlessMetal.encodeGqmm2UpKtopSwiglu(
+            into: enc, x: x, w: ugW, scales: ugS, biases: ugB, inds: inds, out: actFused,
+            Ktop: Ktop, K: H, I: I, gs: gs, M: M)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let a = actSep.contents().bindMemory(to: Float16.self, capacity: M * Ktop * I)
+        let b = actFused.contents().bindMemory(to: Float16.self, capacity: M * Ktop * I)
+        var maxAbs: Float = 0
+        var num = 0.0, den = 0.0
+        for i in 0 ..< (M * Ktop * I) {
+            let d = abs(Float(a[i]) - Float(b[i]))
+            maxAbs = max(maxAbs, d)
+            num += Double(d * d)
+            den += Double(Float(a[i]) * Float(a[i]))
+        }
+        XCTAssertLessThan(sqrt(num / max(den, 1e-30)), 1e-5, "maxAbs=\(maxAbs)")
+    }
+
+    /// Fold gqmm2 + resid_add ≡ fold-add epilogue into `h` (o-proj analog, Ktop=1).
+    func testFoldAddMatchesGqmm2ThenResid() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let K = 512, N = 256, E = 4, Ktop = 1, M = 2, gs = 128
+        func fill(_ buf: MTLBuffer) {
+            let n = buf.length
+            let p = buf.contents().bindMemory(to: UInt8.self, capacity: n)
+            for i in 0 ..< n { p[i] = UInt8((i * 17 + 3) & 0xff) }
+        }
+        func fillHalf(_ buf: MTLBuffer, _ v: Float16) {
+            let n = buf.length / 2
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = v }
+        }
+        func buf(_ bytes: Int) -> MTLBuffer {
+            device.makeBuffer(length: bytes, options: .storageModeShared)!
+        }
+        let packedK = K * 2 / 32
+        let nGroups = K / gs
+        let x = buf(M * K * 2); fillHalf(x, 0.01)
+        let w = buf(E * N * packedK * 4); fill(w)
+        let s = buf(E * N * nGroups * 2); fillHalf(s, 0.02)
+        let b = buf(E * N * nGroups * 2); fillHalf(b, -0.02)
+        let inds = buf(M * Ktop * 4)
+        let ip = inds.contents().bindMemory(to: Int32.self, capacity: M * Ktop)
+        ip[0] = 1; ip[1] = 2
+        let y = buf(M * Ktop * N * 2)
+        let hA = buf(M * N * 2)
+        let hB = buf(M * N * 2)
+        fillHalf(hA, 0.03)
+        hB.contents().copyMemory(from: hA.contents(), byteCount: M * N * 2)
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        try SeedlessMetal.gqmm2(
+            x: x, w: w, scales: s, biases: b, inds: inds, out: y,
+            Ktop: Ktop, K: K, N: N, gs: gs, lhsPerExpert: false, M: M,
+            into: enc, splitK: false, w16: false, ternary: false, fold: true,
+            deferA: false, foldA: false)
+        SeedlessMetal.encodeResid(into: enc, h: hA, delta: y, H: N, M: M)
+        try SeedlessMetal.encodeGqmm2FoldAdd(
+            into: enc, x: x, w: w, scales: s, biases: b, inds: inds, h: hB,
+            Ktop: Ktop, K: K, N: N, gs: gs, M: M)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let a = hA.contents().bindMemory(to: Float16.self, capacity: M * N)
+        let bp = hB.contents().bindMemory(to: Float16.self, capacity: M * N)
+        var maxAbs: Float = 0
+        var num = 0.0, den = 0.0
+        for i in 0 ..< (M * N) {
+            let d = abs(Float(a[i]) - Float(bp[i]))
+            maxAbs = max(maxAbs, d)
+            num += Double(d * d)
+            den += Double(Float(a[i]) * Float(a[i]))
+        }
+        XCTAssertLessThan(sqrt(num / max(den, 1e-30)), 1e-5, "maxAbs=\(maxAbs)")
+    }
+
     func testFlashTopKMatchesCPUSelect() throws {
         try SeedlessMetal.ensureCompiled()
         guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {

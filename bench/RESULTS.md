@@ -763,6 +763,27 @@ Packed e2e win (~+7 tok/s vs warm baseline, ~0.2 ms/tok on layers). Default
 **on**; `=0` restores down gather + `score_resid`. Serializing 8 expert GEMVs
 in one TG (256 vs 2048 TGs) beat extra occupancy here.
 
+### 2026-09-12 remaining 1-step fuses
+
+**Up Ktop-in-TG + SwiGLU** (`gqmm2_rows_fold_up_swiglu`, `MOMIJ_FUSE_UP_KTOP=1`):
+same trick as down, plus in-register SwiGLU, shared-x. Parity rel_l2 < 1e-5.
+Packed e2e **lost**: ~173 → **~145** tok/s (layers 5.67 → 6.75 ms). 8 experts ×
+(up+gate) in one TG is too fat — same class of loss as `FUSE_UP_SWIGLU`. Keep
+opt-in **off**.
+
+**o-proj → residual** (`gqmm2_rows_fold_add`, no Ktop serialize): `h += o`
+drops `attnOut` + `resid_add`. Parity rel_l2 < 1e-5. L0 unchanged.
+
+| Path | tok/s | layers ms/tok |
+|---|---|---|
+| o-resid fold | **196.7 / 196.6** | 4.96 / 4.96 |
+| two-dispatch (first / later) | 195.3 / 176.2† | 5.00 / 5.39 |
+
+† second default run had head 0.275 ms (stall). Fair pair is 195.3 vs 196.7
+(~+1 tok/s, ~0.04 ms/tok on layers). Default **on**; `MOMIJ_FUSE_O_RESID=0`
+restores the write+add. WriteKV pair / rms+gate not pursued — smaller than
+this and up-Ktop already showed occupancy can erase a dispatch win.
+
 ## Baseline (oracle / mlx-lm-deepgrove)
 
 See `docs/baseline.md` (~182 tok/s exact decode). Recheck same day after omlx stop:

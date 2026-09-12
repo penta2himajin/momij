@@ -15,6 +15,8 @@ import MLX
 /// `MOMIJ_GQMM2_DEFER_A=1` applies α after simd_sum (separate metallib; opt-in).
 /// `MOMIJ_GQMM2_FOLD_A=1` fold epilogue `α·(accum−sum)` (separate metallib; opt-in).
 /// `MOMIJ_FUSE_DOWN_SCORE=0` restores down gather + `score_resid` (Ktop loop in-TG is default).
+/// `MOMIJ_FUSE_UP_KTOP=1` loops Ktop in the fold up+SwiGLU TG (packed e2e regress; opt-in).
+/// `MOMIJ_FUSE_O_RESID=0` restores o-proj write + `resid_add` (fold-add into `h` is default).
 /// `gqmm2_rows_vec` (vectorized loads) and `gqmm2_rows_pf` measured packed-CB regress — not shipped.
 public enum SeedlessMetal {
     nonisolated(unsafe) static var device: MTLDevice?
@@ -24,6 +26,8 @@ public enum SeedlessMetal {
     nonisolated(unsafe) static var gqmm2TernaryPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var gqmm2FoldPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var gqmm2FoldScorePipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var gqmm2FoldUpPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var gqmm2FoldAddPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var gqmm2DeferAPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var gqmm2FoldAPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var gqmm2SplitKPipeline: MTLComputePipelineState?
@@ -154,6 +158,20 @@ public enum SeedlessMetal {
         return String(cString: raw) != "0"
     }
 
+    /// Ktop-in-TG fold up+SwiGLU (shared x). Default off — packed e2e regress.
+    /// Env: `MOMIJ_FUSE_UP_KTOP=1`.
+    public static var fuseUpKtop: Bool {
+        guard let raw = getenv("MOMIJ_FUSE_UP_KTOP") else { return false }
+        return String(cString: raw) == "1"
+    }
+
+    /// Fold o-proj into residual add (`h += o`). Default on.
+    /// `MOMIJ_FUSE_O_RESID=0` restores o-proj write + `resid_add`.
+    public static var fuseOResid: Bool {
+        guard let raw = getenv("MOMIJ_FUSE_O_RESID") else { return true }
+        return String(cString: raw) != "0"
+    }
+
     /// Wider TG: 16 output rows / TG (4 simdgroups). Env: `MOMIJ_GQMM2_W16=1`.
     public static var useW16: Bool {
         guard let raw = getenv("MOMIJ_GQMM2_W16") else { return false }
@@ -190,14 +208,16 @@ public enum SeedlessMetal {
     }
 
     private static func ensureFoldCompiled() throws {
-        if gqmm2FoldPipeline != nil, gqmm2FoldScorePipeline != nil { return }
+        if gqmm2FoldPipeline != nil, gqmm2FoldScorePipeline != nil,
+           gqmm2FoldUpPipeline != nil, gqmm2FoldAddPipeline != nil { return }
         try ensureCompiled()
         guard let device else { throw SeedlessError.notReady }
         try compileFoldPipelines(device)
     }
 
     private static func compileFoldPipelines(_ device: MTLDevice) throws {
-        if gqmm2FoldPipeline != nil, gqmm2FoldScorePipeline != nil { return }
+        if gqmm2FoldPipeline != nil, gqmm2FoldScorePipeline != nil,
+           gqmm2FoldUpPipeline != nil, gqmm2FoldAddPipeline != nil { return }
         let lib = try device.makeLibrary(source: foldMetalSource, options: mlxMatchCompileOpts())
         if gqmm2FoldPipeline == nil {
             gqmm2FoldPipeline = try device.makeComputePipelineState(
@@ -206,6 +226,14 @@ public enum SeedlessMetal {
         if gqmm2FoldScorePipeline == nil {
             gqmm2FoldScorePipeline = try device.makeComputePipelineState(
                 function: lib.makeFunction(name: "gqmm2_rows_fold_score")!)
+        }
+        if gqmm2FoldUpPipeline == nil {
+            gqmm2FoldUpPipeline = try device.makeComputePipelineState(
+                function: lib.makeFunction(name: "gqmm2_rows_fold_up_swiglu")!)
+        }
+        if gqmm2FoldAddPipeline == nil {
+            gqmm2FoldAddPipeline = try device.makeComputePipelineState(
+                function: lib.makeFunction(name: "gqmm2_rows_fold_add")!)
         }
     }
 
@@ -459,7 +487,11 @@ public enum SeedlessMetal {
         else { throw SeedlessError.notReady }
         guard M >= 1 else { throw SeedlessError.unsupportedShape(N: H, K: I, gs: gs) }
 
-        if fuseUpSwiglu {
+        if fuseUpKtop {
+            try encodeGqmm2UpKtopSwiglu(
+                into: enc, x: x, w: upGateW, scales: upGateS, biases: upGateB, inds: inds, out: act,
+                Ktop: Ktop, K: H, I: I, gs: gs, M: M)
+        } else if fuseUpSwiglu {
             try gqmm2UpSwiglu(x: x, w: upGateW, scales: upGateS, biases: upGateB, inds: inds,
                              out: act, Ktop: Ktop, K: H, I: I, gs: gs, M: M, into: enc)
         } else {
@@ -654,6 +686,75 @@ public enum SeedlessMetal {
             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
     }
 
+    /// Fold up||gate gather with Ktop loop in-TG + clamped SwiGLU → `act[M·Ktop, I]`.
+    /// Shared `x[M, K]`. Two-kernel rounding: SwiGLU from `half(up)` / `half(gate)`.
+    static func encodeGqmm2UpKtopSwiglu(
+        into enc: MTLComputeCommandEncoder,
+        x: MTLBuffer, w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
+        inds: MTLBuffer, out: MTLBuffer,
+        Ktop: Int, K: Int, I: Int, gs: Int = 128, M: Int = 1
+    ) throws {
+        try ensureFoldCompiled()
+        guard let pipe = gqmm2FoldUpPipeline, let stop = stopBuf else {
+            throw SeedlessError.notReady
+        }
+        guard M >= 1, I % 8 == 0, K % gqmm2BlockSize == 0, gs == 64 || gs == 128 else {
+            throw SeedlessError.unsupportedShape(N: I, K: K, gs: gs)
+        }
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(w, offset: 0, index: 0)
+        enc.setBuffer(scales, offset: 0, index: 1)
+        enc.setBuffer(biases, offset: 0, index: 2)
+        enc.setBuffer(x, offset: 0, index: 3)
+        enc.setBuffer(inds, offset: 0, index: 4)
+        enc.setBuffer(out, offset: 0, index: 5)
+        var kk = Int32(K), ii = Int32(I), kt = Int32(Ktop)
+        enc.setBytes(&kk, length: 4, index: 6)
+        enc.setBytes(&ii, length: 4, index: 7)
+        enc.setBytes(&kt, length: 4, index: 8)
+        enc.setBuffer(stop, offset: 0, index: 9)
+        var gsv = Int32(gs)
+        enc.setBytes(&gsv, length: 4, index: 10)
+        enc.dispatchThreadgroups(
+            MTLSize(width: 1, height: I / 8, depth: M),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+    }
+
+    /// Fold gather-qmv epilogue into `h += half(y)`. Same grid as `gqmm2` (`depth = M·Ktop`).
+    static func encodeGqmm2FoldAdd(
+        into enc: MTLComputeCommandEncoder,
+        x: MTLBuffer, w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
+        inds: MTLBuffer, h: MTLBuffer,
+        Ktop: Int, K: Int, N: Int, gs: Int = 128, M: Int = 1, lhsPerExpert: Bool = false
+    ) throws {
+        try ensureFoldCompiled()
+        guard let pipe = gqmm2FoldAddPipeline, let stop = stopBuf else {
+            throw SeedlessError.notReady
+        }
+        guard M >= 1, N % 8 == 0, K % gqmm2BlockSize == 0, gs == 64 || gs == 128 else {
+            throw SeedlessError.unsupportedShape(N: N, K: K, gs: gs)
+        }
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(w, offset: 0, index: 0)
+        enc.setBuffer(scales, offset: 0, index: 1)
+        enc.setBuffer(biases, offset: 0, index: 2)
+        enc.setBuffer(x, offset: 0, index: 3)
+        enc.setBuffer(inds, offset: 0, index: 4)
+        enc.setBuffer(h, offset: 0, index: 5)
+        var kk = Int32(K), nn = Int32(N), kt = Int32(Ktop)
+        enc.setBytes(&kk, length: 4, index: 6)
+        enc.setBytes(&nn, length: 4, index: 7)
+        enc.setBytes(&kt, length: 4, index: 8)
+        enc.setBuffer(stop, offset: 0, index: 9)
+        var lp = UInt32(lhsPerExpert ? 1 : 0)
+        enc.setBytes(&lp, length: 4, index: 10)
+        var gsv = Int32(gs)
+        enc.setBytes(&gsv, length: 4, index: 11)
+        enc.dispatchThreadgroups(
+            MTLSize(width: 1, height: N / 8, depth: M * Ktop),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+    }
+
     /// Decode SDPA. Queries laid out `[M, numHeads, headDim]`; `tid.y` is the query row.
     /// Same KV cache for all M. `causalM`: query m uses `N = seqLen + m` (draft-causal).
     public static func encodeSdpa(
@@ -698,7 +799,8 @@ public enum SeedlessMetal {
         kCache: MTLBuffer, vCache: MTLBuffer,
         H: Int, numHeads: Int, numKV: Int, headDim: Int,
         ropeDim: Int, ropePos: Int, writePos: Int, maxLen: Int, seqLen: Int,
-        eps: Float, gs: Int = 128, M: Int = 1, rotateFirst: Bool = false
+        eps: Float, gs: Int = 128, M: Int = 1, rotateFirst: Bool = false,
+        residInto: MTLBuffer? = nil
     ) throws {
         try ensureCompiled()
         guard let qkPipe = qkNormRopePipeline, let writeKV = writeKVPipeline, sdpaPipeline != nil
@@ -781,8 +883,14 @@ public enum SeedlessMetal {
             numHeads: numHeads, numKV: numKV, headDim: headDim,
             maxLen: maxLen, seqLen: seqLen, M: M, causalM: M > 1)
 
-        try gqmm2(x: attnTmp, w: oW, scales: oS, biases: oB, inds: densInds, out: attnOut,
-                  Ktop: 1, K: qDim, N: H, gs: gs, lhsPerExpert: false, M: M, into: enc)
+        if let residH = residInto {
+            try encodeGqmm2FoldAdd(
+                into: enc, x: attnTmp, w: oW, scales: oS, biases: oB, inds: densInds, h: residH,
+                Ktop: 1, K: qDim, N: H, gs: gs, M: M)
+        } else {
+            try gqmm2(x: attnTmp, w: oW, scales: oS, biases: oB, inds: densInds, out: attnOut,
+                      Ktop: 1, K: qDim, N: H, gs: gs, lhsPerExpert: false, M: M, into: enc)
+        }
     }
 
     /// One full layer decode: input_rms → attn → resid → MoE block.
@@ -813,8 +921,11 @@ public enum SeedlessMetal {
             kCache: kCache, vCache: vCache,
             H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
             ropeDim: ropeDim, ropePos: ropePos, writePos: writePos, maxLen: maxLen, seqLen: seqLen,
-            eps: eps, gs: gs, M: M, rotateFirst: rotateFirst)
-        encodeResid(into: enc, h: h, delta: attnOut, H: H, M: M)
+            eps: eps, gs: gs, M: M, rotateFirst: rotateFirst,
+            residInto: fuseOResid ? h : nil)
+        if !fuseOResid {
+            encodeResid(into: enc, h: h, delta: attnOut, H: H, M: M)
+        }
         try encodeMoEBlock(
             into: enc, h: h, normW: postNorm, gateW: gateW,
             upGateW: upGateW, upGateS: upGateS, upGateB: upGateB,
@@ -2966,6 +3077,141 @@ public enum SeedlessMetal {
             device half* ho = h + (size_t)m * out_vec_size + out_row;
             for (int row = 0; row < results_per_simdgroup; row++) {
                 ho[row] = half(float(ho[row]) + float(half(acc[row])));
+            }
+        }
+    }
+
+    kernel void gqmm2_rows_fold_up_swiglu(
+        device const uint32_t* w      [[buffer(0)]],
+        device const half*     scales [[buffer(1)]],
+        device const half*     biases [[buffer(2)]],
+        device const half*     x      [[buffer(3)]],
+        device const int*      inds   [[buffer(4)]],
+        device half*           y      [[buffer(5)]],
+        constant int& in_vec_size  [[buffer(6)]],
+        constant int& out_vec_size [[buffer(7)]],
+        constant int& ktop         [[buffer(8)]],
+        device const int* stopFlag [[buffer(9)]],
+        constant int&  gsz         [[buffer(10)]],
+        uint3 tid      [[threadgroup_position_in_grid]],
+        uint  simd_gid [[simdgroup_index_in_threadgroup]],
+        uint  simd_lid [[thread_index_in_simdgroup]])
+    {
+        if (stopFlag[0] != 0) return;
+        (void)biases;
+        constexpr int packs_per_thread = 1, num_simdgroups = 2, results_per_simdgroup = 4;
+        constexpr int pack_factor = 16, bytes_per_pack = 4, values_per_thread = 16;
+        constexpr int block_size = 512;
+        const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+        const int in_vec_size_g = in_vec_size / gsz;
+        const int weight_rows = out_vec_size * 2;
+        uint m = tid.z;
+        const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+        thread float x_thread[16];
+        const device uint8_t* w0 = (const device uint8_t*)w;
+        const device half* scales0 = scales;
+        const device half* x0 = x + (size_t)m * in_vec_size + simd_lid * values_per_thread;
+        for (int ki = 0; ki < ktop; ++ki) {
+            uint mk = m * (uint)ktop + (uint)ki;
+            uint e = (uint)inds[mk];
+            const device uint8_t* ws = w0 + (size_t)e * weight_rows * in_vec_size_w;
+            const device half* scp = scales0 + (size_t)e * weight_rows * in_vec_size_g;
+            const device uint8_t* ws_up = ws + (size_t)out_row * in_vec_size_w
+                + simd_lid * packs_per_thread * bytes_per_pack;
+            const device uint8_t* ws_gate = ws + (size_t)(out_row + out_vec_size) * in_vec_size_w
+                + simd_lid * packs_per_thread * bytes_per_pack;
+            const device half* sc_up = scp + (size_t)out_row * in_vec_size_g;
+            const device half* sc_gate = scp + (size_t)(out_row + out_vec_size) * in_vec_size_g;
+            thread float alpha_up[4];
+            thread float alpha_gate[4];
+            thread float result_up[4] = {0};
+            thread float result_gate[4] = {0};
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                alpha_up[row] = (float)sc_up[row * in_vec_size_g];
+                alpha_gate[row] = (float)sc_gate[row * in_vec_size_g];
+            }
+            const device half* xk = x0;
+            for (int k = 0; k < in_vec_size; k += block_size) {
+                float sum = ld16_b2(xk, x_thread);
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    auto wl_u = (const device uint8_t*)(ws_up + row * in_vec_size_w);
+                    auto wl_g = (const device uint8_t*)(ws_gate + row * in_vec_size_w);
+                    result_up[row] += qd2(wl_u, x_thread, alpha_up[row], -alpha_up[row], sum);
+                    result_gate[row] += qd2(wl_g, x_thread, alpha_gate[row], -alpha_gate[row], sum);
+                }
+                ws_up += block_size * bytes_per_pack / pack_factor;
+                ws_gate += block_size * bytes_per_pack / pack_factor;
+                xk += block_size;
+            }
+            device half* yk = y + (size_t)mk * out_vec_size + out_row;
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                float up = simd_sum(result_up[row]);
+                float gate = simd_sum(result_gate[row]);
+                if (simd_lid == 0) {
+                    float uf = float(half(up));
+                    float gf = float(half(gate));
+                    gf = metal::min(gf, 7.0f);
+                    uf = metal::clamp(uf, -7.0f, 7.0f);
+                    float silu = gf / (1.0f + metal::exp(-gf));
+                    yk[row] = half(silu * uf);
+                }
+            }
+        }
+    }
+
+    kernel void gqmm2_rows_fold_add(
+        device const uint32_t* w      [[buffer(0)]],
+        device const half*     scales [[buffer(1)]],
+        device const half*     biases [[buffer(2)]],
+        device const half*     x      [[buffer(3)]],
+        device const int*      inds   [[buffer(4)]],
+        device half*           y      [[buffer(5)]],
+        constant int& in_vec_size  [[buffer(6)]],
+        constant int& out_vec_size [[buffer(7)]],
+        constant int& ktop         [[buffer(8)]],
+        device const int* stopFlag [[buffer(9)]],
+        constant uint& lhsPer      [[buffer(10)]],
+        constant int&  gsz         [[buffer(11)]],
+        uint3 tid      [[threadgroup_position_in_grid]],
+        uint  simd_gid [[simdgroup_index_in_threadgroup]],
+        uint  simd_lid [[thread_index_in_simdgroup]])
+    {
+        if (stopFlag[0] != 0) return;
+        (void)biases;
+        constexpr int packs_per_thread = 1, num_simdgroups = 2, results_per_simdgroup = 4;
+        constexpr int pack_factor = 16, bytes_per_pack = 4, values_per_thread = 16;
+        constexpr int block_size = 512;
+        const device uint8_t* ws = (const device uint8_t*)w;
+        thread float x_thread[16];
+        thread float result[4] = {0};
+        thread float alpha[4];
+        const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+        const int in_vec_size_g = in_vec_size / gsz;
+        uint mk = tid.z;
+        uint e = (uint)inds[mk];
+        ws     += (size_t)e * out_vec_size * in_vec_size_w;
+        scales += (size_t)e * out_vec_size * in_vec_size_g;
+        const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+        ws     += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+        scales += out_row * in_vec_size_g;
+        for (int row = 0; row < results_per_simdgroup; row++) {
+            alpha[row] = (float)scales[row * in_vec_size_g];
+        }
+        x += (size_t)(lhsPer ? mk : mk / (uint)ktop) * in_vec_size + simd_lid * values_per_thread;
+        y += (size_t)mk * out_vec_size + out_row;
+        for (int k = 0; k < in_vec_size; k += block_size) {
+            float sum = ld16_b2(x, x_thread);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+                result[row] += qd2(wl, x_thread, alpha[row], -alpha[row], sum);
+            }
+            ws += block_size * bytes_per_pack / pack_factor;
+            x += block_size;
+        }
+        for (int row = 0; row < results_per_simdgroup; row++) {
+            result[row] = simd_sum(result[row]);
+            if (simd_lid == 0) {
+                y[row] = half(float(y[row]) + float(half(result[row])));
             }
         }
     }

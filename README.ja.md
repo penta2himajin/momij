@@ -1,17 +1,19 @@
 # momij
 
-[日本語](./README.ja.md)
+> Source: README.md @ 8f8b8b9a74ccb79ece616efaac23e3bfb4d85037
 
-High-speed inference engine for Maple-Preview on Apple Silicon (M1 Max).
-Primary product: an OpenAI-compatible server intended to **replace oMLX when serving Maple**.
+[English](./README.md)
 
-## Approach
+Maple-Preview 専用の高速推論エンジン（Apple Silicon / M1 Max）。
+**oMLX の Maple 置き換え**を想定した OpenAI 互換サーバを第1成果物とする。
 
-- **Stack**: Swift + raw Metal (Qwisp Seedless style). MLX is used for weight load and the canonical greedy reference path.
-- **Model**: `~/models/deepgrove/maple-preview-2bit-mlx`
-- **References**: `qwisp` (Seedless / Tell), `mlx-lm-deepgrove` (canonical Maple)
+## 方針
 
-Details: [docs/research-catalog.md](docs/research-catalog.md) and [docs/baseline.md](docs/baseline.md).
+- **スタック**: Swift + raw Metal（Qwisp Seedless 型）。MLX はロード／正準 greedy 基板。
+- **モデル**: `~/models/deepgrove/maple-preview-2bit-mlx`
+- **参照**: `qwisp`（Seedless / Tell）、`mlx-lm-deepgrove`（正準 Maple）
+
+詳細は [docs/research-catalog.md](docs/research-catalog.md) と [docs/baseline.md](docs/baseline.md)。
 
 ## Setup
 
@@ -21,7 +23,7 @@ cd swift
 swift build -c release
 ```
 
-Oracle benches (`mlx-lm-deepgrove`) need the DeepGrove venv:
+Oracle ベンチ（mlx-lm-deepgrove）には DeepGrove venv が必要:
 
 ```bash
 # already at ~/repos/mlx-lm-deepgrove/.venv
@@ -30,7 +32,7 @@ Oracle benches (`mlx-lm-deepgrove`) need the DeepGrove venv:
 ## Commands
 
 ```bash
-# Baseline-compatible bench (stop competing GPU users yourself)
+# Baseline-compatible bench (stops competing GPU users yourself)
 omlx stop   # if running
 swift run -c release momij -- bench --model ~/models/deepgrove/maple-preview-2bit-mlx -p 128 -g 256 -n 3
 swift run -c release momij -- bench --model ~/models/deepgrove/maple-preview-2bit-mlx --flash-head -p 128 -g 256 -n 3
@@ -38,7 +40,7 @@ swift run -c release momij -- bench --model ~/models/deepgrove/maple-preview-2bi
 # Seedless Metal microbench
 swift run -c release momij -- seedless-bench --model ~/models/deepgrove/maple-preview-2bit-mlx
 
-# OpenAI server (default port 8742) — point clients here instead of oMLX for Maple
+# OpenAI server (default port 8742) — point evprtr / clients here instead of oMLX for Maple
 swift run -c release momij -- serve --model ~/models/deepgrove/maple-preview-2bit-mlx --port 8742
 
 # SuffixSpec (env or flag)

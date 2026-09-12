@@ -78,7 +78,7 @@ Removing a translation: reverse the steps above.
 
 | English source | Japanese translation | Status |
 |---|---|---|
-| `README.md` | `README.ja.md` | Placeholder |
+| `README.md` | `README.ja.md` | Current |
 
 ## Trigger for revisiting
 

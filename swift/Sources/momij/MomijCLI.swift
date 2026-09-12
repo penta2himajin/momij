@@ -250,8 +250,22 @@ struct MomijMain {
             let tok = try await AutoTokenizer.from(modelFolder: URL(fileURLWithPath: modelDir))
             return HFTokenizer(tok)
         } catch {
-            fputs("[momij] warning: HF tokenizer load failed (\(error)); using byte fallback\n", stderr)
-            return MomijHTTP.ByteTokenizer()
+            throw TokenizerLoadError.hfFailed("\(error)")
+        }
+    }
+
+    /// Serve / generate require a real HF tokenizer (chat_template). No byte fallback.
+    static func loadTokenizerForServe(modelDir: String) async throws -> any MomijHTTP.TokenizerAdapter {
+        try await loadTokenizer(modelDir: modelDir)
+    }
+}
+
+enum TokenizerLoadError: Error, CustomStringConvertible {
+    case hfFailed(String)
+    var description: String {
+        switch self {
+        case .hfFailed(let s):
+            return "HF tokenizer load failed (chat_template required for serve): \(s)"
         }
     }
 }
@@ -263,12 +277,12 @@ struct HFTokenizer: MomijHTTP.TokenizerAdapter {
     func decode(_ ids: [Int]) throws -> String { inner.decode(tokens: ids) }
     func applyChatTemplate(_ messages: [MomijHTTP.ChatMessage]) throws -> [Int] {
         let dicts: [[String: String]] = messages.map {
-            ["role": $0.role, "content": $0.content ?? ""]
+            ["role": $0.role, "content": $0.content]
         }
-        if let ids = try? inner.applyChatTemplate(messages: dicts) {
-            return ids
+        do {
+            return try inner.applyChatTemplate(messages: dicts)
+        } catch {
+            throw MomijHTTP.TemplateError.applyFailed("\(error)")
         }
-        let text = messages.map { "\($0.role): \($0.content ?? "")" }.joined(separator: "\n")
-        return try encode(text)
     }
 }

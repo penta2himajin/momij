@@ -3,7 +3,6 @@ import Hummingbird
 import HTTPTypes
 import MomijCore
 
-
 enum MomijHTTP {
     struct ModelObject: ResponseEncodable, Codable {
         let id: String
@@ -17,26 +16,8 @@ enum MomijHTTP {
         let data: [ModelObject]
     }
 
-    struct ChatMessage: Codable {
-        var role: String
-        var content: String?
-    }
-
-    struct ChatCompletionRequest: Codable {
-        var model: String?
-        var messages: [ChatMessage]
-        var max_tokens: Int?
-        var max_completion_tokens: Int?
-        var temperature: Double?
-        var top_p: Double?
-        var presence_penalty: Double?
-        var frequency_penalty: Double?
-        /// HF / vLLM-style (not official OpenAI); 1.0 = off.
-        var repetition_penalty: Double?
-        var stream: Bool?
-        var n: Int?
-        var seed: UInt64?
-    }
+    /// Alias kept for TokenizerAdapter / HF bridge.
+    typealias ChatMessage = OpenAIChatCompat.ChatMessage
 
     actor AsyncLock {
         private var locked = false
@@ -75,7 +56,7 @@ enum MomijHTTP {
         func applyChatTemplate(_ messages: [ChatMessage]) throws -> [Int]
     }
 
-    /// Minimal byte-fallback tokenizer when swift-transformers Hub load is unavailable.
+    /// Dev / offline only. Serve path must not use this (HF chat_template required).
     struct ByteTokenizer: TokenizerAdapter {
         func encode(_ text: String) throws -> [Int] {
             Array(text.utf8).map { Int($0) }
@@ -85,70 +66,121 @@ enum MomijHTTP {
             return String(bytes: bytes, encoding: .utf8) ?? ""
         }
         func applyChatTemplate(_ messages: [ChatMessage]) throws -> [Int] {
-            let text = messages.map { "\($0.role): \($0.content ?? "")" }.joined(separator: "\n")
-            return try encode(text)
+            throw TemplateError.byteFallbackForbidden
+        }
+    }
+
+    enum TemplateError: Error, CustomStringConvertible {
+        case byteFallbackForbidden
+        case applyFailed(String)
+
+        var description: String {
+            switch self {
+            case .byteFallbackForbidden:
+                return "HF chat_template required; byte tokenizer cannot serve"
+            case .applyFailed(let s):
+                return "chat_template failed: \(s)"
+            }
         }
     }
 
     static func makeRouter(engine: MomijEngine) -> Router<BasicRequestContext> {
         let router = Router(context: BasicRequestContext.self)
+        // Authorization (if present) is ignored — no 401 for Bearer from evprtr.
         router.get("/v1/models") { _, _ -> ModelsResponse in
             ModelsResponse(data: [ModelObject(id: engine.modelID)])
         }
         router.get("/healthz") { _, _ -> String in "ok" }
         router.post("/v1/chat/completions") { req, _ -> Response in
             let body = try await req.body.collect(upTo: 8_000_000)
-            let chatReq = try JSONDecoder().decode(ChatCompletionRequest.self, from: Data(body.readableBytesView))
-            if (chatReq.n ?? 1) > 1 {
-                return Response(status: .badRequest, body: .init(byteBuffer: .init(string: #"{"error":"n>1 unsupported"}"#)))
+            let chatReq: OpenAIChatCompat.ChatCompletionRequest
+            do {
+                chatReq = try OpenAIChatCompat.parseRequest(from: Data(body.readableBytesView))
+            } catch let e as OpenAIChatCompat.ParseError {
+                return jsonError(status: .badRequest, message: e.description)
+            } catch {
+                return jsonError(status: .badRequest, message: "invalid request")
             }
-            let maxTok = chatReq.max_completion_tokens ?? chatReq.max_tokens ?? 256
-            let ids = try engine.tokenizer.applyChatTemplate(chatReq.messages)
+            if chatReq.n > 1 {
+                return jsonError(status: .badRequest, message: "n>1 unsupported")
+            }
+
+            let promptIds: [Int]
+            do {
+                promptIds = try engine.tokenizer.applyChatTemplate(chatReq.messages)
+            } catch {
+                return jsonError(status: .internalServerError, message: "\(error)")
+            }
+
             let opts = GenerateOptions(
-                maxTokens: maxTok,
-                temperature: chatReq.temperature ?? 0,
-                topP: chatReq.top_p ?? 1,
-                presencePenalty: chatReq.presence_penalty ?? 0,
-                frequencyPenalty: chatReq.frequency_penalty ?? 0,
-                repetitionPenalty: chatReq.repetition_penalty ?? 1,
+                maxTokens: chatReq.maxTokens,
+                temperature: chatReq.temperature,
+                topP: chatReq.topP,
+                presencePenalty: chatReq.presencePenalty,
+                frequencyPenalty: chatReq.frequencyPenalty,
+                repetitionPenalty: chatReq.repetitionPenalty,
                 useSuffixSpec: ProcessInfo.processInfo.environment["MOMIJ_SUFFIX_SPEC"] == "1",
                 seed: chatReq.seed
             )
-            if chatReq.stream == true {
-                return try await streamSSE(engine: engine, prompt: ids, options: opts)
+            if chatReq.stream {
+                return try await streamSSE(engine: engine, prompt: promptIds, options: opts)
             }
-            let tokens = try await engine.withLock {
-                var out: [Int] = []
-                for try await t in engine.backend.generate(ids, options: opts) {
-                    out.append(t)
+
+            let tokens: [Int]
+            do {
+                tokens = try await engine.withLock {
+                    var out: [Int] = []
+                    for try await t in engine.backend.generate(promptIds, options: opts) {
+                        out.append(t)
+                    }
+                    return out
                 }
-                return out
+            } catch {
+                return jsonError(status: .internalServerError, message: "generation failed: \(error)")
             }
-            let text = try engine.tokenizer.decode(tokens)
-            let payload: [String: Any] = [
-                "id": "chatcmpl-momij",
-                "object": "chat.completion",
-                "created": Int(Date().timeIntervalSince1970),
-                "model": engine.modelID,
-                "choices": [[
-                    "index": 0,
-                    "message": ["role": "assistant", "content": text],
-                    "finish_reason": "stop",
-                ]],
-                "usage": [
-                    "prompt_tokens": ids.count,
-                    "completion_tokens": tokens.count,
-                    "total_tokens": ids.count + tokens.count,
-                ],
-            ]
-            let data = try JSONSerialization.data(withJSONObject: payload)
-            return Response(
-                status: .ok,
-                headers: [.contentType: "application/json"],
-                body: .init(byteBuffer: .init(data: data))
-            )
+
+            let finish = OpenAIChatCompat.finishReason(
+                completionTokens: tokens, maxTokens: opts.maxTokens, eosTokenIds: opts.eosTokenIds)
+            let decodeIds = OpenAIChatCompat.contentTokenIds(tokens, eosTokenIds: opts.eosTokenIds)
+            let text: String
+            do {
+                text = try engine.tokenizer.decode(decodeIds)
+            } catch {
+                return jsonError(status: .internalServerError, message: "decode failed: \(error)")
+            }
+            do {
+                let data = try OpenAIChatCompat.nonStreamJSON(
+                    modelID: engine.modelID,
+                    content: text,
+                    finishReason: finish,
+                    promptTokens: promptIds.count,
+                    completionTokens: tokens.count)
+                return Response(
+                    status: .ok,
+                    headers: [.contentType: "application/json"],
+                    body: .init(byteBuffer: .init(data: data))
+                )
+            } catch {
+                return jsonError(status: .internalServerError, message: "response encode failed")
+            }
         }
         return router
+    }
+
+    static func jsonError(status: HTTPResponse.Status, message: String) -> Response {
+        let payload: [String: Any] = [
+            "error": [
+                "message": message,
+                "type": "invalid_request_error",
+            ],
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: payload))
+            ?? Data(#"{"error":{"message":"error","type":"invalid_request_error"}}"#.utf8)
+        return Response(
+            status: status,
+            headers: [.contentType: "application/json"],
+            body: .init(byteBuffer: .init(data: data))
+        )
     }
 
     static func streamSSE(engine: MomijEngine, prompt: [Int], options: GenerateOptions) async throws -> Response {
@@ -159,28 +191,54 @@ enum MomijHTTP {
                         var out: [Int] = []
                         for try await t in engine.backend.generate(prompt, options: options) {
                             out.append(t)
-                            let piece = (try? engine.tokenizer.decode([t])) ?? ""
-                            let chunk: [String: Any] = [
-                                "id": "chatcmpl-momij",
-                                "object": "chat.completion.chunk",
-                                "created": Int(Date().timeIntervalSince1970),
-                                "model": engine.modelID,
-                                "choices": [[
-                                    "index": 0,
-                                    "delta": ["content": piece],
-                                    "finish_reason": NSNull(),
-                                ]],
-                            ]
-                            if let data = try? JSONSerialization.data(withJSONObject: chunk),
-                               let line = String(data: data, encoding: .utf8) {
-                                var buf = ByteBufferAllocator().buffer(capacity: line.count + 16)
-                                buf.writeString("data: \(line)\n\n")
-                                cont.yield(buf)
+                            let pieceIds = OpenAIChatCompat.contentTokenIds(
+                                [t], eosTokenIds: options.eosTokenIds)
+                            let piece = pieceIds.isEmpty
+                                ? ""
+                                : ((try? engine.tokenizer.decode(pieceIds)) ?? "")
+                            if !piece.isEmpty {
+                                let chunk: [String: Any] = [
+                                    "id": "chatcmpl-momij",
+                                    "object": "chat.completion.chunk",
+                                    "created": Int(Date().timeIntervalSince1970),
+                                    "model": engine.modelID,
+                                    "choices": [[
+                                        "index": 0,
+                                        "delta": ["content": piece],
+                                        "finish_reason": NSNull(),
+                                    ]],
+                                ]
+                                if let data = try? JSONSerialization.data(withJSONObject: chunk),
+                                   let line = String(data: data, encoding: .utf8) {
+                                    var buf = ByteBufferAllocator().buffer(capacity: line.count + 16)
+                                    buf.writeString("data: \(line)\n\n")
+                                    cont.yield(buf)
+                                }
                             }
                         }
                         return out
                     }
-                    _ = tokens
+                    let finish = OpenAIChatCompat.finishReason(
+                        completionTokens: tokens,
+                        maxTokens: options.maxTokens,
+                        eosTokenIds: options.eosTokenIds)
+                    let finalChunk: [String: Any] = [
+                        "id": "chatcmpl-momij",
+                        "object": "chat.completion.chunk",
+                        "created": Int(Date().timeIntervalSince1970),
+                        "model": engine.modelID,
+                        "choices": [[
+                            "index": 0,
+                            "delta": [:] as [String: Any],
+                            "finish_reason": finish,
+                        ]],
+                    ]
+                    if let data = try? JSONSerialization.data(withJSONObject: finalChunk),
+                       let line = String(data: data, encoding: .utf8) {
+                        var buf = ByteBufferAllocator().buffer(capacity: line.count + 16)
+                        buf.writeString("data: \(line)\n\n")
+                        cont.yield(buf)
+                    }
                     var done = ByteBufferAllocator().buffer(capacity: 16)
                     done.writeString("data: [DONE]\n\n")
                     cont.yield(done)
@@ -206,5 +264,4 @@ enum MomijHTTP {
         fputs("[momij] listening on http://\(host):\(port) model=\(engine.modelID)\n", stderr)
         try await app.runService()
     }
-
 }

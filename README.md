@@ -13,6 +13,23 @@ Primary product: an OpenAI-compatible server intended to **replace oMLX when ser
 
 Details: [docs/research-catalog.md](docs/research-catalog.md) and [docs/baseline.md](docs/baseline.md).
 
+## oMLX Maple drop-in (evprtr)
+
+Point OpenAI clients (e.g. evprtr) at momij instead of oMLX for Maple:
+
+```bash
+swift run -c release momij -- serve --model ~/models/deepgrove/maple-preview-2bit-mlx --port 8742
+# EVPRTR_UPSTREAM_BASE_URL=http://127.0.0.1:8742/v1
+```
+
+Contract notes:
+
+- Default listen: `127.0.0.1:8742` (`--host` / `--port`). `--model-id` sets `/v1/models` and response `model` (default `maple-preview`).
+- Extra request fields (`tools`, `tool_choice`, `structured_outputs`, …) are **ignored**; generation continues.
+- HF `chat_template` is **required** on serve (no byte-tokenizer fallback). Template failure → 5xx / serve exit.
+- Assistant text (including `<tool_call>` markup) is returned in `choices[0].message.content`. Native OpenAI `tool_calls` are not required.
+- `Authorization` is ignored (no 401). One request at a time (in-process lock).
+
 ## Setup
 
 ```bash

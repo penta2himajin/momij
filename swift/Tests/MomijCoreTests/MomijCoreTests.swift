@@ -1617,3 +1617,108 @@ final class ConfigTests: XCTestCase {
         XCTAssertFalse(cfg.isSliding(1))
     }
 }
+
+final class OpenAIChatCompatTests: XCTestCase {
+    func testIgnoresUnknownRequestFields() throws {
+        let raw = """
+        {"model":"maple","messages":[{"role":"user","content":"hi"}],\
+        "tools":[{"type":"function","function":{"name":"ls","parameters":{"type":"object"}}}],\
+        "tool_choice":"auto","structured_outputs":{"json":{"type":"object"}},\
+        "response_format":{"type":"json_object"},"user":"u","metadata":{"k":1},\
+        "max_tokens":16}
+        """.data(using: .utf8)!
+        let req = try OpenAIChatCompat.parseRequest(from: raw)
+        XCTAssertEqual(req.messages.count, 1)
+        XCTAssertEqual(req.messages[0].content, "hi")
+        XCTAssertEqual(req.maxTokens, 16)
+        XCTAssertEqual(req.model, "maple")
+    }
+
+    func testNullContentIsEmptyString() throws {
+        let raw = #"{"messages":[{"role":"assistant","content":null}]}"#.data(using: .utf8)!
+        let req = try OpenAIChatCompat.parseRequest(from: raw)
+        XCTAssertEqual(req.messages[0].content, "")
+    }
+
+    func testDeveloperRoleMapsToSystem() throws {
+        let raw = #"{"messages":[{"role":"developer","content":"sys"},{"role":"user","content":"u"}]}"#
+            .data(using: .utf8)!
+        let req = try OpenAIChatCompat.parseRequest(from: raw)
+        XCTAssertEqual(req.messages[0].role, "system")
+        XCTAssertEqual(req.messages[1].role, "user")
+    }
+
+    func testMultimodalContentPartsFlattenToText() throws {
+        let raw = """
+        {"messages":[{"role":"user","content":[\
+        {"type":"text","text":"<tools>"},{"type":"text","text":"</tools>"}]}]}
+        """.data(using: .utf8)!
+        let req = try OpenAIChatCompat.parseRequest(from: raw)
+        XCTAssertEqual(req.messages[0].content, "<tools></tools>")
+    }
+
+    func testMaxCompletionTokensPreferred() throws {
+        let raw = #"{"messages":[{"role":"user","content":"x"}],"max_tokens":8,"max_completion_tokens":32}"#
+            .data(using: .utf8)!
+        let req = try OpenAIChatCompat.parseRequest(from: raw)
+        XCTAssertEqual(req.maxTokens, 32)
+    }
+
+    func testMarkupRoundtripPreservedInMessages() throws {
+        let system = "You have tools.\n<tools>\n[{\"name\":\"ls\"}]\n</tools>"
+        let assistant = #"<tool_call>{"name":"ls","arguments":{"path":"."}}</tool_call>"#
+        let user = "<tool_response>\nok\n</tool_response>"
+        let payload: [String: Any] = [
+            "messages": [
+                ["role": "system", "content": system],
+                ["role": "assistant", "content": assistant],
+                ["role": "user", "content": user],
+            ],
+            "max_tokens": 64,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        let req = try OpenAIChatCompat.parseRequest(from: data)
+        XCTAssertEqual(req.messages[0].content, system)
+        XCTAssertEqual(req.messages[1].content, assistant)
+        XCTAssertEqual(req.messages[2].content, user)
+    }
+
+    func testFinishReasonLengthWhenMaxFilled() {
+        let tokens = Array(repeating: 1, count: 16)
+        XCTAssertEqual(
+            OpenAIChatCompat.finishReason(completionTokens: tokens, maxTokens: 16),
+            "length")
+    }
+
+    func testFinishReasonStopOnEos() {
+        let tokens = [10, 11, 151_645]
+        XCTAssertEqual(
+            OpenAIChatCompat.finishReason(completionTokens: tokens, maxTokens: 64),
+            "stop")
+        XCTAssertEqual(
+            OpenAIChatCompat.contentTokenIds(tokens),
+            [10, 11])
+    }
+
+    func testNonStreamResponseShape() throws {
+        let data = try OpenAIChatCompat.nonStreamJSON(
+            modelID: "maple-preview",
+            content: "pong",
+            finishReason: "stop",
+            promptTokens: 3,
+            completionTokens: 1,
+            id: "chatcmpl-test",
+            created: 1)
+        let obj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        XCTAssertEqual(obj["object"] as? String, "chat.completion")
+        XCTAssertEqual(obj["model"] as? String, "maple-preview")
+        let choices = obj["choices"] as! [[String: Any]]
+        let msg = choices[0]["message"] as! [String: Any]
+        XCTAssertEqual(msg["role"] as? String, "assistant")
+        XCTAssertEqual(msg["content"] as? String, "pong")
+        XCTAssertEqual(choices[0]["finish_reason"] as? String, "stop")
+        let usage = obj["usage"] as! [String: Any]
+        XCTAssertEqual(usage["total_tokens"] as? Int, 4)
+    }
+}
+

@@ -41,7 +41,26 @@ Verdict:
 - **Correctness**: mlx JSON OK; seedless JSON under xgrammar **not trustworthy**.
 - **Speed**: **not fixed**; short JSON object ≈ 32s on mlx is unacceptable for interactive use.
 
-## Next (if prioritizing)
+## After (same day, this workstream)
 
-1. seedless long decode: profile SWA rotate / prefill mask parity vs mlx (quality).
-2. xgrammar: stateful matcher + sparse allowed-ID extract; wire **logit-argmax** into seedless constrained path (or refuse JSON on seedless until then).
+Fixes landed:
+
+1. **Seedless SWA ring write** — stop in-place `maple_shift_kv` (parallel overwrite race) and `writePos = maxLen-1` every wrapped step. `kvWritePos = offset % maxLen`, `ropePos` stays absolute. Attention is over the last window of slots (RoPE baked at write).
+2. **Ban `<think>` / `<|im_start|>`** when `MOMIJ_ENABLE_THINKING` is off; strip unclosed think instead of leaking the body.
+3. **xgrammar** — stateful matcher (`accept` as prefix grows); **one host copy of logits** then argmax among allowed (mlx previously called GPU `.item()` per allowed id → ~32s).
+4. **seedless constrained** — real forward + logit argmax (lowest-id walk only remains as a unit-test helper).
+
+Re-measure (release, `:8744` mlx / `:8745` seedless, temp=0):
+
+| Case | mlx | seedless |
+|---|---|---|
+| short `OK` | `OK` (2 tok, stop) | `OwOwl` (5 tok, stop) — no think/im_start |
+| med ~643 | `OK` | repetition (“It is a coding agent…”) — **no** `Available.` / im_start |
+| long ~2889 `2+2` | `4.` | `<tool_call>` echo of the user line — **no** `Available.` / im_start |
+| JSON object | **0.58s**, `{"name":": ","ok":true}` | **0.50s**, same shape, **not** `!!!!` |
+| ZQX grammar | 0.01s `ZQX` | 0.06s `ZQX` |
+
+### Verdict
+
+- **B (xgrammar): PASS.** mlx short JSON **32s → 0.58s**; seedless JSON is valid and logit-based.
+- **A (seedless long quality): PARTIAL.** Collapse modes from the remeasure (`Available.` / im_start / empty-after-strip) are gone. mlx-parity answers (`OK` / `4.`) are **not** there yet — seedless sequential Metal prefill still diverges inside the SWA window (~280 tok already garbled with think-on). Next: batched SWA prefill vs mlx, or keep `--backend mlx` for Pi-length until that lands.

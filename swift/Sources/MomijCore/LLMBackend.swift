@@ -17,6 +17,8 @@ public struct GenerateOptions: Sendable {
     public var seed: UInt64? = nil
     /// Finite-string / grammar frontier: allowed next token ids given prefix.
     public var allowedNext: (@Sendable ([Int]) -> Set<Int>)? = nil
+    /// Token ids never sampled (e.g. `<think>` when thinking is disabled).
+    public var bannedTokenIds: [Int] = []
 
     public init(
         maxTokens: Int = 256, temperature: Double = 0, topP: Double = 1,
@@ -24,7 +26,8 @@ public struct GenerateOptions: Sendable {
         repetitionPenalty: Double = 1,
         eosTokenIds: [Int] = [151_645], useSuffixSpec: Bool = false, draftK: Int = 8,
         seed: UInt64? = nil,
-        allowedNext: (@Sendable ([Int]) -> Set<Int>)? = nil
+        allowedNext: (@Sendable ([Int]) -> Set<Int>)? = nil,
+        bannedTokenIds: [Int] = []
     ) {
         self.maxTokens = maxTokens
         self.temperature = temperature
@@ -37,6 +40,7 @@ public struct GenerateOptions: Sendable {
         self.draftK = draftK
         self.seed = seed
         self.allowedNext = allowedNext
+        self.bannedTokenIds = bannedTokenIds
     }
 
     /// Fast SuffixSpec / M-row greedy path is valid only for deterministic greedy.
@@ -80,12 +84,10 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     let eos = options.eosTokenIds.first
                     let tokens: [Int]
                     if let allowedNext = options.allowedNext {
-                        // Finite grammar: walk the frontier (deterministic). Prefer
-                        // continuing tokens over EOS; among ties, lowest id.
-                        tokens = Self.generateConstrained(
-                            maxTokens: options.maxTokens,
-                            eos: eos ?? 151_645,
-                            allowedNext: allowedNext)
+                        tokens = try self.engine.generate(
+                            prompt: prompt, maxTokens: options.maxTokens,
+                            eos: eos, allowedNext: allowedNext,
+                            bannedTokenIds: options.bannedTokenIds)
                     } else if options.isGreedyCompatible {
                         if options.useSuffixSpec {
                             let r = try self.engine.generateSuffixSpec(
@@ -94,7 +96,8 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                             tokens = r.tokens
                         } else {
                             tokens = try self.engine.generate(
-                                prompt: prompt, maxTokens: options.maxTokens, eos: eos)
+                                prompt: prompt, maxTokens: options.maxTokens, eos: eos,
+                                bannedTokenIds: options.bannedTokenIds)
                         }
                     } else {
                         let proc = LogitsProcessor.from(options)
@@ -118,8 +121,8 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         }
     }
 
-    /// Deterministic finite-language walk (no logits). Used when Seedless cannot
-    /// cheaply mask the full vocab; MLX backend prefers score-argmax among allowed.
+    /// Deterministic finite-language walk (no logits). Kept for unit tests of
+    /// frontier order; serve uses `SeedlessDecodeEngine.generate` + logit argmax.
     static func generateConstrained(
         maxTokens: Int,
         eos: Int,
@@ -184,7 +187,8 @@ public final class MapleMLXBackend: LLMBackend, @unchecked Sendable {
                         tokens = self.engine.generate(
                             prompt: prompt, maxTokens: options.maxTokens,
                             eos: options.eosTokenIds.first,
-                            allowedNext: options.allowedNext)
+                            allowedNext: options.allowedNext,
+                            bannedTokenIds: options.bannedTokenIds)
                     }
                     for t in tokens { cont.yield(t) }
                     cont.finish()

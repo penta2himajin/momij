@@ -25,6 +25,10 @@ public enum ChatTemplatePatch {
         return try? String(contentsOf: url, encoding: .utf8)
     }
 
+    public static var bannedAssistantTokenIds: [Int] {
+        enableThinking ? [] : [151_667, 151_644]  // <think>, <|im_start|>
+    }
+
     /// Template string for applyChatTemplate, or nil to use the tokenizer default.
     public static func serveTemplate(modelDir: String) -> String? {
         if enableThinking { return nil }
@@ -34,16 +38,20 @@ public enum ChatTemplatePatch {
     }
 
     /// If thinking is disabled and the model still emitted a think block, keep the
-    /// visible answer only (client content channel).
+    /// visible answer only (client content channel). Unclosed `<think>` is dropped
+    /// rather than leaked as assistant text.
     public static func stripThinkForContent(_ text: String, thinkingEnabled: Bool = enableThinking) -> String {
         guard !thinkingEnabled else { return text }
-        guard let close = text.range(of: "</think>") else {
-            // Unclosed think: drop leading `<think>…` if present.
-            if let open = text.range(of: "<think>") {
-                return String(text[open.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        var s = text
+        while let open = s.range(of: "<think>") {
+            if let close = s.range(of: "</think>", range: open.upperBound..<s.endIndex) {
+                s.removeSubrange(open.lowerBound..<close.upperBound)
+            } else {
+                s = String(s[..<open.lowerBound])
+                break
             }
-            return text
         }
-        return String(text[close.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        s = s.replacingOccurrences(of: "</think>", with: "")
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

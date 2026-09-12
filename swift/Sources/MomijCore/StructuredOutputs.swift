@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 
 /// oMLX-compatible constrained-decoding request fields.
 ///
@@ -207,5 +208,54 @@ public struct FiniteStringGuide: Sendable {
             }
         }
         return bestId
+    }
+}
+
+/// Host-side argmax among a grammar-allowed set. Used by mlx (after one logits
+/// copy) and seedless constrained decode — never per-id GPU `.item()`.
+public enum ConstrainedPick {
+    public static func argmax(allowed: Set<Int>, scores: [Float]) -> Int? {
+        var bestId: Int?
+        var bestScore = -Float.greatestFiniteMagnitude
+        for id in allowed {
+            guard id >= 0, id < scores.count else { continue }
+            let s = scores[id]
+            if s > bestScore {
+                bestScore = s
+                bestId = id
+            }
+        }
+        return bestId
+    }
+
+    public static func applyBanned(_ scores: inout [Float], banned: [Int]) {
+        for id in banned where id >= 0 && id < scores.count {
+            scores[id] = -.infinity
+        }
+    }
+
+    public static func argmaxAll(_ scores: [Float]) -> Int {
+        var bestId = 0
+        var best = -Float.greatestFiniteMagnitude
+        for i in scores.indices where scores[i] > best {
+            best = scores[i]
+            bestId = i
+        }
+        return bestId
+    }
+
+    public static func hostScores(_ logits: MLXArray) -> [Float] {
+        var row = logits
+        while row.ndim > 1 { row = row[0] }
+        let flat = row.asType(.float32)
+        MLX.eval(flat)
+        let n = flat.dim(0)
+        var scores = [Float](repeating: -Float.infinity, count: n)
+        flat.asData(access: .copy).data.withUnsafeBytes { raw in
+            let src = raw.bindMemory(to: Float.self)
+            let m = min(n, raw.count / MemoryLayout<Float>.size)
+            for i in 0 ..< m { scores[i] = src[i] }
+        }
+        return scores
     }
 }

@@ -185,7 +185,8 @@ enum MomijHTTP {
                 useSuffixSpec: ProcessInfo.processInfo.environment["MOMIJ_SUFFIX_SPEC"] == "1"
                     && allowedNext == nil,
                 seed: chatReq.seed,
-                allowedNext: allowedNext
+                allowedNext: allowedNext,
+                bannedTokenIds: ChatTemplatePatch.bannedAssistantTokenIds
             )
             if chatReq.stream {
                 return try await streamSSE(engine: engine, prompt: promptIds, options: opts)

@@ -4,7 +4,7 @@ import MLX
 import MLXFast
 
 /// End-to-end Seedless decode: MLX embed + Metal layers (commit→1wait) + MLX final norm/lm_head.
-/// KV grows with `offset`; SWA layers rotate via `maple_shift_kv`.
+/// KV grows with `offset`; SWA layers ring-write after `slidingWindow`.
 public final class SeedlessDecodeEngine: @unchecked Sendable {
     public let store: WeightStore
     public let config: MapleConfig
@@ -45,6 +45,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     private var specLogitsSlots: [MTLBuffer] = []
     /// Packed final-norm rows for M-row FlashHead (`[maxM, H]`).
     private var specPackedNorm: MTLBuffer?
+    /// Banned ids for the in-flight `generate` (e.g. `<think>` when thinking is off).
+    private var decodeBanned: [Int] = []
 
     public struct PhaseMs: Sendable {
         public var embed = 0.0
@@ -355,17 +357,33 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
 
     private func nextToken() -> Int {
         let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
+        let id: Int
         if useFlashHead, let fh = flashHead {
             if fh.fuseIntoLayerCB {
-                return fh.greedyAfterFusedGather(hostH: ptr)
+                id = fh.greedyAfterFusedGather(hostH: ptr)
+            } else {
+                id = fh.greedyAfterCentroids(hBuf: finalNormBuf, hostH: ptr)
             }
-            return fh.greedyAfterCentroids(hBuf: finalNormBuf, hostH: ptr)
+        } else {
+            let h = MLXArray(UnsafeBufferPointer(start: ptr, count: H)).reshaped([H])
+            let logits = lmHead.apply(h.reshaped([1, 1, H]))
+            let y = MLX.argMax(logits.reshaped([-1]), axis: -1)
+            MLX.eval(y)
+            id = y.item(Int.self)
         }
+        if !decodeBanned.isEmpty && decodeBanned.contains(id) {
+            return nextTokenBannedFallback()
+        }
+        return id
+    }
+
+    private func nextTokenBannedFallback() -> Int {
+        let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
         let h = MLXArray(UnsafeBufferPointer(start: ptr, count: H)).reshaped([H])
         let logits = lmHead.apply(h.reshaped([1, 1, H]))
-        let y = MLX.argMax(logits.reshaped([-1]), axis: -1)
-        MLX.eval(y)
-        return y.item(Int.self)
+        var scores = ConstrainedPick.hostScores(logits)
+        ConstrainedPick.applyBanned(&scores, banned: decodeBanned)
+        return ConstrainedPick.argmaxAll(scores)
     }
 
     private func nextTokenSampled(
@@ -707,7 +725,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     /// One token: embed → Metal layers (+final RMS + FlashHead centroids) → gather/sample.
     /// Updates Token Recycling adjacency from FlashHead candidates when enabled.
     @discardableResult
-    public func step(_ token: Int, profile: Bool = false) throws -> Int {
+    public func step(
+        _ token: Int, profile: Bool = false, skipFlash: Bool = false, allowed: Set<Int>? = nil
+    ) throws -> Int {
         var ph = PhaseMs()
         let t0 = CFAbsoluteTimeGetCurrent()
         embedToken(token)
@@ -716,7 +736,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             SeedlessMetal.encodeRms(
                 into: enc, h: stack.hBuf, w: normWBuf,
                 out: finalNormBuf, H: H, eps: config.rmsNormEps)
-            if let fh = flashHead {
+            if !skipFlash, let fh = flashHead {
                 fh.encodeCentroids(into: enc, h: finalNormBuf)
                 if fh.fuseIntoLayerCB {
                     fh.encodeFusedAfterCentroids(into: enc, h: finalNormBuf)
@@ -724,8 +744,13 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             }
         }
         let t2 = CFAbsoluteTimeGetCurrent()
-        let next = nextToken()
-        observeRecycle(fromToken: token)
+        let next: Int
+        if let allowed {
+            next = nextTokenConstrained(allowed)
+        } else {
+            next = nextToken()
+            observeRecycle(fromToken: token)
+        }
         let t3 = CFAbsoluteTimeGetCurrent()
         if profile {
             ph.embed = (t1 - t0) * 1000
@@ -738,7 +763,25 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         return next
     }
 
-    public func generate(prompt: [Int], maxTokens: Int, eos: Int? = 151_645) throws -> [Int] {
+    private func nextTokenConstrained(_ allowed: Set<Int>) -> Int {
+        var allow = allowed
+        for b in decodeBanned { allow.remove(b) }
+        if allow.isEmpty { return 0 }
+        if allow.count == 1, let only = allow.first { return only }
+        let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
+        let h = MLXArray(UnsafeBufferPointer(start: ptr, count: H)).reshaped([H])
+        let logits = lmHead.apply(h.reshaped([1, 1, H]))
+        let scores = ConstrainedPick.hostScores(logits)
+        return ConstrainedPick.argmax(allowed: allow, scores: scores) ?? allow.first!
+    }
+
+    public func generate(
+        prompt: [Int], maxTokens: Int, eos: Int? = 151_645,
+        allowedNext: (([Int]) -> Set<Int>)? = nil,
+        bannedTokenIds: [Int] = []
+    ) throws -> [Int] {
+        decodeBanned = bannedTokenIds
+        defer { decodeBanned = [] }
         guard !prompt.isEmpty, maxTokens > 0 else { return [] }
         // Full-attn layers need prompt+gen ≤ fullMaxLen. Fail cleanly before Metal encode.
         if prompt.count >= fullMaxLen {
@@ -747,16 +790,19 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         let capped = min(maxTokens, fullMaxLen - prompt.count)
         guard capped > 0 else { return [] }
         reset()
+        let constrain = allowedNext != nil
         var last = prompt[0]
         for i in 0 ..< prompt.count {
             let id = prompt[i]
             if i + 1 < prompt.count {
-                _ = try step(id)
+                _ = try step(id, skipFlash: constrain)
+            } else if constrain, let allowedNext {
+                last = try step(id, skipFlash: true, allowed: allowedNext([]))
             } else {
                 last = try step(id)
             }
         }
-        let chainK = Self.envChainK
+        let chainK = constrain ? 0 : Self.envChainK
         var out: [Int] = []
         var y = last
         while out.count < capped {
@@ -764,6 +810,12 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             if let eos, y == eos { break }
             let remain = capped - out.count
             if remain == 0 { break }
+            if constrain, let allowedNext {
+                let allow = allowedNext(out)
+                if allow.isEmpty { break }
+                y = try step(y, skipFlash: true, allowed: allow)
+                continue
+            }
             if chainK > 1, useFlashHead, flashFused {
                 let n = min(chainK, remain, specMaxM)
                 let toks = try stepGreedyChain(from: y, count: n)

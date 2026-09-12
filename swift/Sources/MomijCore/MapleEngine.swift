@@ -168,11 +168,13 @@ public final class MapleEngine: @unchecked Sendable {
         prompt: [Int],
         maxTokens: Int,
         eos: Int? = 151_645,
-        allowedNext: (([Int]) -> Set<Int>)? = nil
+        allowedNext: (([Int]) -> Set<Int>)? = nil,
+        bannedTokenIds: [Int] = []
     ) -> [Int] {
         guard !prompt.isEmpty, maxTokens > 0 else { return [] }
         let logits0 = forwardLastLogits(prompt, reset: true)
-        var y = pickToken(logits0, prefix: [], allowedNext: allowedNext)
+        var y = pickToken(
+            logits0, prefix: [], allowedNext: allowedNext, banned: bannedTokenIds)
         asyncEval(y)
         var out: [Int] = []
         for i in 0 ..< maxTokens {
@@ -182,7 +184,8 @@ public final class MapleEngine: @unchecked Sendable {
             if let eos, next == eos { break }
             if i + 1 < maxTokens {
                 let logits = stepLogits(y)
-                nextY = pickToken(logits, prefix: out, allowedNext: allowedNext)
+                nextY = pickToken(
+                    logits, prefix: out, allowedNext: allowedNext, banned: bannedTokenIds)
                 asyncEval(nextY!)
             }
             guard let n = nextY else { break }
@@ -194,30 +197,28 @@ public final class MapleEngine: @unchecked Sendable {
     private func pickToken(
         _ logits: MLXArray,
         prefix: [Int],
-        allowedNext: (([Int]) -> Set<Int>)?
+        allowedNext: (([Int]) -> Set<Int>)?,
+        banned: [Int]
     ) -> MLXArray {
-        guard let allowedNext else {
+        if let allowedNext {
+            var allowed = allowedNext(prefix)
+            for b in banned { allowed.remove(b) }
+            guard !allowed.isEmpty else {
+                return MLXArray(Int32(0))
+            }
+            if allowed.count == 1, let only = allowed.first {
+                return MLXArray(Int32(only))
+            }
+            let scores = ConstrainedPick.hostScores(logits[0, 0])
+            let id = ConstrainedPick.argmax(allowed: allowed, scores: scores) ?? allowed.first!
+            return MLXArray(Int32(id))
+        }
+        if banned.isEmpty {
             return MLX.argMax(logits[0, 0], axis: -1)
         }
-        let allowed = allowedNext(prefix)
-        guard !allowed.isEmpty else {
-            // No legal continuation — emit a sentinel zeros vector (caller stops).
-            return MLXArray(Int32(0))
-        }
-        if allowed.count == 1, let only = allowed.first {
-            return MLXArray(Int32(only))
-        }
-        let row = logits[0, 0]
-        var bestId = allowed.first!
-        var bestScore = -Float.greatestFiniteMagnitude
-        for id in allowed {
-            let score = row[id].item(Float.self)
-            if score > bestScore {
-                bestScore = score
-                bestId = id
-            }
-        }
-        return MLXArray(Int32(bestId))
+        var scores = ConstrainedPick.hostScores(logits[0, 0])
+        ConstrainedPick.applyBanned(&scores, banned: banned)
+        return MLXArray(Int32(ConstrainedPick.argmaxAll(scores)))
     }
 
     public func benchmark(promptTokens: Int, genTokens: Int, trials: Int)

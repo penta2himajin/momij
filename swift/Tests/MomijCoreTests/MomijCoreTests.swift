@@ -84,6 +84,20 @@ final class SuffixSpecTests: XCTestCase {
         XCTAssertFalse(SeedlessLayerBlock.canRewind(isSliding: true, offset: 512, maxLen: 512, steps: 1))
     }
 
+    /// After the SWA window fills, write into a ring (offset % maxLen). Never pin
+    /// every decode step at maxLen-1 — that plus in-place shift races the KV.
+    func testSWAWritePosIsRingNotClampedTail() {
+        XCTAssertEqual(SeedlessLayerBlock.kvWritePos(offset: 0, maxLen: 512, isSliding: true), 0)
+        XCTAssertEqual(SeedlessLayerBlock.kvWritePos(offset: 511, maxLen: 512, isSliding: true), 511)
+        XCTAssertEqual(SeedlessLayerBlock.kvWritePos(offset: 512, maxLen: 512, isSliding: true), 0)
+        XCTAssertEqual(SeedlessLayerBlock.kvWritePos(offset: 513, maxLen: 512, isSliding: true), 1)
+        XCTAssertEqual(SeedlessLayerBlock.kvWritePos(offset: 1024, maxLen: 512, isSliding: true), 0)
+        XCTAssertEqual(SeedlessLayerBlock.kvSeqLen(offset: 100, maxLen: 512, isSliding: true), 101)
+        XCTAssertEqual(SeedlessLayerBlock.kvSeqLen(offset: 512, maxLen: 512, isSliding: true), 512)
+        XCTAssertEqual(SeedlessLayerBlock.kvWritePos(offset: 100, maxLen: 2048, isSliding: false), 100)
+        XCTAssertEqual(SeedlessLayerBlock.kvSeqLen(offset: 100, maxLen: 2048, isSliding: false), 101)
+    }
+
     /// MLX SWA cache must keep absolute RoPE offset (oracle RotatingKVCache), not clamp to maxSize.
     func testRotatingKVCacheOffsetStaysAbsolute() {
         let cache = KVCache(maxSize: 8)
@@ -1840,6 +1854,17 @@ final class StructuredOutputsTests: XCTestCase {
             allowedNext: { guide.allowedNext(prefix: $0) })
         XCTAssertEqual(toks, Array("ZQX".utf8.map { Int($0) }) + [7])
     }
+
+    /// Open JSON must not pick the lowest allowed id (`!` is often vocab 0-ish).
+    func testConstrainedPickUsesLogitsNotLowestId() {
+        var scores = [Float](repeating: 0, count: 16)
+        scores[1] = 1   // "!"
+        scores[5] = 9   // e.g. a letter
+        scores[7] = 3
+        let allowed: Set<Int> = [1, 5, 7]
+        XCTAssertEqual(ConstrainedPick.argmax(allowed: allowed, scores: scores), 5)
+        XCTAssertNotEqual(allowed.min(), 5)
+    }
 }
 
 final class SeedlessContextTests: XCTestCase {
@@ -1878,6 +1903,20 @@ final class ChatTemplatePatchTests: XCTestCase {
         XCTAssertEqual(
             ChatTemplatePatch.stripThinkForContent(text, thinkingEnabled: true),
             text)
+    }
+
+    func testBannedAssistantTokensWhenThinkingOff() {
+        XCTAssertTrue(ChatTemplatePatch.bannedAssistantTokenIds.contains(151_667))
+        XCTAssertTrue(ChatTemplatePatch.bannedAssistantTokenIds.contains(151_644))
+    }
+
+    func testStripThinkDropsUnclosedBlock() {
+        XCTAssertEqual(
+            ChatTemplatePatch.stripThinkForContent("<think>\nAvailable. Available.", thinkingEnabled: false),
+            "")
+        XCTAssertEqual(
+            ChatTemplatePatch.stripThinkForContent("ok <think>secret", thinkingEnabled: false),
+            "ok")
     }
 
     func testServeTemplatePatchesMapleJinja() throws {

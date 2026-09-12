@@ -55,16 +55,24 @@ public enum XGrammarTokenizer {
     }
 }
 
-/// Stateful xgrammar matcher → allowed-next token sets (replay prefix each call).
+/// xgrammar matcher → allowed-next token sets.
+///
+/// Keeps one matcher and `accept`s as the generated prefix grows. A diverging
+/// prefix resets and replays. Bitmask scan still visits the vocab, but skips
+/// empty 32-bit words.
 public final class XGrammarTokenGuide: @unchecked Sendable {
     private let compiled: Grammar.Compiled
     private let vocabSize: Int
     private let eosTokenId: Int
+    private var matcher: Grammar.Matcher?
+    private var accepted: [Int] = []
+    private var bitmask: Grammar.Matcher.TokenBitmask
 
     public init(compiled: Grammar.Compiled, vocabSize: Int, eosTokenId: Int) {
         self.compiled = compiled
         self.vocabSize = vocabSize
         self.eosTokenId = eosTokenId
+        self.bitmask = Grammar.Matcher.TokenBitmask(vocabSize: vocabSize)
     }
 
     public static func compileJSONSchema(
@@ -94,18 +102,12 @@ public final class XGrammarTokenGuide: @unchecked Sendable {
     }
 
     public func allowedNext(prefix: [Int]) throws -> Set<Int> {
-        let matcher = try Grammar.Matcher(
-            compiled,
-            stopTokens: [Int32(eosTokenId)],
-            terminatesWithoutStopToken: true)
-        for t in prefix {
-            if matcher.isTerminated { break }
-            _ = matcher.accept(Int32(t))
-        }
+        try syncMatcher(to: prefix)
+        guard let matcher else { return [eosTokenId] }
         if matcher.isTerminated {
             return [eosTokenId]
         }
-        var bitmask = Grammar.Matcher.TokenBitmask(vocabSize: vocabSize)
+        bitmask.reset()
         _ = matcher.fillNextTokenBitmask(&bitmask)
         var allowed = Set<Int>()
         allowed.reserveCapacity(64)
@@ -116,5 +118,33 @@ public final class XGrammarTokenGuide: @unchecked Sendable {
             allowed.insert(eosTokenId)
         }
         return allowed
+    }
+
+    private func syncMatcher(to prefix: [Int]) throws {
+        if matcher == nil {
+            matcher = try Grammar.Matcher(
+                compiled,
+                stopTokens: [Int32(eosTokenId)],
+                terminatesWithoutStopToken: true)
+            accepted = []
+        }
+        if prefix == accepted { return }
+        if prefix.count > accepted.count,
+           prefix.starts(with: accepted)
+        {
+            for t in prefix[accepted.count...] {
+                if matcher?.isTerminated == true { break }
+                _ = matcher?.accept(Int32(t))
+            }
+            accepted = prefix
+            return
+        }
+        matcher?.reset()
+        accepted = []
+        for t in prefix {
+            if matcher?.isTerminated == true { break }
+            _ = matcher?.accept(Int32(t))
+        }
+        accepted = prefix
     }
 }

@@ -781,8 +781,46 @@ drops `attnOut` + `resid_add`. Parity rel_l2 < 1e-5. L0 unchanged.
 
 † second default run had head 0.275 ms (stall). Fair pair is 195.3 vs 196.7
 (~+1 tok/s, ~0.04 ms/tok on layers). Default **on**; `MOMIJ_FUSE_O_RESID=0`
-restores the write+add. WriteKV pair / rms+gate not pursued — smaller than
-this and up-Ktop already showed occupancy can erase a dispatch win.
+restores the write+add.
+
+### 2026-09-12 writeKV pair + encode-vs-GPU (ICB gate)
+
+**CPU encode vs GPU** (`layersPerCB=4`, 6 CBs, pos=32, 8 iters, release):
+
+| Mode | encode | gpu_sum | gpu_span | wall | encode/gpu |
+|---|---|---|---|---|---|
+| piped | 0.253 ms | 4.573 | 4.718 | 5.155 | **0.06** |
+| wait-each | 0.229 ms | 4.823 | 6.474 | 6.828 | 0.05 |
+
+ICB / pre-encode would need encode/gpu ≳ 0.2. Encode is already hidden behind GPU
+fill (`layersPerCB=4` + overlap). Skip ICB.
+
+**rms+gate**: `xNorm` is the up-gqmm2 LHS, so a fused kernel still writes H or
+recomputes RMS in each of E=256 gate TGs. Not pursued.
+
+**writeKV pair** (`maple_write_kv_pair`, `MOMIJ_FUSE_WRITEKV=0` restores two
+copies): same indexing as two `maple_write_kv` dispatches, one grid. Parity
+`testWriteKVPairMatchesTwoWrites` rel_l2 < 1e-5. L0 vs MLX unchanged at
+`1.9291e-4`.
+
+First A/B (fans not 100%) looked like +8 tok/s; that was a head stall on `=0`.
+Remeasured fans max, omlx stop, mlx.metallib colocated, p128/g64 n=3
+interleaved (warmup then A/B):
+
+| Path | tok/s | layers | head |
+|---|---|---|---|
+| pair warmup | 173.9 | 5.58 | 0.163 |
+| two-dispatch (1) | 159.2† | 5.95 | 0.322 |
+| pair (1) | 162.0† | 5.88 | 0.287 |
+| two-dispatch (2) | 173.0 | 5.65 | 0.123 |
+| pair (2) | **174.3** | 5.60 | 0.134 |
+
+† head stall. Healthy pair is **173.9 / 174.3 vs 173.0** (~+1 tok/s, ~0.07 ms
+on layers) — same class as o-resid. Absolute band today is ~174, not the
+morning ~196 (layers 5.6 vs 4.96); fan switch did not close that gap.
+Default **on** (one fewer dispatch, no occupancy loss). `=0` restores two
+`maple_write_kv`. Encode-vs-GPU after fans max: piped encode=0.208 ms,
+gpu_sum=4.543, encode/gpu=**0.05** — ICB still skip.
 
 ## Baseline (oracle / mlx-lm-deepgrove)
 

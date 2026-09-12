@@ -1356,6 +1356,68 @@ final class SeedlessAttnEncodeTests: XCTestCase {
         XCTAssertTrue(attnOut.contents().bindMemory(to: Float16.self, capacity: 1)[0].isFinite)
     }
 
+    /// Two `maple_write_kv` dispatches ≡ one `maple_write_kv_pair`.
+    func testWriteKVPairMatchesTwoWrites() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let KV = 4, D = 128, maxLen = 16, pos = 3, M = 2
+        let kvDim = KV * D
+        func buf(_ n: Int) -> MTLBuffer {
+            device.makeBuffer(length: n * 2, options: .storageModeShared)!
+        }
+        func fill(_ b: MTLBuffer, _ n: Int, _ seed: Int) {
+            let p = b.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = Float16(Float((i * seed) % 50) * 0.01 - 0.2) }
+        }
+        let kSrc = buf(M * kvDim); fill(kSrc, M * kvDim, 13)
+        let vSrc = buf(M * kvDim); fill(vSrc, M * kvDim, 17)
+        let kA = buf(KV * maxLen * D); let vA = buf(KV * maxLen * D)
+        let kB = buf(KV * maxLen * D); let vB = buf(KV * maxLen * D)
+        func zero(_ b: MTLBuffer) {
+            let n = b.length / 2
+            let p = b.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = 0 }
+        }
+        zero(kA); zero(vA); zero(kB); zero(vB)
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        SeedlessMetal.encodeWriteKV(
+            into: enc, src: kSrc, cache: kA, srcOffset: 0,
+            KV: KV, D: D, maxLen: maxLen, pos: pos, M: M,
+            srcHeadStride: D, srcSeqStride: kvDim)
+        SeedlessMetal.encodeWriteKV(
+            into: enc, src: vSrc, cache: vA, srcOffset: 0,
+            KV: KV, D: D, maxLen: maxLen, pos: pos, M: M,
+            srcHeadStride: D, srcSeqStride: kvDim)
+        SeedlessMetal.encodeWriteKVPair(
+            into: enc, kSrc: kSrc, vSrc: vSrc, kCache: kB, vCache: vB,
+            kSrcOffset: 0, vSrcOffset: 0,
+            KV: KV, D: D, maxLen: maxLen, pos: pos, M: M,
+            kHeadStride: D, kSeqStride: kvDim,
+            vHeadStride: D, vSeqStride: kvDim)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let n = KV * maxLen * D
+        func rel(_ a: MTLBuffer, _ b: MTLBuffer) -> Double {
+            let ap = a.contents().bindMemory(to: Float16.self, capacity: n)
+            let bp = b.contents().bindMemory(to: Float16.self, capacity: n)
+            var num = 0.0, den = 0.0
+            for i in 0 ..< n {
+                let d = Float(ap[i]) - Float(bp[i])
+                num += Double(d * d)
+                den += Double(Float(ap[i]) * Float(ap[i]))
+            }
+            return sqrt(num / max(den, 1e-30))
+        }
+        XCTAssertLessThan(rel(kA, kB), 1e-5)
+        XCTAssertLessThan(rel(vA, vB), 1e-5)
+    }
+
     /// Batched SDPA M=2 (shared KV) must match two sequential M=1 queries.
     func testSdpaMrowMatchesSequential() throws {
         try SeedlessMetal.ensureCompiled()

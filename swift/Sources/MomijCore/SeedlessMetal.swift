@@ -17,6 +17,7 @@ import MLX
 /// `MOMIJ_FUSE_DOWN_SCORE=0` restores down gather + `score_resid` (Ktop loop in-TG is default).
 /// `MOMIJ_FUSE_UP_KTOP=1` loops Ktop in the fold up+SwiGLU TG (packed e2e regress; opt-in).
 /// `MOMIJ_FUSE_O_RESID=0` restores o-proj write + `resid_add` (fold-add into `h` is default).
+/// `MOMIJ_FUSE_WRITEKV=0` restores two `maple_write_kv` dispatches (K then V).
 /// `gqmm2_rows_vec` (vectorized loads) and `gqmm2_rows_pf` measured packed-CB regress — not shipped.
 public enum SeedlessMetal {
     nonisolated(unsafe) static var device: MTLDevice?
@@ -49,6 +50,7 @@ public enum SeedlessMetal {
     nonisolated(unsafe) static var routeTop8Pipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var qkNormRopePipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var writeKVPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var writeKVPairPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var shiftKVPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var sdpaPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var embedTokenPipeline: MTLComputePipelineState?
@@ -88,6 +90,7 @@ public enum SeedlessMetal {
         routeTop8Pipeline = try pipe("maple_route_top8")
         qkNormRopePipeline = try pipe("maple_qk_norm_rope")
         writeKVPipeline = try pipe("maple_write_kv")
+        writeKVPairPipeline = try pipe("maple_write_kv_pair")
         shiftKVPipeline = try pipe("maple_shift_kv")
         sdpaPipeline = try pipe("maple_sdpa_d128")
         embedTokenPipeline = try pipe("maple_embed_token")
@@ -169,6 +172,13 @@ public enum SeedlessMetal {
     /// `MOMIJ_FUSE_O_RESID=0` restores o-proj write + `resid_add`.
     public static var fuseOResid: Bool {
         guard let raw = getenv("MOMIJ_FUSE_O_RESID") else { return true }
+        return String(cString: raw) != "0"
+    }
+
+    /// Write K and V caches in one kernel. Default on.
+    /// `MOMIJ_FUSE_WRITEKV=0` restores two `maple_write_kv` dispatches.
+    public static var fuseWriteKV: Bool {
+        guard let raw = getenv("MOMIJ_FUSE_WRITEKV") else { return true }
         return String(cString: raw) != "0"
     }
 
@@ -561,6 +571,8 @@ public enum SeedlessMetal {
         else { throw SeedlessError.notReady }
         guard M >= 1 else { throw SeedlessError.unsupportedShape(N: H, K: I, gs: gs) }
 
+        // rms then gate stay separate: xNorm is also the up-gqmm2 LHS, so a fused
+        // rms+gate kernel would still write H and/or recompute RMS in each of E TGs.
         encodeRms(into: enc, h: h, w: normW, out: xNorm, H: H, eps: eps, M: M)
         encodeGate(into: enc, w: gateW, x: xNorm, y: logits, E: E, H: H, M: M)
         encodeRoute(into: enc, logits: logits, inds: inds, scores: scores, E: E, Ktop: Ktop, M: M)
@@ -786,6 +798,62 @@ public enum SeedlessMetal {
             threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
     }
 
+    /// Copy one KV cache slot from `src` (token-major head layout).
+    static func encodeWriteKV(
+        into enc: MTLComputeCommandEncoder,
+        src: MTLBuffer, cache: MTLBuffer, srcOffset: Int,
+        KV: Int, D: Int, maxLen: Int, pos: Int, M: Int,
+        srcHeadStride: Int, srcSeqStride: Int
+    ) {
+        enc.setComputePipelineState(writeKVPipeline!)
+        enc.setBuffer(src, offset: srcOffset, index: 0)
+        enc.setBuffer(cache, offset: 0, index: 1)
+        var kv32 = Int32(KV), d32 = Int32(D), ml32 = Int32(maxLen), p32 = Int32(pos)
+        var m32 = Int32(M), hs = Int32(srcHeadStride), ss = Int32(srcSeqStride)
+        enc.setBytes(&kv32, length: 4, index: 2)
+        enc.setBytes(&d32, length: 4, index: 3)
+        enc.setBytes(&ml32, length: 4, index: 4)
+        enc.setBytes(&p32, length: 4, index: 5)
+        enc.setBytes(&m32, length: 4, index: 6)
+        enc.setBytes(&hs, length: 4, index: 7)
+        enc.setBytes(&ss, length: 4, index: 8)
+        let n = KV * D
+        enc.dispatchThreads(MTLSize(width: n, height: M, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(256, n), height: 1, depth: 1))
+    }
+
+    /// Copy K and V cache slots in one dispatch.
+    static func encodeWriteKVPair(
+        into enc: MTLComputeCommandEncoder,
+        kSrc: MTLBuffer, vSrc: MTLBuffer, kCache: MTLBuffer, vCache: MTLBuffer,
+        kSrcOffset: Int, vSrcOffset: Int,
+        KV: Int, D: Int, maxLen: Int, pos: Int, M: Int,
+        kHeadStride: Int, kSeqStride: Int,
+        vHeadStride: Int, vSeqStride: Int
+    ) {
+        enc.setComputePipelineState(writeKVPairPipeline!)
+        enc.setBuffer(kSrc, offset: kSrcOffset, index: 0)
+        enc.setBuffer(vSrc, offset: vSrcOffset, index: 1)
+        enc.setBuffer(kCache, offset: 0, index: 2)
+        enc.setBuffer(vCache, offset: 0, index: 3)
+        var kv32 = Int32(KV), d32 = Int32(D), ml32 = Int32(maxLen), p32 = Int32(pos)
+        var m32 = Int32(M)
+        var khs = Int32(kHeadStride), kss = Int32(kSeqStride)
+        var vhs = Int32(vHeadStride), vss = Int32(vSeqStride)
+        enc.setBytes(&kv32, length: 4, index: 4)
+        enc.setBytes(&d32, length: 4, index: 5)
+        enc.setBytes(&ml32, length: 4, index: 6)
+        enc.setBytes(&p32, length: 4, index: 7)
+        enc.setBytes(&m32, length: 4, index: 8)
+        enc.setBytes(&khs, length: 4, index: 9)
+        enc.setBytes(&kss, length: 4, index: 10)
+        enc.setBytes(&vhs, length: 4, index: 11)
+        enc.setBytes(&vss, length: 4, index: 12)
+        let n = KV * D
+        enc.dispatchThreads(MTLSize(width: n, height: M, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(256, n), height: 1, depth: 1))
+    }
+
     /// Decode attn body. `ropePos` / `writePos` / `seqLen` are for token 0;
     /// `M>1` uses RoPE `pos+m`, writes cache slots `writePos+m`, and causal SDPA
     /// (`N = seqLen + m`). Decode still calls this with `M=1`. `rotateFirst` is M=1 only.
@@ -803,8 +871,10 @@ public enum SeedlessMetal {
         residInto: MTLBuffer? = nil
     ) throws {
         try ensureCompiled()
-        guard let qkPipe = qkNormRopePipeline, let writeKV = writeKVPipeline, sdpaPipeline != nil
+        guard qkNormRopePipeline != nil, writeKVPipeline != nil, writeKVPairPipeline != nil,
+              sdpaPipeline != nil
         else { throw SeedlessError.notReady }
+        let qkPipe = qkNormRopePipeline!
         guard M >= 1 else { throw SeedlessError.unsupportedShape(N: H, K: H, gs: gs) }
         if rotateFirst && M > 1 {
             throw SeedlessError.unsupportedShape(N: H, K: H, gs: gs)
@@ -850,33 +920,24 @@ public enum SeedlessMetal {
         enc.dispatchThreadgroups(MTLSize(width: 1, height: nQK, depth: M),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
-        var kv32 = Int32(numKV), d32 = Int32(headDim), ml32 = Int32(maxLen), p32 = Int32(writePos)
-        var srcHS = Int32(headDim), srcSSK = Int32(kvDim), srcSSV = Int32(qkvN)
-        enc.setComputePipelineState(writeKV)
-        enc.setBuffer(qkOut, offset: qDim * M * 2, index: 0)
-        enc.setBuffer(kCache, offset: 0, index: 1)
-        enc.setBytes(&kv32, length: 4, index: 2)
-        enc.setBytes(&d32, length: 4, index: 3)
-        enc.setBytes(&ml32, length: 4, index: 4)
-        enc.setBytes(&p32, length: 4, index: 5)
-        enc.setBytes(&m32, length: 4, index: 6)
-        enc.setBytes(&srcHS, length: 4, index: 7)
-        enc.setBytes(&srcSSK, length: 4, index: 8)
-        enc.dispatchThreads(MTLSize(width: kvDim, height: M, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: min(256, kvDim), height: 1, depth: 1))
-
-        enc.setComputePipelineState(writeKV)
-        enc.setBuffer(qkvOut, offset: (qDim + kvDim) * 2, index: 0)
-        enc.setBuffer(vCache, offset: 0, index: 1)
-        enc.setBytes(&kv32, length: 4, index: 2)
-        enc.setBytes(&d32, length: 4, index: 3)
-        enc.setBytes(&ml32, length: 4, index: 4)
-        enc.setBytes(&p32, length: 4, index: 5)
-        enc.setBytes(&m32, length: 4, index: 6)
-        enc.setBytes(&srcHS, length: 4, index: 7)
-        enc.setBytes(&srcSSV, length: 4, index: 8)
-        enc.dispatchThreads(MTLSize(width: kvDim, height: M, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: min(256, kvDim), height: 1, depth: 1))
+        if fuseWriteKV {
+            encodeWriteKVPair(
+                into: enc,
+                kSrc: qkOut, vSrc: qkvOut, kCache: kCache, vCache: vCache,
+                kSrcOffset: qDim * M * 2, vSrcOffset: (qDim + kvDim) * 2,
+                KV: numKV, D: headDim, maxLen: maxLen, pos: writePos, M: M,
+                kHeadStride: headDim, kSeqStride: kvDim,
+                vHeadStride: headDim, vSeqStride: qkvN)
+        } else {
+            encodeWriteKV(
+                into: enc, src: qkOut, cache: kCache, srcOffset: qDim * M * 2,
+                KV: numKV, D: headDim, maxLen: maxLen, pos: writePos, M: M,
+                srcHeadStride: headDim, srcSeqStride: kvDim)
+            encodeWriteKV(
+                into: enc, src: qkvOut, cache: vCache, srcOffset: (qDim + kvDim) * 2,
+                KV: numKV, D: headDim, maxLen: maxLen, pos: writePos, M: M,
+                srcHeadStride: headDim, srcSeqStride: qkvN)
+        }
 
         encodeSdpa(
             into: enc, queries: qkOut, kCache: kCache, vCache: vCache, out: attnTmp,
@@ -1674,6 +1735,58 @@ public enum SeedlessMetal {
             )
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// GPU-timed K/V cache write: two `maple_write_kv` vs one `maple_write_kv_pair`.
+    public static func benchWriteKV(
+        KV: Int = 4, D: Int = 128, maxLen: Int = 512, M: Int = 1, pos: Int = 32, iters: Int = 200
+    ) throws -> String {
+        try ensureCompiled()
+        guard let device else { throw SeedlessError.notReady }
+        let kvDim = KV * D
+        func fillX(_ buf: MTLBuffer, n: Int) {
+            let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
+            for i in 0 ..< n { p[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+        }
+        let kSrc = device.makeBuffer(length: M * kvDim * 2, options: .storageModeShared)!
+        let vSrc = device.makeBuffer(length: M * kvDim * 2, options: .storageModeShared)!
+        fillX(kSrc, n: M * kvDim)
+        fillX(vSrc, n: M * kvDim)
+        let kA = device.makeBuffer(length: KV * maxLen * D * 2, options: .storageModeShared)!
+        let vA = device.makeBuffer(length: KV * maxLen * D * 2, options: .storageModeShared)!
+        let kB = device.makeBuffer(length: KV * maxLen * D * 2, options: .storageModeShared)!
+        let vB = device.makeBuffer(length: KV * maxLen * D * 2, options: .storageModeShared)!
+        func avg(_ body: (MTLComputeCommandEncoder) -> Void) throws -> Double {
+            var gpu = 0.0
+            for _ in 0 ..< 8 {
+                _ = try timeCB { enc in body(enc) }
+            }
+            for _ in 0 ..< iters {
+                gpu += try timeCB { enc in body(enc) }.gpuMs
+            }
+            return gpu / Double(iters)
+        }
+        let two = try avg { enc in
+            encodeWriteKV(
+                into: enc, src: kSrc, cache: kA, srcOffset: 0,
+                KV: KV, D: D, maxLen: maxLen, pos: pos, M: M,
+                srcHeadStride: D, srcSeqStride: kvDim)
+            encodeWriteKV(
+                into: enc, src: vSrc, cache: vA, srcOffset: 0,
+                KV: KV, D: D, maxLen: maxLen, pos: pos, M: M,
+                srcHeadStride: D, srcSeqStride: kvDim)
+        }
+        let pair = try avg { enc in
+            encodeWriteKVPair(
+                into: enc, kSrc: kSrc, vSrc: vSrc, kCache: kB, vCache: vB,
+                kSrcOffset: 0, vSrcOffset: 0,
+                KV: KV, D: D, maxLen: maxLen, pos: pos, M: M,
+                kHeadStride: D, kSeqStride: kvDim,
+                vHeadStride: D, vSeqStride: kvDim)
+        }
+        return String(
+            format: "writeKV two-dispatch=%.4f ms  pair=%.4f ms  (KV=%d D=%d M=%d)",
+            two, pair, KV, D, M)
     }
 
     /// GPU-timed full MoE block M-row (rms + gate + route + fused expert + resid).
@@ -2694,6 +2807,33 @@ public enum SeedlessMetal {
         uint h = i / (uint)D, d = i % (uint)D;
         half v = src[(size_t)h * (size_t)srcHeadStride + (size_t)m * (size_t)srcSeqStride + d];
         cache[(size_t)h * (size_t)maxLen * (size_t)D + (size_t)(pos + (int)m) * (size_t)D + d] = v;
+    }
+
+    kernel void maple_write_kv_pair(
+        device const half* ksrc [[buffer(0)]],
+        device const half* vsrc [[buffer(1)]],
+        device half* kcache     [[buffer(2)]],
+        device half* vcache     [[buffer(3)]],
+        constant int& KV        [[buffer(4)]],
+        constant int& D         [[buffer(5)]],
+        constant int& maxLen    [[buffer(6)]],
+        constant int& pos       [[buffer(7)]],
+        constant int& M         [[buffer(8)]],
+        constant int& kHeadStride [[buffer(9)]],
+        constant int& kSeqStride  [[buffer(10)]],
+        constant int& vHeadStride [[buffer(11)]],
+        constant int& vSeqStride  [[buffer(12)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        uint i = gid.x, m = gid.y;
+        if (i >= (uint)(KV * D) || m >= (uint)M) return;
+        uint h = i / (uint)D, d = i % (uint)D;
+        half kv = ksrc[(size_t)h * (size_t)kHeadStride + (size_t)m * (size_t)kSeqStride + d];
+        half vv = vsrc[(size_t)h * (size_t)vHeadStride + (size_t)m * (size_t)vSeqStride + d];
+        size_t dst = (size_t)h * (size_t)maxLen * (size_t)D
+                   + (size_t)(pos + (int)m) * (size_t)D + d;
+        kcache[dst] = kv;
+        vcache[dst] = vv;
     }
 
     // Drop oldest token: cache[h, s, :] <- cache[h, s+1, :] for s in 0..maxLen-2.

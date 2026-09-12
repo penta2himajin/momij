@@ -403,6 +403,81 @@ public final class SeedlessLayerStack {
         return last
     }
 
+    /// CPU encode vs GPU fill for `layersPerCB` command buffers (ICB gate).
+    public func profileEncodeVsGpu(layersPerCB: Int = 4, iters: Int = 8, pos: Int = 32) throws -> String {
+        guard let q = SeedlessMetal.queue else { throw SeedlessError.notReady }
+        let g = max(1, layersPerCB)
+        // Warm: fill the GPU so later timings are not first-dispatch noise.
+        for _ in 0 ..< 2 {
+            fillH(0.01)
+            resetCaches()
+            _ = try SeedlessMetal.timeCB { enc in
+                try layers[0].encode(into: enc, at: pos)
+            }
+        }
+
+        func run(waitEach: Bool) throws -> (encode: Double, gpu: Double, span: Double, wall: Double) {
+            var encodeSum = 0.0, gpuSum = 0.0, spanSum = 0.0, wallSum = 0.0
+            for _ in 0 ..< iters {
+                fillH(0.01)
+                resetCaches()
+                let t0 = CFAbsoluteTimeGetCurrent()
+                var cbs: [MTLCommandBuffer] = []
+                var encodeMs = 0.0
+                var i = 0
+                while i < layers.count {
+                    let te = CFAbsoluteTimeGetCurrent()
+                    let cb = q.makeCommandBuffer()!
+                    let enc = cb.makeComputeCommandEncoder()!
+                    let end = min(i + g, layers.count)
+                    for j in i ..< end {
+                        try layers[j].encode(into: enc, at: pos)
+                    }
+                    enc.endEncoding()
+                    encodeMs += (CFAbsoluteTimeGetCurrent() - te) * 1000
+                    cb.commit()
+                    if waitEach { cb.waitUntilCompleted() }
+                    cbs.append(cb)
+                    i = end
+                }
+                cbs.last?.waitUntilCompleted()
+                wallSum += (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                encodeSum += encodeMs
+                gpuSum += cbs.reduce(0.0) { $0 + max(0, ($1.gpuEndTime - $1.gpuStartTime) * 1000) }
+                if let f = cbs.first, let l = cbs.last, f.gpuStartTime > 0, l.gpuEndTime > f.gpuStartTime {
+                    spanSum += (l.gpuEndTime - f.gpuStartTime) * 1000
+                }
+            }
+            let n = Double(iters)
+            return (encodeSum / n, gpuSum / n, spanSum / n, wallSum / n)
+        }
+
+        let piped = try run(waitEach: false)
+        let isolated = try run(waitEach: true)
+        let nCB = (layers.count + g - 1) / g
+        func row(_ name: String, _ t: (encode: Double, gpu: Double, span: Double, wall: Double)) -> String {
+            String(
+                format: "  %-10@ encode=%.3f ms  gpu_sum=%.3f  gpu_span=%.3f  wall=%.3f  encode/gpu=%.2f",
+                name as NSString, t.encode, t.gpu, t.span, t.wall, t.encode / max(t.gpu, 1e-9))
+        }
+        return """
+        seedless encode vs GPU (layersPerCB=\(g), \(nCB) CBs, pos=\(pos), \(iters) iters)
+        \(row("piped", piped))
+        \(row("wait-each", isolated))
+        note: ICB only helps if CPU encode is a large fraction of GPU fill (encode/gpu ≳ 0.2 piped).
+        """
+    }
+
+    public static func profileEncodeVsGpu(
+        store: WeightStore, layersPerCB: Int = 4, iters: Int = 8, pos: Int = 32
+    ) throws -> String {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device else { throw SeedlessError.notReady }
+        fputs("[momij] encode-vs-gpu profile: loading layers…\n", stderr)
+        let stack = try SeedlessLayerStack(store: store, device: device)
+        return try stack.profileEncodeVsGpu(layersPerCB: layersPerCB, iters: iters, pos: pos)
+    }
+
     /// Host-side KV + offset snapshot for SuffixSpec reject rollback.
     /// `offsetOnly`: rewind `offset` without copying caches (append-only chains).
     public struct CacheSnapshot {

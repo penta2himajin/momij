@@ -109,6 +109,9 @@ struct MomijMain {
                 print(String(format: "  phase_ms/tok embed=%.3f layers=%.3f head=%.3f  (sum=%.3f)",
                              ph.embed, ph.layers, ph.head,
                              ph.embed + ph.layers + ph.head))
+                if has(args, "--profile-encode") {
+                    print(try eng.stack.profileEncodeVsGpu(layersPerCB: eng.layersPerCB))
+                }
                 if let rel = try? SeedlessDecodeEngine.parityL0(store: store) {
                     print(String(format: "  parity L0 rel_l2=%.4e", rel))
                 }
@@ -137,6 +140,7 @@ struct MomijMain {
         print(try SeedlessMetal.benchFusedExpertMrow(iters: 20))
         print(try SeedlessMetal.benchAttnMrow(iters: 20))
         print(try SeedlessMetal.benchAttnBlockMrow(iters: 20))
+        print(try SeedlessMetal.benchWriteKV(iters: 200))
         print(try SeedlessMetal.benchMoEBlockMrow(iters: 20))
         print(try SeedlessMetal.benchLayerMrowConfigs(iters: 8))
         if FileManager.default.fileExists(atPath: model) {
@@ -157,6 +161,9 @@ struct MomijMain {
                 }
                 if has(args, "--profile-floor") {
                     print(try SeedlessEngine.profileDecodeFloor(store: store, iters: 16))
+                }
+                if has(args, "--profile-encode") {
+                    print(try SeedlessLayerStack.profileEncodeVsGpu(store: store, layersPerCB: 4))
                 }
                 if has(args, "--sweep-cb") {
                     print(try SeedlessDecodeEngine.sweepLayersPerCB(store: store, prompt: 64, gen: 64))

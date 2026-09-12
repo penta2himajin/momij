@@ -996,6 +996,77 @@ final class SeedlessMetalTests: XCTestCase {
         XCTAssertLessThan(sqrt(num / max(den, 1e-30)), 1e-5)
     }
 
+    /// Down gather + `score_resid` ≡ `gqmm2` fold-score epilogue into `h`.
+    func testDownScoreResidMatchesGqmm2ThenAdd() throws {
+        try SeedlessMetal.ensureCompiled()
+        guard let device = SeedlessMetal.device, let q = SeedlessMetal.queue else {
+            throw XCTSkip("no Metal device")
+        }
+        let H = 512, I = 512, E = 8, Ktop = 2, M = 2, gs = 128
+        func buf(_ bytes: Int) -> MTLBuffer {
+            device.makeBuffer(length: bytes, options: .storageModeShared)!
+        }
+        let packedI = I * 2 / 32
+        let nGI = I / gs
+        let act = buf(M * Ktop * I * 2)
+        let ap = act.contents().bindMemory(to: Float16.self, capacity: M * Ktop * I)
+        for i in 0 ..< (M * Ktop * I) { ap[i] = Float16((Float(i % 17) - 8.0) * 0.01) }
+        let w = buf(E * H * packedI * 4)
+        let wp = w.contents().bindMemory(to: UInt8.self, capacity: E * H * packedI * 4)
+        for i in 0 ..< (E * H * packedI * 4) { wp[i] = UInt8((i * 17 + 3) & 0xff) }
+        let s = buf(E * H * nGI * 2)
+        let b = buf(E * H * nGI * 2)
+        let sp = s.contents().bindMemory(to: Float16.self, capacity: E * H * nGI)
+        let bp = b.contents().bindMemory(to: Float16.self, capacity: E * H * nGI)
+        for i in 0 ..< (E * H * nGI) {
+            sp[i] = 0.02
+            bp[i] = -0.02
+        }
+        let inds = buf(M * Ktop * 4)
+        let scores = buf(M * Ktop * 4)
+        let ip = inds.contents().bindMemory(to: Int32.self, capacity: M * Ktop)
+        let scp = scores.contents().bindMemory(to: Float.self, capacity: M * Ktop)
+        ip[0] = 1; ip[1] = 3; ip[2] = 2; ip[3] = 5
+        for i in 0 ..< (M * Ktop) { scp[i] = Float((i % 7) + 1) / 28.0 }
+        let down = buf(M * Ktop * H * 2)
+        let hA = buf(M * H * 2)
+        let hB = buf(M * H * 2)
+        let ha = hA.contents().bindMemory(to: Float16.self, capacity: M * H)
+        let hb = hB.contents().bindMemory(to: Float16.self, capacity: M * H)
+        for i in 0 ..< (M * H) {
+            let v = Float16(Float(i % 11) * 0.03)
+            ha[i] = v
+            hb[i] = v
+        }
+
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        try SeedlessMetal.gqmm2(
+            x: act, w: w, scales: s, biases: b, inds: inds, out: down,
+            Ktop: Ktop, K: I, N: H, gs: gs, lhsPerExpert: true, M: M,
+            into: enc, splitK: false, w16: false, ternary: false, fold: true,
+            deferA: false, foldA: false)
+        SeedlessMetal.encodeScoreResid(
+            into: enc, down: down, scores: scores, h: hA, H: H, Ktop: Ktop, M: M)
+        try SeedlessMetal.encodeGqmm2DownScoreResid(
+            into: enc, x: act, w: w, scales: s, biases: b,
+            inds: inds, scores: scores, h: hB,
+            Ktop: Ktop, K: I, N: H, gs: gs, M: M)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        var num = 0.0, den = 0.0
+        var maxAbs: Float = 0
+        for i in 0 ..< (M * H) {
+            let d = abs(Float(ha[i]) - Float(hb[i]))
+            maxAbs = max(maxAbs, d)
+            num += Double(d * d)
+            den += Double(Float(ha[i]) * Float(ha[i]))
+        }
+        XCTAssertLessThan(sqrt(num / max(den, 1e-30)), 1e-5, "maxAbs=\(maxAbs)")
+    }
+
     /// Batched MoE block M=2 must match two sequential M=1 steps.
     func testMoEBlockMrowMatchesSequential() throws {
         try SeedlessMetal.ensureCompiled()

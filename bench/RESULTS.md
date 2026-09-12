@@ -733,8 +733,7 @@ favored unfused (2359 vs 2314 blocks/s) — ignore vs packed CB.
 
 Scratch overlay does **not** cut traffic: `ug` rows are stride `2I`, so
 in-place SwiGLU cannot feed down without an x-stride change. `ugOut` and
-`downOut` are not live together (alias = RAM only). Next real traffic cut
-would fold scores into the down-gqmm2 epilogue.
+`downOut` are not live together (alias = RAM only).
 
 Qwisp `gqmm2_rows` vs momij: same `tid.z = M·Ktop`, same 8 rows/TG, same 2-bit
 packing. Remaining delta tried: TG shape `(32,2)` vs momij `(64,1)`
@@ -743,6 +742,26 @@ packing. Remaining delta tried: TG shape `(32,2)` vs momij `(64,1)`
 Warm p128/g64 n=3 interleaved: default **185.7** / TG2D **185.2** then **183.5**.
 Wash — keep `TG2D` opt-in **off**. ALU/packing rewrites already lost; this
 was the last cheap grid-shape delta.
+
+### 2026-09-12 down-gqmm2 score fold (`gqmm2_rows_fold_score`)
+
+Loop Ktop inside the down-fold TG (`tid.z = m`, not `m·Ktop`) and add
+`half(Σ_k half(down_k)·score_k)` into `h`. Drops `downOut` (~32KB) and the
+`score_resid` dispatch. Two-kernel rounding preserved.
+
+Parity: `testDownScoreResidMatchesGqmm2ThenAdd` rel_l2 < 1e-5. L0 vs MLX
+unchanged at `1.9291e-4`. MoE M-row still passes with the fold on.
+
+Release, omlx stop, mlx.metallib colocated, p128/g64 (warm n=3, interleaved):
+
+| Path | tok/s | layers ms/tok |
+|---|---|---|
+| down-score fold | **193.9 / 195.7** | 5.02 / 4.98 |
+| `MOMIJ_FUSE_DOWN_SCORE=0` | 182.2 / 188.5 | 5.26 / 5.18 |
+
+Packed e2e win (~+7 tok/s vs warm baseline, ~0.2 ms/tok on layers). Default
+**on**; `=0` restores down gather + `score_resid`. Serializing 8 expert GEMVs
+in one TG (256 vs 2048 TGs) beat extra occupancy here.
 
 ## Baseline (oracle / mlx-lm-deepgrove)
 

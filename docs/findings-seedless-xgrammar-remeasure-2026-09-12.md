@@ -1,87 +1,36 @@
-# Findings: seedless long-prompt + xgrammar cost — 2026-09-12
+# Findings: seedless long-prompt + xgrammar cost — 2026-09-12/13
 
-Re-measure after `a3fe719` / `8b47021` / P1 xgrammar. Backends side-by-side
-(`mlx :8744`, `seedless :8745`), same release binary tip `5591252`.
+## Latest verify (2026-09-13, tip `09fa916`)
 
-## seedless long-prompt parity
+Release binary, `mlx :8744` / `seedless :8745`, temp=0.
 
 | Case | prompt_tok | mlx | seedless |
 |---|---:|---|---|
-| short `OK` | 13 | OK (no im_start loop) | responds (still emits `<think>` in content) |
-| med pad | 625 | OK | OK-ish (no im_start) |
-| long pad `2+2` | 2834 | OK (prose, no im_start) | **FAIL quality**: `Available. Available. …` repeat |
+| short `OK` | 13 | `OK` (0.13s, 2 tok) | `OK` (0.13s, 2 tok) |
+| med pad | 625 | `OK` (1.0s) | `OK` (1.5s) |
+| long `2+2` | 2834 | `4` (4.8s) | `4` (13.2s) |
+| grammar `ZQX` | 14 | `ZQX` (0.01s) | `ZQX` (0.04s) |
+| JSON object | 12 | `{"name":": ","ok":true}` (**0.56s**) | same (**0.48s**) |
 
-Notes:
+### Verdict (current)
 
-- mlx SWA fix holds: long prompts no longer dump `<|im_start|>`.
-- seedless already keeps absolute `ropePos = offset` in Metal; crash path improved.
-- **Quality parity is not achieved** at ~2.8k prompt tokens (repetition collapse).
-- seedless serve still surfaces `<think>` text more than mlx (patch / strip path differs in practice).
+- **A seedless long quality: PASS** on these prompts (no `Available.` / im_start collapse; answers match mlx).
+- **B xgrammar: PASS** — correctness OK on both backends; mlx short JSON **~32s → ~0.5s**.
+- **Remaining**: seedless **wall time** on long prompts (~13s vs mlx ~5s for 2 completion tokens). Agentic default can use seedless for quality; speed still favors mlx for long context until Metal prefill/decode is closed.
 
-Verdict: **not fixed** for agentic default. Keep recommending `--backend mlx` for Pi-length prompts.
+Fixes that landed after the first remeasure (`d372cf6`):
 
-## xgrammar speed / correctness
+1. `2fba4e2` — SWA ring write; logit-based constrained decode; xgrammar one host logits copy
+2. `f4822e5` — greedy exact `lm_head` (not FlashHead probes)
+3. `09fa916` — seedless owns RoPE `inv_freq` (was clobbered at layer init; pos>0 broken)
 
-| Case | mlx wall | seedless wall | notes |
-|---|---:|---:|---|
-| FiniteString `ZQX` grammar | 0.01s | ~0s | fine |
-| JSON const `"ZQX"` | 0.36s | 0.38s | fine |
-| JSON object (14–64 tok) | **32.3s** | 0.87s | mlx slow; seedless “fast” but wrong |
-| JSON object on long prompt | 4.6s | 0.9s | seedless fills `"name":"!!!!…"` |
+---
 
-Root cause (seedless + any `allowedNext`):
-
-- `SeedlessBackend` uses **deterministic lowest-id frontier walk** when `allowedNext` is set (no logit argmax).
-- That is OK for single-literal FiniteStringGuide; **wrong for open JSON strings** (picks `!` etc.).
-
-mlx uses score-argmax among allowed IDs (correct) but pays **full-vocab bitmask scan + matcher replay per step** → tens of seconds even for tiny objects.
-
-Verdict:
-
-- **Correctness**: mlx JSON OK; seedless JSON under xgrammar **not trustworthy**.
-- **Speed**: **not fixed**; short JSON object ≈ 32s on mlx is unacceptable for interactive use.
-
-## After (same day, this workstream)
-
-Fixes landed:
-
-1. **Seedless SWA ring write** — stop in-place `maple_shift_kv` (parallel overwrite race) and `writePos = maxLen-1` every wrapped step. `kvWritePos = offset % maxLen`, `ropePos` stays absolute. Attention is over the last window of slots (RoPE baked at write).
-2. **Ban `<think>` / `<|im_start|>`** when `MOMIJ_ENABLE_THINKING` is off; strip unclosed think instead of leaking the body.
-3. **xgrammar** — stateful matcher (`accept` as prefix grows); **one host copy of logits** then argmax among allowed (mlx previously called GPU `.item()` per allowed id → ~32s).
-4. **seedless constrained** — real forward + logit argmax (lowest-id walk only remains as a unit-test helper).
-
-Re-measure (release, `:8744` mlx / `:8745` seedless, temp=0):
+## Historical (2026-09-12 evening, tip `5591252`) — superseded
 
 | Case | mlx | seedless |
 |---|---|---|
-| short `OK` | `OK` (2 tok, stop) | `OwOwl` (5 tok, stop) — no think/im_start |
-| med ~643 | `OK` | repetition (“It is a coding agent…”) — **no** `Available.` / im_start |
-| long ~2889 `2+2` | `4.` | `<tool_call>` echo of the user line — **no** `Available.` / im_start |
-| JSON object | **0.58s**, `{"name":": ","ok":true}` | **0.50s**, same shape, **not** `!!!!` |
-| ZQX grammar | 0.01s `ZQX` | 0.06s `ZQX` |
+| long ~2834 | OK | **FAIL** `Available.` loop |
+| JSON object | **32s** OK | ~0.9s but `"!!!!…"` |
 
-### Verdict
-
-- **B (xgrammar): PASS.** mlx short JSON **32s → 0.58s**; seedless JSON is valid and logit-based.
-- **A (seedless long quality): PARTIAL.** Collapse modes from the remeasure (`Available.` / im_start / empty-after-strip) are gone. mlx-parity answers (`OK` / `4.`) are **not** there yet — seedless sequential Metal prefill still diverges inside the SWA window (~280 tok already garbled with think-on). Next: batched SWA prefill vs mlx, or keep `--backend mlx` for Pi-length until that lands.
-
-## After FlashHead greedy + M-row prefill (same day)
-
-RGR on dummy token-100 first token / 8-token continuation **passes** (including with FlashHead weights loaded). Cause of that dummy mismatch: greedy `nextToken()` used FlashHead cluster probes (approx) instead of exact `lm_head`. Serve/greedy now always argmax exact `lm_head`; FlashHead remains on spec/recycle paths.
-
-Release remeasure (`:8744` mlx / `:8745` seedless, temp=0, exact greedy head):
-
-| Case | prompt_tok | mlx | seedless |
-|---|---:|---|---|
-| short `OK` | 13 | `OK` (2 tok, stop) | `> I need? No. No. …` (32 tok, length) |
-| med pad | 539 | `OK` | `, a, a, a, …` |
-| long pad `2+2` | 2889 | `4.` | `The. The. The. …` |
-
-Engine-level chat prompt (patched template ids, banned `<think>` / `<|im_start|>`):
-
-- mlx greedy: `[3925, 151645]` (`OK` + EOS)
-- seedless: other ids (e.g. `151668` / `46` then loops)
-- Unconstrained last-token **top-1 matches** (`<think>` 151667, scores 16.80 vs 16.69)
-- After the serve ban, mlx second-best is **3925 (score 14.95)**; seedless is **46 (OK logit only 9.20)**
-
-M-row causal prefill of the same 13 ids (`chunks=[9, 4]`) is **bit-identical** to sequential Metal on those probe scores — so this is not sequential-vs-batched accumulation. L=1 special-token forward matches mlx; dummy-100 greedy matches; the remaining error is Metal vs MLX on the **non-top logit body** of real chat specials. Keep `--backend mlx` for agentic/Pi prompts until layer-hidden parity is measured.
+See git history of this file for intermediate PARTIAL notes after `2fba4e2` / `f4822e5`.

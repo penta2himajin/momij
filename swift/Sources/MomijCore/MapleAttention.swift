@@ -95,7 +95,19 @@ public struct MapleAttention {
         }
 
         let (allK, allV) = cache.update(keys, values)
-        let mask: MLXFast.ScaledDotProductAttentionMaskMode = L > 1 ? .causal : .none
+        let mask: MLXFast.ScaledDotProductAttentionMaskMode
+        if L <= 1 {
+            mask = .none
+        } else if useRope, let window = cache.maxSize, L > window {
+            // Prefill longer than SWA window: causal alone would attend past the
+            // trained window; match mlx-lm create_causal_mask(..., window_size=).
+            let additive = AttentionMasks.slidingCausal(
+                queryLen: L, offset: cache.offset - L, windowSize: window
+            ).asType(queries.dtype)
+            mask = .array(additive)
+        } else {
+            mask = .causal
+        }
         let out = MLXFast.scaledDotProductAttention(
             queries: queries, keys: allK, values: allV,
             scale: scale, mask: mask

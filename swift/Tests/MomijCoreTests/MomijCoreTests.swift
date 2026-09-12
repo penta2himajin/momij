@@ -1,4 +1,5 @@
 import XCTest
+import MLX
 @testable import MomijCore
 
 final class SuffixSpecTests: XCTestCase {
@@ -81,6 +82,52 @@ final class SuffixSpecTests: XCTestCase {
         XCTAssertFalse(SeedlessLayerBlock.canRewind(isSliding: true, offset: 508, maxLen: 512, steps: 8))
         XCTAssertTrue(SeedlessLayerBlock.canRewind(isSliding: true, offset: 504, maxLen: 512, steps: 8))
         XCTAssertFalse(SeedlessLayerBlock.canRewind(isSliding: true, offset: 512, maxLen: 512, steps: 1))
+    }
+
+    /// MLX SWA cache must keep absolute RoPE offset (oracle RotatingKVCache), not clamp to maxSize.
+    func testRotatingKVCacheOffsetStaysAbsolute() {
+        let cache = KVCache(maxSize: 8)
+        func kv(_ L: Int, mark: Float) -> (MLXArray, MLXArray) {
+            // [B=1, H=1, L, D=2]
+            var data = [Float](repeating: 0, count: L * 2)
+            for i in 0 ..< L { data[i * 2] = mark + Float(i) }
+            let k = MLXArray(data).reshaped([1, 1, L, 2])
+            return (k, k)
+        }
+        let (k0, v0) = kv(10, mark: 100)
+        let (rk0, _) = cache.update(k0, v0)
+        MLX.eval(rk0)
+        XCTAssertEqual(cache.offset, 10, "prefill past window must advance absolute offset")
+        XCTAssertLessThanOrEqual(rk0.dim(2), 10)
+        // Decode steps past the window: offset must keep climbing for RoPE.
+        for step in 0 ..< 5 {
+            let (k1, v1) = kv(1, mark: Float(200 + step))
+            _ = cache.update(k1, v1)
+            XCTAssertEqual(cache.offset, 11 + step)
+        }
+        XCTAssertEqual(cache.offset, 15)
+        let kLast = cache.keys!
+        let vLast = cache.values!
+        MLX.eval(kLast, vLast)
+        XCTAssertEqual(kLast.dim(2), 8, "stored KV stays within maxSize")
+        _ = vLast
+    }
+
+    func testSlidingWindowCausalMask() {
+        // N=4, window=2, offset=0 → row i attends [max(0,i-1)...i]
+        let m = AttentionMasks.slidingCausal(queryLen: 4, offset: 0, windowSize: 2)
+        MLX.eval(m)
+        // additive: 0 allowed, -inf blocked. Shape [1,1,4,4] or [4,4]
+        let flat = m.asType(.float32).reshaped([-1])
+        // positions (q,k): (0,0) ok; (1,0)(1,1) ok; (2,0) blocked; (2,1)(2,2) ok
+        func at(_ q: Int, _ k: Int) -> Float {
+            flat[q * 4 + k].item(Float.self)
+        }
+        XCTAssertEqual(at(0, 0), 0)
+        XCTAssertTrue(at(2, 0).isInfinite && at(2, 0) < 0)
+        XCTAssertEqual(at(2, 1), 0)
+        XCTAssertEqual(at(2, 2), 0)
+        XCTAssertTrue(at(1, 0) == 0 || at(1, 0).isFinite)
     }
 
     func testGlobalIndexBeatsEmptyLocal() {
@@ -1811,6 +1858,41 @@ final class SeedlessContextTests: XCTestCase {
         let eng = try SeedlessDecodeEngine(store: store, fullMaxLen: 32)
         let prompt = Array(repeating: 100, count: 40)
         XCTAssertThrowsError(try eng.generate(prompt: prompt, maxTokens: 8, eos: nil))
+    }
+}
+
+final class ChatTemplatePatchTests: XCTestCase {
+    func testWithoutForcedThinkRemovesThinkOpener() {
+        // Maple jinja uses escaped \n inside the quoted string.
+        let fileStyle = "{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n<think>\\n' }}\n{%- endif %}\n"
+        let patched = ChatTemplatePatch.withoutForcedThink(fileStyle)
+        XCTAssertFalse(patched.contains("<think>"))
+        XCTAssertTrue(patched.contains("<|im_start|>assistant\\n' }}"))
+    }
+
+    func testStripThinkForContentKeepsAnswer() {
+        let text = "<think>\nplan\n</think>\nhello"
+        XCTAssertEqual(
+            ChatTemplatePatch.stripThinkForContent(text, thinkingEnabled: false),
+            "hello")
+        XCTAssertEqual(
+            ChatTemplatePatch.stripThinkForContent(text, thinkingEnabled: true),
+            text)
+    }
+
+    func testServeTemplatePatchesMapleJinja() throws {
+        let modelDir = ProcessInfo.processInfo.environment["MOMIJ_MODEL"]
+            ?? NSString("~/models/deepgrove/maple-preview-2bit-mlx").expandingTildeInPath
+        guard let raw = ChatTemplatePatch.loadModelTemplate(modelDir: modelDir) else {
+            throw XCTSkip("chat_template.jinja not present")
+        }
+        XCTAssertTrue(raw.contains("<think>"), "stock Maple template must force think")
+        let patched = ChatTemplatePatch.withoutForcedThink(raw)
+        XCTAssertFalse(
+            patched.contains("<|im_start|>assistant\\n<think>\\n"),
+            "generation prompt must not force think")
+        XCTAssertTrue(patched.contains("<|im_start|>assistant\\n' }}"))
+        // Historical reasoning_content path may still mention <think>; that is OK.
     }
 }
 

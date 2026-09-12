@@ -249,7 +249,8 @@ struct MomijMain {
     static func loadTokenizer(modelDir: String) async throws -> any MomijHTTP.TokenizerAdapter {
         do {
             let tok = try await AutoTokenizer.from(modelFolder: URL(fileURLWithPath: modelDir))
-            return HFTokenizer(tok)
+            let template = ChatTemplatePatch.serveTemplate(modelDir: modelDir)
+            return HFTokenizer(tok, chatTemplateOverride: template)
         } catch {
             throw TokenizerLoadError.hfFailed("\(error)")
         }
@@ -273,7 +274,13 @@ enum TokenizerLoadError: Error, CustomStringConvertible {
 
 struct HFTokenizer: MomijHTTP.TokenizerAdapter {
     let inner: any Tokenizer
-    init(_ inner: any Tokenizer) { self.inner = inner }
+    /// When set (default serve: Maple template without forced `<think>`), used instead of
+    /// the tokenizer's embedded chat_template.
+    let chatTemplateOverride: String?
+    init(_ inner: any Tokenizer, chatTemplateOverride: String? = nil) {
+        self.inner = inner
+        self.chatTemplateOverride = chatTemplateOverride
+    }
     func encode(_ text: String) throws -> [Int] { inner.encode(text: text) }
     func decode(_ ids: [Int]) throws -> String { inner.decode(tokens: ids) }
     func applyChatTemplate(_ messages: [MomijHTTP.ChatMessage]) throws -> [Int] {
@@ -281,6 +288,9 @@ struct HFTokenizer: MomijHTTP.TokenizerAdapter {
             ["role": $0.role, "content": $0.content]
         }
         do {
+            if let chatTemplateOverride {
+                return try inner.applyChatTemplate(messages: dicts, chatTemplate: chatTemplateOverride)
+            }
             return try inner.applyChatTemplate(messages: dicts)
         } catch {
             throw MomijHTTP.TemplateError.applyFailed("\(error)")

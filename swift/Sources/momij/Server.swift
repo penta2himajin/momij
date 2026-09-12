@@ -209,7 +209,8 @@ enum MomijHTTP {
             let decodeIds = OpenAIChatCompat.contentTokenIds(tokens, eosTokenIds: opts.eosTokenIds)
             let text: String
             do {
-                text = try engine.tokenizer.decode(decodeIds)
+                let raw = try engine.tokenizer.decode(decodeIds)
+                text = ChatTemplatePatch.stripThinkForContent(raw)
             } catch {
                 return jsonError(status: .internalServerError, message: "decode failed: \(error)")
             }

@@ -132,6 +132,116 @@ public final class MapleEngine: @unchecked Sendable {
         return lmHead.apply(h[0..., (h.dim(1) - 1) ..< h.dim(1), 0...])
     }
 
+    /// Last-token residual after embed and after each layer (batched prefill).
+    func lastTokenHiddenAfterEachLayer(_ ids: [Int]) -> (embed: [Float], layers: [[Float]]) {
+        resetCaches()
+        let promptArr = MLXArray(ids.map { Int32($0) }).reshaped([1, ids.count])
+        var h = embed(promptArr)
+        MLX.eval(h)
+        let embedRow = Self.hostLastRow(h)
+        var layersOut: [[Float]] = []
+        layersOut.reserveCapacity(layers.count)
+        for (layer, cache) in zip(layers, caches) {
+            let r = layer.attn(rms(h, layer.inNorm), cache: cache)
+            h = h + r
+            let r2 = layer.moe(rms(h, layer.postNorm))
+            h = h + r2
+            MLX.eval(h)
+            layersOut.append(Self.hostLastRow(h))
+        }
+        return (embedRow, layersOut)
+    }
+
+    /// Last-token residual after layer-0 attention only (batched prefill).
+    func lastTokenAfterFirstAttn(_ ids: [Int]) -> [Float] {
+        resetCaches()
+        let promptArr = MLXArray(ids.map { Int32($0) }).reshaped([1, ids.count])
+        var h = embed(promptArr)
+        let layer = layers[0]
+        let r = layer.attn(rms(h, layer.inNorm), cache: caches[0])
+        h = h + r
+        MLX.eval(h)
+        return Self.hostLastRow(h)
+    }
+
+    /// Last-token L0 QKV after RMS (no RoPE). `batched` uses the full prompt; else last id only.
+    func lastTokenLayer0QKV(_ ids: [Int], batched: Bool) -> [Float] {
+        let attn = layers[0].attn
+        let x: MLXArray
+        if batched {
+            let promptArr = MLXArray(ids.map { Int32($0) }).reshaped([1, ids.count])
+            x = rms(embed(promptArr), layers[0].inNorm)
+        } else {
+            let tok = MLXArray([Int32(ids.last!)]).reshaped([1, 1])
+            x = rms(embed(tok), layers[0].inNorm)
+        }
+        let qkv = attn.qkvProj.apply(x)
+        MLX.eval(qkv)
+        return Self.hostLastRow(qkv)
+    }
+
+    /// Last-token L0 Q after qk-norm + RoPE. Batched = MLXFast.RoPE; else decode fused kernel.
+    func lastTokenLayer0Q(_ ids: [Int], batched: Bool) -> [Float] {
+        let attn = layers[0].attn
+        if batched {
+            let promptArr = MLXArray(ids.map { Int32($0) }).reshaped([1, ids.count])
+            let x = rms(embed(promptArr), layers[0].inNorm)
+            let qkv = attn.qkvProj.apply(x)
+            let B = 1, L = ids.count
+            let qEnd = attn.numHeads * attn.headDim
+            var q = qkv[0..., 0..., 0 ..< qEnd].reshaped([B, L, attn.numHeads, attn.headDim])
+            q = MLXFast.rmsNorm(q.asType(.float32), weight: attn.qNorm.asType(.float32), eps: attn.eps)
+                .asType(qkv.dtype)
+                .transposed(0, 2, 1, 3)
+            if attn.useRope {
+                q = MLXFast.RoPE(
+                    q, dimensions: attn.ropeDim, traditional: false,
+                    base: attn.ropeBase, scale: 1.0, offset: 0)
+            }
+            let last = q[0..., 0..., L - 1, 0...].reshaped([-1]).asType(.float32)
+            MLX.eval(last)
+            return Self.hostVec(last)
+        }
+        let tok = MLXArray([Int32(ids.last!)]).reshaped([1, 1])
+        let x = rms(embed(tok), layers[0].inNorm)
+        let qkv = attn.qkvProj.apply(x)
+        let flat = qkv.reshaped([-1])
+        let qk = flat[0 ..< attn.qkSize].reshaped([attn.numHeads + attn.numKVHeads, attn.headDim])
+        let out = MapleFused.qkNormRope(
+            qk: qk, w: attn.qkW.asType(qk.dtype), invFreq: attn.invFreq,
+            offset: ids.count - 1, eps: attn.eps,
+            ropeDim: attn.useRope ? attn.ropeDim : 0)
+        let q = out[0 ..< attn.numHeads].reshaped([-1]).asType(.float32)
+        MLX.eval(q)
+        return Self.hostVec(q)
+    }
+
+    private static func hostVec(_ a: MLXArray) -> [Float] {
+        let x = a.asType(.float32)
+        MLX.eval(x)
+        let n = x.dim(0)
+        var out = [Float](repeating: 0, count: n)
+        x.asData(access: .copy).data.withUnsafeBytes { raw in
+            let src = raw.bindMemory(to: Float.self)
+            let m = min(n, raw.count / MemoryLayout<Float>.size)
+            for i in 0 ..< m { out[i] = src[i] }
+        }
+        return out
+    }
+
+    private static func hostLastRow(_ h: MLXArray) -> [Float] {
+        let last = h[0, h.dim(1) - 1, 0...].asType(.float32)
+        MLX.eval(last)
+        let n = last.dim(0)
+        var out = [Float](repeating: 0, count: n)
+        last.asData(access: .copy).data.withUnsafeBytes { raw in
+            let src = raw.bindMemory(to: Float.self)
+            let m = min(n, raw.count / MemoryLayout<Float>.size)
+            for i in 0 ..< m { out[i] = src[i] }
+        }
+        return out
+    }
+
     private func stepLogits(_ token: MLXArray) -> MLXArray {
         // token: scalar or [1]/int — keep on-device (oracle generate_step style)
         let tok = token.asType(.int32).reshaped([1, 1])

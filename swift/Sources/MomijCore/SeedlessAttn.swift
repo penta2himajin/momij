@@ -115,12 +115,19 @@ public final class SeedlessLayerBlock {
                 freqs[i] = pow(base, -Float(i) / Float(half))
             }
         }
-        let invArr = MLXArray(freqs)
-        MLX.eval([inW, postW, gW, qkvW0, qkvS0, qkvB0, oW0, oS0, oB0, qkWArr, invArr,
+        MLX.eval([inW, postW, gW, qkvW0, qkvS0, qkvB0, oW0, oS0, oB0, qkWArr,
                   ugW, ugS, ugB, dW, dS, dB])
 
         func mtl(_ a: MLXArray) throws -> MTLBuffer {
             guard let b = SeedlessMetal.mtlBuf(a, device) else { throw SeedlessError.notReady }
+            return b
+        }
+        // Derived locals die at end of init; noCopy aliases would clobber inv_freq
+        // (pos=0 RoPE is identity, so the dangling table was invisible).
+        func owned(_ a: MLXArray) throws -> MTLBuffer {
+            guard let b = SeedlessMetal.mtlBufHostCopy(a, device) else {
+                throw SeedlessError.notReady
+            }
             return b
         }
         inNorm = try mtl(inW)
@@ -132,8 +139,15 @@ public final class SeedlessLayerBlock {
         oW = try mtl(oW0)
         oS = try mtl(oS0)
         oB = try mtl(oB0)
-        qkW = try mtl(qkWArr)
-        invFreq = try mtl(invArr)
+        qkW = try owned(qkWArr)
+        let invBytes = freqs.count * MemoryLayout<Float>.size
+        guard let invBuf = device.makeBuffer(
+            length: invBytes, options: .storageModeShared)
+        else { throw SeedlessError.notReady }
+        freqs.withUnsafeBytes { raw in
+            invBuf.contents().copyMemory(from: raw.baseAddress!, byteCount: raw.count)
+        }
+        invFreq = invBuf
         upGateW = try mtl(ugW)
         upGateS = try mtl(ugS)
         upGateB = try mtl(ugB)

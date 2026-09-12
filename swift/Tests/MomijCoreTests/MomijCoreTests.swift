@@ -2026,6 +2026,226 @@ final class SeedlessContextTests: XCTestCase {
             try seed.greedyScoresAfterPrefill(prompt: prompt, skipFlash: true))
         XCTAssertEqual(seedTop, mlxTop, "g=\(seed.layersPerCB) seedless=\(seedTop) mlx=\(mlxTop)")
     }
+
+    /// Last-token residual after each layer matches batched MLX on the serve chat ids.
+    func testChatPrefillHiddenMatchesMLX() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        let prompt = [
+            151_644, 872, 198, 20_841, 448, 6896, 25, 10_402, 151_645, 198,
+            151_644, 77_091, 198,
+        ]
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let mlx = MapleEngine(store: store, enableSeedlessMoE: false)
+        let seed = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 256, enableFlashHead: false)
+        let mlxH = mlx.lastTokenHiddenAfterEachLayer(prompt)
+        let seedH = try seed.lastTokenHiddenAfterEachLayer(prompt: prompt)
+        XCTAssertEqual(seedH.embed.count, mlxH.embed.count)
+        XCTAssertEqual(seedH.layers.count, mlxH.layers.count)
+
+        func cosine(_ a: [Float], _ b: [Float]) -> Float {
+            var dot: Float = 0, na: Float = 0, nb: Float = 0
+            for i in 0 ..< a.count {
+                dot += a[i] * b[i]
+                na += a[i] * a[i]
+                nb += b[i] * b[i]
+            }
+            return dot / (sqrt(na) * sqrt(nb) + 1e-12)
+        }
+        func maxAbs(_ a: [Float], _ b: [Float]) -> Float {
+            var m: Float = 0
+            for i in 0 ..< a.count { m = max(m, abs(a[i] - b[i])) }
+            return m
+        }
+
+        let embedCos = cosine(seedH.embed, mlxH.embed)
+        let embedMax = maxAbs(seedH.embed, mlxH.embed)
+        var notes = ["embed cos=\(embedCos) maxAbs=\(embedMax)"]
+        XCTAssertGreaterThan(embedCos, 0.999, notes[0])
+
+        // fp16 layer noise is small; 0.995 still leaves the OK-logit gap unexplained
+        // if only tiny drift. Fail at the first layer that clearly leaves the mlx basin.
+        let minCos: Float = 0.995
+        var firstBad: Int?
+        for (i, (s, m)) in zip(seedH.layers, mlxH.layers).enumerated() {
+            let c = cosine(s, m)
+            let d = maxAbs(s, m)
+            notes.append("L\(i) sliding=\(store.config.isSliding(i)) cos=\(c) maxAbs=\(d)")
+            if firstBad == nil, c < minCos { firstBad = i }
+        }
+        XCTAssertNil(
+            firstBad,
+            "first residual mismatch at layer \(firstBad!) " + notes.joined(separator: " | "))
+    }
+
+    /// Layer-0 attention vs mlx. Same-token pairs are exact; mixed ids expose SDPA mix bugs
+    /// (identical V makes softmax errors invisible).
+    func testChatPrefillLayer0AttnMatchesMLX() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        let chat = [
+            151_644, 872, 198, 20_841, 448, 6896, 25, 10_402, 151_645, 198,
+            151_644, 77_091, 198,
+        ]
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let mlx = MapleEngine(store: store, enableSeedlessMoE: false)
+        let seed = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 256, enableFlashHead: false)
+
+        func cosine(_ a: [Float], _ b: [Float]) -> Float {
+            var dot: Float = 0, na: Float = 0, nb: Float = 0
+            for i in 0 ..< a.count {
+                dot += a[i] * b[i]
+                na += a[i] * a[i]
+                nb += b[i] * b[i]
+            }
+            return dot / (sqrt(na) * sqrt(nb) + 1e-12)
+        }
+        func maxAbs(_ a: [Float], _ b: [Float]) -> Float {
+            var m: Float = 0
+            for i in 0 ..< a.count { m = max(m, abs(a[i] - b[i])) }
+            return m
+        }
+
+        var notes: [String] = []
+        var firstBad: String?
+        let cases: [(String, [Int])] = [
+            ("dummy L=2", [100, 100]),
+            ("special+special", [151_644, 151_644]),
+            ("special+100", [151_644, 100]),
+            ("chat L=2", Array(chat.prefix(2))),
+        ]
+        for (label, prompt) in cases {
+            let m = mlx.lastTokenAfterFirstAttn(prompt)
+            let s = try seed.lastTokenAfterFirstAttn(
+                prompt: prompt, prefixFullStack: false)
+            let c = cosine(s, m)
+            let d = maxAbs(s, m)
+            notes.append("\(label) cos=\(c) maxAbs=\(d)")
+            if firstBad == nil, c < 0.995 { firstBad = label }
+        }
+        XCTAssertNil(firstBad, "layer0 attn mismatch at \(firstBad!) " + notes.joined(separator: " | "))
+    }
+
+    /// Metal SDPA output must match a host fp32 mix of the same Q/K/V (N=2 mixed ids).
+    func testLayer0SdpaMatchesHostQKV() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        let prompt = [151_644, 100]
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let seed = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 256, enableFlashHead: false)
+        _ = try seed.lastTokenAfterFirstAttn(prompt: prompt, prefixFullStack: false)
+        let l0 = seed.stack.layers[0]
+        let Hn = l0.numHeads, KV = l0.numKV, D = l0.headDim, maxLen = l0.maxLen
+        let N = 2
+        let qCount = Hn * D
+        let qp = l0.qkOut.contents().bindMemory(to: Float16.self, capacity: qCount)
+        let kp = l0.kCache.contents().bindMemory(to: Float16.self, capacity: KV * maxLen * D)
+        let vp = l0.vCache.contents().bindMemory(to: Float16.self, capacity: KV * maxLen * D)
+        let ap = l0.attnTmp.contents().bindMemory(to: Float16.self, capacity: qCount)
+        let scale = Float(pow(Double(D), -0.5))
+        var host = [Float](repeating: 0, count: qCount)
+        for qh in 0 ..< Hn {
+            let kvh = qh * KV / Hn
+            var scores = [Float](repeating: 0, count: N)
+            for t in 0 ..< N {
+                var dot: Float = 0
+                let qOff = qh * D
+                let kOff = kvh * maxLen * D + t * D
+                for d in 0 ..< D { dot += Float(qp[qOff + d]) * Float(kp[kOff + d]) }
+                scores[t] = scale * dot
+            }
+            let mx = scores.max() ?? 0
+            var z: Float = 0
+            for t in 0 ..< N {
+                scores[t] = exp(scores[t] - mx)
+                z += scores[t]
+            }
+            for d in 0 ..< D {
+                var acc: Float = 0
+                for t in 0 ..< N {
+                    let vOff = kvh * maxLen * D + t * D
+                    acc += (scores[t] / z) * Float(vp[vOff + d])
+                }
+                host[qh * D + d] = acc
+            }
+        }
+        var maxAbs: Float = 0
+        var dot: Float = 0, na: Float = 0, nb: Float = 0
+        for i in 0 ..< qCount {
+            let a = host[i], b = Float(ap[i])
+            maxAbs = max(maxAbs, abs(a - b))
+            dot += a * b
+            na += a * a
+            nb += b * b
+        }
+        let cos = dot / (sqrt(na) * sqrt(nb) + 1e-12)
+        XCTAssertGreaterThan(cos, 0.999, "Metal SDPA vs host QKV mix cos=\(cos) maxAbs=\(maxAbs)")
+    }
+
+    /// Split mixed-id L0 mismatch: QKV (gqmm2) vs Q after RoPE (qk-norm-rope vs MLXFast.RoPE).
+    func testChatPrefillLayer0QSplitsQKVFromRoPE() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        let prompt = [151_644, 100]
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let mlx = MapleEngine(store: store, enableSeedlessMoE: false)
+        let seed = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 256, enableFlashHead: false)
+        let metal = try seed.lastTokenLayer0QK(prompt: prompt)
+        let qkvLast = mlx.lastTokenLayer0QKV(prompt, batched: false)
+        let qkvBatched = mlx.lastTokenLayer0QKV(prompt, batched: true)
+        let qFused = mlx.lastTokenLayer0Q(prompt, batched: false)
+        let qBatched = mlx.lastTokenLayer0Q(prompt, batched: true)
+
+        func cosine(_ a: [Float], _ b: [Float]) -> Float {
+            var dot: Float = 0, na: Float = 0, nb: Float = 0
+            let n = min(a.count, b.count)
+            for i in 0 ..< n {
+                dot += a[i] * b[i]
+                na += a[i] * a[i]
+                nb += b[i] * b[i]
+            }
+            return dot / (sqrt(na) * sqrt(nb) + 1e-12)
+        }
+        func maxAbs(_ a: [Float], _ b: [Float]) -> Float {
+            var m: Float = 0
+            let n = min(a.count, b.count)
+            for i in 0 ..< n { m = max(m, abs(a[i] - b[i])) }
+            return m
+        }
+        func note(_ label: String, _ a: [Float], _ b: [Float]) -> String {
+            "\(label) n=\(a.count)/\(b.count) cos=\(cosine(a, b)) maxAbs=\(maxAbs(a, b))"
+        }
+        let notes = [
+            note("qkv metal vs mlx-last", metal.qkv, qkvLast),
+            note("qkv metal vs mlx-batched", metal.qkv, qkvBatched),
+            note("qkv mlx-last vs mlx-batched", qkvLast, qkvBatched),
+            note("Q metal vs mlx-fused pos1", metal.q, qFused),
+            note("Q metal vs mlx-batched pos1", metal.q, qBatched),
+            note("Q mlx-fused vs mlx-batched", qFused, qBatched),
+        ]
+        var firstBad: String?
+        let checks: [(String, [Float], [Float])] = [
+            ("qkv metal vs mlx-last", metal.qkv, qkvLast),
+            ("Q metal vs mlx-fused pos1", metal.q, qFused),
+            ("Q metal vs mlx-batched pos1", metal.q, qBatched),
+        ]
+        for (label, a, b) in checks {
+            if firstBad == nil, cosine(a, b) < 0.995 { firstBad = label }
+        }
+        XCTAssertNil(firstBad, "L0 split mismatch at \(firstBad!) " + notes.joined(separator: " | "))
+    }
 }
 
 final class ChatTemplatePatchTests: XCTestCase {

@@ -438,6 +438,99 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         return ConstrainedPick.hostScores(logits)
     }
 
+    /// Sequential prefix, then last token layer-by-layer. Compare to batched mlx residuals.
+    func lastTokenHiddenAfterEachLayer(prompt: [Int]) throws -> (embed: [Float], layers: [[Float]]) {
+        reset()
+        guard let last = prompt.last, !prompt.isEmpty else { return ([], []) }
+        for id in prompt.dropLast() {
+            _ = try step(id, skipFlash: true)
+        }
+        embedToken(last)
+        let embedRow = copyLastH()
+        var layersOut: [[Float]] = []
+        layersOut.reserveCapacity(stack.layers.count)
+        guard let q = SeedlessMetal.queue else { throw SeedlessError.notReady }
+        for layer in stack.layers {
+            let cb = q.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            do {
+                try layer.encodeStep(into: enc)
+                enc.endEncoding()
+            } catch {
+                enc.endEncoding()
+                throw error
+            }
+            cb.commit()
+            cb.waitUntilCompleted()
+            layersOut.append(copyLastH())
+        }
+        return (embedRow, layersOut)
+    }
+
+    func lastTokenAfterFirstAttn(prompt: [Int]) throws -> [Float] {
+        try lastTokenAfterFirstAttn(prompt: prompt, prefixFullStack: true)
+    }
+
+    /// If `prefixFullStack` is false, only layer 0 runs on prefix tokens (isolates KV clobber).
+    func lastTokenAfterFirstAttn(prompt: [Int], prefixFullStack: Bool) throws -> [Float] {
+        reset()
+        guard let last = prompt.last, !prompt.isEmpty else { return [] }
+        guard let q = SeedlessMetal.queue else { throw SeedlessError.notReady }
+        let l0 = stack.layers[0]
+        for id in prompt.dropLast() {
+            if prefixFullStack {
+                _ = try step(id, skipFlash: true)
+            } else {
+                embedToken(id)
+                let cb = q.makeCommandBuffer()!
+                let enc = cb.makeComputeCommandEncoder()!
+                do {
+                    try l0.encodeStep(into: enc)
+                    enc.endEncoding()
+                } catch {
+                    enc.endEncoding()
+                    throw error
+                }
+                cb.commit()
+                cb.waitUntilCompleted()
+            }
+        }
+        embedToken(last)
+        let pos = l0.offset
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        do {
+            try l0.encodeAttnOnly(into: enc, at: pos)
+            enc.endEncoding()
+        } catch {
+            enc.endEncoding()
+            throw error
+        }
+        cb.commit()
+        cb.waitUntilCompleted()
+        return copyLastH()
+    }
+
+    /// After L0-only prefix + last `encodeAttnOnly`: pre-RoPE QKV and post-norm/RoPE Q.
+    func lastTokenLayer0QK(prompt: [Int]) throws -> (qkv: [Float], q: [Float]) {
+        _ = try lastTokenAfterFirstAttn(prompt: prompt, prefixFullStack: false)
+        let l0 = stack.layers[0]
+        let qDim = l0.numHeads * l0.headDim
+        let kvDim = l0.numKV * l0.headDim
+        let qkvN = qDim + 2 * kvDim
+        let qp = l0.qkvOut.contents().bindMemory(to: Float16.self, capacity: qkvN)
+        let qk = l0.qkOut.contents().bindMemory(to: Float16.self, capacity: qDim + kvDim)
+        return (
+            (0 ..< qkvN).map { Float(qp[$0]) },
+            (0 ..< qDim).map { Float(qk[$0]) }
+        )
+    }
+
+    private func copyLastH() -> [Float] {
+        let p = stack.hBuf.contents().bindMemory(to: Float16.self, capacity: H)
+        return (0 ..< H).map { Float(p[$0]) }
+    }
+
     private func nextTokenBannedFallback() -> Int {
         let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
         let h = MLXArray(UnsafeBufferPointer(start: ptr, count: H)).reshaped([H])

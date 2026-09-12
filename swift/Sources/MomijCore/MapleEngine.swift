@@ -118,7 +118,7 @@ public final class MapleEngine: @unchecked Sendable {
             .asType(x.dtype)
     }
 
-    private func forwardLastLogits(_ ids: [Int], reset: Bool) -> MLXArray {
+    func forwardLastLogits(_ ids: [Int], reset: Bool) -> MLXArray {
         if reset { resetCaches() }
         let promptArr = MLXArray(ids.map { Int32($0) }).reshaped([1, ids.count])
         var h = embed(promptArr)

@@ -64,3 +64,24 @@ Re-measure (release, `:8744` mlx / `:8745` seedless, temp=0):
 
 - **B (xgrammar): PASS.** mlx short JSON **32s → 0.58s**; seedless JSON is valid and logit-based.
 - **A (seedless long quality): PARTIAL.** Collapse modes from the remeasure (`Available.` / im_start / empty-after-strip) are gone. mlx-parity answers (`OK` / `4.`) are **not** there yet — seedless sequential Metal prefill still diverges inside the SWA window (~280 tok already garbled with think-on). Next: batched SWA prefill vs mlx, or keep `--backend mlx` for Pi-length until that lands.
+
+## After FlashHead greedy + M-row prefill (same day)
+
+RGR on dummy token-100 first token / 8-token continuation **passes** (including with FlashHead weights loaded). Cause of that dummy mismatch: greedy `nextToken()` used FlashHead cluster probes (approx) instead of exact `lm_head`. Serve/greedy now always argmax exact `lm_head`; FlashHead remains on spec/recycle paths.
+
+Release remeasure (`:8744` mlx / `:8745` seedless, temp=0, exact greedy head):
+
+| Case | prompt_tok | mlx | seedless |
+|---|---:|---|---|
+| short `OK` | 13 | `OK` (2 tok, stop) | `> I need? No. No. …` (32 tok, length) |
+| med pad | 539 | `OK` | `, a, a, a, …` |
+| long pad `2+2` | 2889 | `4.` | `The. The. The. …` |
+
+Engine-level chat prompt (patched template ids, banned `<think>` / `<|im_start|>`):
+
+- mlx greedy: `[3925, 151645]` (`OK` + EOS)
+- seedless: other ids (e.g. `151668` / `46` then loops)
+- Unconstrained last-token **top-1 matches** (`<think>` 151667, scores 16.80 vs 16.69)
+- After the serve ban, mlx second-best is **3925 (score 14.95)**; seedless is **46 (OK logit only 9.20)**
+
+M-row causal prefill of the same 13 ids (`chunks=[9, 4]`) is **bit-identical** to sequential Metal on those probe scores — so this is not sequential-vs-batched accumulation. L=1 special-token forward matches mlx; dummy-100 greedy matches; the remaining error is Metal vs MLX on the **non-top logit body** of real chat specials. Keep `--backend mlx` for agentic/Pi prompts until layer-hidden parity is measured.

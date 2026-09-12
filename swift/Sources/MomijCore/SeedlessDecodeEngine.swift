@@ -25,6 +25,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     public var flashProbes: Int { flashHead?.nProbes ?? 0 }
     /// True when `MOMIJ_FLASH_FUSE=1` (topk+gather in layer CB).
     public var flashFused: Bool { flashHead?.fuseIntoLayerCB ?? false }
+    var decodeMaxM: Int { stack.maxM }
+    private(set) var lastPrefillChunks: [Int] = []
     private let finalNormBuf: MTLBuffer
     private let H: Int
     /// Max chained verify feeds (draftK+1). Env `MOMIJ_SPEC_MAX_M`, default 9.
@@ -58,7 +60,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
 
     public private(set) var lastPhase = PhaseMs()
 
-    public init(store: WeightStore, fullMaxLen: Int = 2048) throws {
+    public init(store: WeightStore, fullMaxLen: Int = 2048, enableFlashHead: Bool? = nil) throws {
         try SeedlessMetal.ensureCompiled()
         guard let device = SeedlessMetal.device else { throw SeedlessError.notReady }
         self.store = store
@@ -102,7 +104,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             bits: config.headBits,
             groupSize: config.headGroupSize)
         let flashEnv = ProcessInfo.processInfo.environment["MOMIJ_FLASH_HEAD"]
-        let wantFlash = flashEnv != "0"
+        let wantFlash = enableFlashHead ?? (flashEnv != "0")
         flashHead = wantFlash ? SeedlessFlashHead(store: store, device: device) : nil
         useFlashHead = flashHead != nil
         if wantFlash && flashHead == nil {
@@ -348,6 +350,59 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         stack.hBuf.contents().copyMemory(from: src, byteCount: H * 2)
     }
 
+    private func embedTokens(_ ids: ArraySlice<Int>) {
+        let dst = stack.hBuf.contents()
+        for (m, id) in ids.enumerated() {
+            precondition(id >= 0 && id < vocab)
+            let src = embBuf.contents().advanced(by: id * H * 2)
+            dst.advanced(by: m * H * 2).copyMemory(from: src, byteCount: H * 2)
+        }
+    }
+
+    /// Causal M-row prefill when capacity allows; last row → `finalNormBuf` via exact RMS.
+    private func prefillPrompt(_ prompt: [Int], skipFlash: Bool) throws {
+        lastPrefillChunks = []
+        var i = 0
+        while i < prompt.count {
+            let remain = prompt.count - i
+            var M = 1
+            if remain > 1 {
+                let cand = min(remain, stack.maxM)
+                if cand > 1, stack.canEncodeMrow(M: cand) { M = cand }
+            }
+            lastPrefillChunks.append(M)
+            let lastChunk = i + M == prompt.count
+            embedTokens(prompt[i ..< (i + M)])
+            try stack.stepCommitWait(layersPerCB: layersPerCB, M: M)
+            if lastChunk {
+                try encodeFinalNorm(fromLastRow: M - 1, skipFlash: skipFlash)
+            }
+            i += M
+        }
+    }
+
+    private func encodeFinalNorm(fromLastRow row: Int, skipFlash: Bool) throws {
+        if row > 0 {
+            let src = stack.hBuf.contents().advanced(by: row * H * 2)
+            stack.hBuf.contents().copyMemory(from: src, byteCount: H * 2)
+        }
+        guard let q = SeedlessMetal.queue else { throw SeedlessError.notReady }
+        let cb = q.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        SeedlessMetal.encodeRms(
+            into: enc, h: stack.hBuf, w: normWBuf, out: finalNormBuf,
+            H: H, eps: config.rmsNormEps)
+        if !skipFlash, let fh = flashHead {
+            fh.encodeCentroids(into: enc, h: finalNormBuf)
+            if fh.fuseIntoLayerCB {
+                fh.encodeFusedAfterCentroids(into: enc, h: finalNormBuf)
+            }
+        }
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+    }
+
     /// Observe FlashHead top candidates into the recycle adjacency for `fromToken`.
     private func observeRecycle(fromToken: Int, inds: MTLBuffer? = nil, logits: MTLBuffer? = nil) {
         guard useRecycle, let fh = flashHead else { return }
@@ -356,25 +411,31 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     }
 
     private func nextToken() -> Int {
+        // Greedy serve/generate: exact lm_head. FlashHead cluster probes are an
+        // approximation and pick the wrong id even on short prompts (measured:
+        // exact=100 vs flash=72887 on a length-8 dummy). Spec/recycle still use
+        // FlashHead on their own paths.
         let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
-        let id: Int
-        if useFlashHead, let fh = flashHead {
-            if fh.fuseIntoLayerCB {
-                id = fh.greedyAfterFusedGather(hostH: ptr)
-            } else {
-                id = fh.greedyAfterCentroids(hBuf: finalNormBuf, hostH: ptr)
-            }
-        } else {
-            let h = MLXArray(UnsafeBufferPointer(start: ptr, count: H)).reshaped([H])
-            let logits = lmHead.apply(h.reshaped([1, 1, H]))
-            let y = MLX.argMax(logits.reshaped([-1]), axis: -1)
-            MLX.eval(y)
-            id = y.item(Int.self)
-        }
+        let h = MLXArray(UnsafeBufferPointer(start: ptr, count: H)).reshaped([H])
+        let logits = lmHead.apply(h.reshaped([1, 1, H]))
+        let y = MLX.argMax(logits.reshaped([-1]), axis: -1)
+        MLX.eval(y)
+        let id = y.item(Int.self)
         if !decodeBanned.isEmpty && decodeBanned.contains(id) {
             return nextTokenBannedFallback()
         }
         return id
+    }
+
+    /// Prefill `prompt` then return exact `lm_head` scores (for tests / banned-argmax).
+    func greedyScoresAfterPrefill(prompt: [Int], skipFlash: Bool = true) throws -> [Float] {
+        reset()
+        guard !prompt.isEmpty else { return [] }
+        try prefillPrompt(prompt, skipFlash: skipFlash)
+        let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
+        let h = MLXArray(UnsafeBufferPointer(start: ptr, count: H)).reshaped([H])
+        let logits = lmHead.apply(h.reshaped([1, 1, H]))
+        return ConstrainedPick.hostScores(logits)
     }
 
     private func nextTokenBannedFallback() -> Int {
@@ -791,16 +852,12 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         guard capped > 0 else { return [] }
         reset()
         let constrain = allowedNext != nil
-        var last = prompt[0]
-        for i in 0 ..< prompt.count {
-            let id = prompt[i]
-            if i + 1 < prompt.count {
-                _ = try step(id, skipFlash: constrain)
-            } else if constrain, let allowedNext {
-                last = try step(id, skipFlash: true, allowed: allowedNext([]))
-            } else {
-                last = try step(id)
-            }
+        try prefillPrompt(prompt, skipFlash: true)
+        var last: Int
+        if constrain, let allowedNext {
+            last = nextTokenConstrained(allowedNext([]))
+        } else {
+            last = nextToken()
         }
         let chainK = constrain ? 0 : Self.envChainK
         var out: [Int] = []
@@ -830,7 +887,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                     y = toks.last!
                 }
             } else {
-                y = try step(y)
+                y = try step(y, skipFlash: true)
             }
         }
         return out
@@ -855,14 +912,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     ) throws -> (tokens: [Int], accepted: Int, attempts: Int, gated: Int) {
         guard !prompt.isEmpty, maxTokens > 0 else { return ([], 0, 0, 0) }
         reset()
-        var y = prompt[0]
-        for i in 0 ..< prompt.count {
-            if i + 1 < prompt.count {
-                _ = try step(prompt[i])
-            } else {
-                y = try step(prompt[i])
-            }
-        }
+        try prefillPrompt(prompt, skipFlash: true)
+        let y = nextToken()
         let r = try generateSuffixSpecFromPrefill(
             first: y, promptIds: prompt, maxTokens: maxTokens, draftK: draftK, eos: eos)
         return (r.tokens, r.accepted, r.attempts, r.gated)

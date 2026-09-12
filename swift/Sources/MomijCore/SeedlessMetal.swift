@@ -938,6 +938,7 @@ public enum SeedlessMetal {
                 KV: numKV, D: headDim, maxLen: maxLen, pos: writePos, M: M,
                 srcHeadStride: headDim, srcSeqStride: qkvN)
         }
+        enc.memoryBarrier(scope: .buffers)
 
         encodeSdpa(
             into: enc, queries: qkOut, kCache: kCache, vCache: vCache, out: attnTmp,
@@ -973,6 +974,7 @@ public enum SeedlessMetal {
         M: Int = 1
     ) throws {
         encodeRms(into: enc, h: h, w: inNorm, out: xAttn, H: H, eps: eps, M: M)
+        enc.memoryBarrier(scope: .buffers)
         try encodeAttnBlock(
             into: enc, xNorm: xAttn,
             qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
@@ -987,6 +989,7 @@ public enum SeedlessMetal {
         if !fuseOResid {
             encodeResid(into: enc, h: h, delta: attnOut, H: H, M: M)
         }
+        enc.memoryBarrier(scope: .buffers)
         try encodeMoEBlock(
             into: enc, h: h, normW: postNorm, gateW: gateW,
             upGateW: upGateW, upGateS: upGateS, upGateB: upGateB,

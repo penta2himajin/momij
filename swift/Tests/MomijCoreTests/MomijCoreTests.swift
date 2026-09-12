@@ -1884,6 +1884,148 @@ final class SeedlessContextTests: XCTestCase {
         let prompt = Array(repeating: 100, count: 40)
         XCTAssertThrowsError(try eng.generate(prompt: prompt, maxTokens: 8, eos: nil))
     }
+
+    /// Seedless sequential prefill must match pure-MLX batched prefill on greedy first token.
+    /// Lengths straddle SWA wrap (512) so a ring/RoPE bug shows up as a cliff.
+    func testFirstGeneratedTokenMatchesMLX() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let mlx = MapleEngine(store: store, enableSeedlessMoE: false)
+        let seed = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 2048, enableFlashHead: false)
+        var mismatches: [String] = []
+        for len in [1, 4, 16, 64, 256, 512, 520] {
+            let prompt = Array(repeating: 100, count: len)
+            let mlxTok = mlx.generate(prompt: prompt, maxTokens: 1, eos: nil)
+            let seedTok = try seed.generate(prompt: prompt, maxTokens: 1, eos: nil)
+            if mlxTok != seedTok {
+                mismatches.append("len=\(len) mlx=\(mlxTok) seedless=\(seedTok)")
+            }
+        }
+        XCTAssertTrue(mismatches.isEmpty, mismatches.joined(separator: "; "))
+    }
+
+    /// Default serve loads FlashHead weights, but greedy decode must still
+    /// use exact `lm_head` (FlashHead probes miss the true argmax).
+    func testGreedyFirstTokenIgnoresFlashHeadApprox() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let exact = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 256, enableFlashHead: false)
+        let flash = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 256, enableFlashHead: true)
+        let prompt = Array(repeating: 100, count: 8)
+        let a = try exact.generate(prompt: prompt, maxTokens: 1, eos: nil)
+        let b = try flash.generate(prompt: prompt, maxTokens: 1, eos: nil)
+        XCTAssertEqual(a, b, "greedy with FlashHead loaded \(b) != exact lm_head \(a)")
+    }
+
+    /// After the first token, sequential Metal decode must stay on the MLX greedy path.
+    func testGreedyContinuationMatchesMLX() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let mlx = MapleEngine(store: store, enableSeedlessMoE: false)
+        let seed = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 1024, enableFlashHead: true)
+        var mismatches: [String] = []
+        for len in [16, 64, 128] {
+            let prompt = Array(repeating: 100, count: len)
+            let mlxTok = mlx.generate(prompt: prompt, maxTokens: 8, eos: nil)
+            let seedTok = try seed.generate(prompt: prompt, maxTokens: 8, eos: nil)
+            if mlxTok != seedTok {
+                mismatches.append("len=\(len) mlx=\(mlxTok) seedless=\(seedTok)")
+            }
+        }
+        XCTAssertTrue(mismatches.isEmpty, mismatches.joined(separator: "; "))
+    }
+
+    /// Serve short chat (`Reply with exactly: OK`, patched template, 13 ids).
+    func testServeShortChatPromptMatchesMLX() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        // <|im_start|>user\nReply with exactly: OK<|im_end|>\n<|im_start|>assistant\n
+        let prompt = [
+            151_644, 872, 198, 20_841, 448, 6896, 25, 10_402, 151_645, 198,
+            151_644, 77_091, 198,
+        ]
+        let banned = ChatTemplatePatch.bannedAssistantTokenIds
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let mlx = MapleEngine(store: store, enableSeedlessMoE: false)
+        let seed = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 256, enableFlashHead: true)
+        let mlxTok = mlx.generate(
+            prompt: prompt, maxTokens: 8, eos: 151_645, bannedTokenIds: banned)
+        let seedTok = try seed.generate(
+            prompt: prompt, maxTokens: 8, eos: 151_645, bannedTokenIds: banned)
+        XCTAssertEqual(seedTok, mlxTok, "seedless \(seedTok) != mlx \(mlxTok)")
+    }
+
+    /// Banning `<think>` must pick the same second-best as mlx (serve default).
+    func testBannedPrefillArgmaxMatchesMLX() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        let prompt = [
+            151_644, 872, 198, 20_841, 448, 6896, 25, 10_402, 151_645, 198,
+            151_644, 77_091, 198,
+        ]
+        let probes = [3925, 198, 151_645, 151_667, 151_668, 151_644]
+        let banned = ChatTemplatePatch.bannedAssistantTokenIds
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let mlx = MapleEngine(store: store, enableSeedlessMoE: false)
+        let seed = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 256, enableFlashHead: false)
+        var mlxScores = ConstrainedPick.hostScores(mlx.forwardLastLogits(prompt, reset: true))
+        var seedScores = try seed.greedyScoresAfterPrefill(prompt: prompt, skipFlash: true)
+        XCTAssertGreaterThanOrEqual(seed.decodeMaxM, 2, "M-row prefill disabled")
+        let mlxTop = ConstrainedPick.argmaxAll(mlxScores)
+        let seedTop = ConstrainedPick.argmaxAll(seedScores)
+        let probeNote = probes.map { id -> String in
+            let ms = id < mlxScores.count ? mlxScores[id] : .nan
+            let ss = id < seedScores.count ? seedScores[id] : .nan
+            return "\(id) mlx=\(ms) seed=\(ss)"
+        }.joined(separator: "; ")
+        ConstrainedPick.applyBanned(&mlxScores, banned: banned)
+        ConstrainedPick.applyBanned(&seedScores, banned: banned)
+        let mlxBan = ConstrainedPick.argmaxAll(mlxScores)
+        let seedBan = ConstrainedPick.argmaxAll(seedScores)
+        XCTAssertEqual(
+            seedTop, mlxTop,
+            "unconstrained top seedless=\(seedTop) mlx=\(mlxTop) \(probeNote)")
+        XCTAssertEqual(
+            seedBan, mlxBan,
+            "banned top seedless=\(seedBan) mlx=\(mlxBan) maxM=\(seed.decodeMaxM) chunks=\(seed.lastPrefillChunks) \(probeNote)")
+    }
+
+    /// Two-token chat prefix (`<|im_start|>` + `user`) last-token argmax vs batched MLX.
+    func testTwoTokenChatPrefillMatchesMLX() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        let prompt = [151_644, 872]
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let mlx = MapleEngine(store: store, enableSeedlessMoE: false)
+        let seed = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 256, enableFlashHead: false)
+        let mlxTop = ConstrainedPick.argmaxAll(
+            ConstrainedPick.hostScores(mlx.forwardLastLogits(prompt, reset: true)))
+        let seedTop = ConstrainedPick.argmaxAll(
+            try seed.greedyScoresAfterPrefill(prompt: prompt, skipFlash: true))
+        XCTAssertEqual(seedTop, mlxTop, "g=\(seed.layersPerCB) seedless=\(seedTop) mlx=\(mlxTop)")
+    }
 }
 
 final class ChatTemplatePatchTests: XCTestCase {

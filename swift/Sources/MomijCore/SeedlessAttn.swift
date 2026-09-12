@@ -391,11 +391,17 @@ public final class SeedlessLayerStack {
             let cb = q.makeCommandBuffer()!
             let enc = cb.makeComputeCommandEncoder()!
             let end = min(i + g, layers.count)
-            for j in i ..< end {
-                try layers[j].encodeStep(into: enc)
+            do {
+                for j in i ..< end {
+                    try layers[j].encodeStep(into: enc)
+                }
+                if end == layers.count, let tail { tail(enc) }
+                enc.endEncoding()
+            } catch {
+                // Metal asserts if an encoder is released without endEncoding.
+                enc.endEncoding()
+                throw error
             }
-            if end == layers.count, let tail { tail(enc) }
-            enc.endEncoding()
             cb.commit()
             last = cb
             i = end
@@ -430,10 +436,15 @@ public final class SeedlessLayerStack {
                     let cb = q.makeCommandBuffer()!
                     let enc = cb.makeComputeCommandEncoder()!
                     let end = min(i + g, layers.count)
-                    for j in i ..< end {
-                        try layers[j].encode(into: enc, at: pos)
+                    do {
+                        for j in i ..< end {
+                            try layers[j].encode(into: enc, at: pos)
+                        }
+                        enc.endEncoding()
+                    } catch {
+                        enc.endEncoding()
+                        throw error
                     }
-                    enc.endEncoding()
                     encodeMs += (CFAbsoluteTimeGetCurrent() - te) * 1000
                     cb.commit()
                     if waitEach { cb.waitUntilCompleted() }

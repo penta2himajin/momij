@@ -1795,3 +1795,23 @@ final class StructuredOutputsTests: XCTestCase {
     }
 }
 
+final class SeedlessContextTests: XCTestCase {
+    private var modelDir: String {
+        ProcessInfo.processInfo.environment["MOMIJ_MODEL"]
+            ?? NSString("~/models/deepgrove/maple-preview-2bit-mlx").expandingTildeInPath
+    }
+
+    /// Oversized prompt must throw before Metal assert (encoder without endEncoding).
+    func testGenerateOversizedPromptThrowsCleanly() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let eng = try SeedlessDecodeEngine(store: store, fullMaxLen: 32)
+        let prompt = Array(repeating: 100, count: 40)
+        XCTAssertThrowsError(try eng.generate(prompt: prompt, maxTokens: 8, eos: nil))
+    }
+}
+
+

@@ -60,7 +60,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     /// When true (default), non-greedy paths use rejection-sampling drafts.
     public let speculativeSample: Bool
 
-    public init(modelDir: String, fullMaxLen: Int = 4096) throws {
+    public init(modelDir: String, fullMaxLen: Int = 16_384) throws {
         let store = try WeightStore(modelDir: modelDir)
         store.residentAll()
         try SeedlessMetal.ensureCompiled()

@@ -9,6 +9,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     public let store: WeightStore
     public let config: MapleConfig
     public let stack: SeedlessLayerStack
+    /// Capacity for full-attention KV (SWA layers use slidingWindow).
+    public let fullMaxLen: Int
     /// Layers encoded per Metal command buffer (env `MOMIJ_LAYERS_PER_CB`, default 4).
     public var layersPerCB: Int
     private let embTable: MLXArray
@@ -60,6 +62,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         self.store = store
         self.config = store.config
         self.H = store.config.hiddenSize
+        self.fullMaxLen = fullMaxLen
         let envM = ProcessInfo.processInfo.environment["MOMIJ_SPEC_MAX_M"].flatMap(Int.init)
         specMaxM = max(2, envM ?? 9)
         // Default on: hot SuffixSpec batch packs True M-row. Cold path never batches
@@ -205,41 +208,46 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         let packMrow = useMrow && M > 1 && stack.canEncodeMrow(M: M)
         let cb = q.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
-        if packMrow, let packed = specPackedNorm {
-            for i in 0 ..< M {
-                SeedlessMetal.encodeEmbedToken(
-                    into: enc, table: embBuf, ids: feedBuf, out: stack.hBuf,
-                    H: H, row: i, outRow: i)
-            }
-            for layer in stack.layers {
-                try layer.encodeStep(into: enc, M: M)
-            }
-            SeedlessMetal.encodeRms(
-                into: enc, h: stack.hBuf, w: normWBuf, out: packed,
-                H: H, eps: config.rmsNormEps, M: M)
-            for i in 0 ..< M {
-                let off = i * H * 2
-                fh.encodeCentroids(into: enc, h: packed, hByteOffset: off)
-                fh.encodeFusedAfterCentroids(
-                    into: enc, h: packed, inds: specIndsSlots[i],
-                    logits: specLogitsSlots[i], hByteOffset: off)
-            }
-        } else {
-            for i in 0 ..< M {
-                SeedlessMetal.encodeEmbedToken(
-                    into: enc, table: embBuf, ids: feedBuf, out: stack.hBuf, H: H, row: i)
-                for layer in stack.layers {
-                    try layer.encodeStep(into: enc)
+        do {
+            if packMrow, let packed = specPackedNorm {
+                for i in 0 ..< M {
+                    SeedlessMetal.encodeEmbedToken(
+                        into: enc, table: embBuf, ids: feedBuf, out: stack.hBuf,
+                        H: H, row: i, outRow: i)
                 }
-                let norm = specNormSlots[i]
+                for layer in stack.layers {
+                    try layer.encodeStep(into: enc, M: M)
+                }
                 SeedlessMetal.encodeRms(
-                    into: enc, h: stack.hBuf, w: normWBuf, out: norm, H: H, eps: config.rmsNormEps)
-                fh.encodeCentroids(into: enc, h: norm)
-                fh.encodeFusedAfterCentroids(
-                    into: enc, h: norm, inds: specIndsSlots[i], logits: specLogitsSlots[i])
+                    into: enc, h: stack.hBuf, w: normWBuf, out: packed,
+                    H: H, eps: config.rmsNormEps, M: M)
+                for i in 0 ..< M {
+                    let off = i * H * 2
+                    fh.encodeCentroids(into: enc, h: packed, hByteOffset: off)
+                    fh.encodeFusedAfterCentroids(
+                        into: enc, h: packed, inds: specIndsSlots[i],
+                        logits: specLogitsSlots[i], hByteOffset: off)
+                }
+            } else {
+                for i in 0 ..< M {
+                    SeedlessMetal.encodeEmbedToken(
+                        into: enc, table: embBuf, ids: feedBuf, out: stack.hBuf, H: H, row: i)
+                    for layer in stack.layers {
+                        try layer.encodeStep(into: enc)
+                    }
+                    let norm = specNormSlots[i]
+                    SeedlessMetal.encodeRms(
+                        into: enc, h: stack.hBuf, w: normWBuf, out: norm, H: H, eps: config.rmsNormEps)
+                    fh.encodeCentroids(into: enc, h: norm)
+                    fh.encodeFusedAfterCentroids(
+                        into: enc, h: norm, inds: specIndsSlots[i], logits: specLogitsSlots[i])
+                }
             }
+            enc.endEncoding()
+        } catch {
+            enc.endEncoding()
+            throw error
         }
-        enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
         return packMrow
@@ -280,38 +288,43 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                     cb.encodeWaitForEvent(event, value: UInt64(ti))
                 }
                 let enc = cb.makeComputeCommandEncoder()!
-                if isFirstCB {
-                    SeedlessMetal.encodeEmbedToken(
-                        into: enc, table: embBuf, ids: feedBuf, out: stack.hBuf, H: H, row: ti)
+                do {
+                    if isFirstCB {
+                        SeedlessMetal.encodeEmbedToken(
+                            into: enc, table: embBuf, ids: feedBuf, out: stack.hBuf, H: H, row: ti)
+                    }
+                    let end = min(layerIdx + g, stack.layers.count)
+                    for j in layerIdx ..< end {
+                        try stack.layers[j].encodeStep(into: enc)
+                    }
+                    let isLast = end == stack.layers.count
+                    if isLast {
+                        let norm = specNormSlots[ti]
+                        let inds = specIndsSlots[ti]
+                        let logits = specLogitsSlots[ti]
+                        SeedlessMetal.encodeRms(
+                            into: enc, h: stack.hBuf, w: normWBuf, out: norm,
+                            H: H, eps: config.rmsNormEps)
+                        fh.encodeCentroids(into: enc, h: norm)
+                        fh.encodeFusedAfterCentroids(into: enc, h: norm, inds: inds, logits: logits)
+                        SeedlessMetal.encodeFlashArgmaxToken(
+                            into: enc, logits: logits, inds: inds, tokenMap: fh.tokenMapBuf,
+                            ids: feedBuf, nProbes: fh.nProbes, clusterSize: fh.clusterSize,
+                            outRow: ti + 1, h: norm, forceRows: fh.forceRowsBuf,
+                            forceIds: fh.forceIdsBuf, nForce: fh.forceCount, H: H)
+                    }
+                    enc.endEncoding()
+                    if isLast {
+                        cb.encodeSignalEvent(event, value: UInt64(ti + 1))
+                    }
+                    cb.commit()
+                    lastCB = cb
+                    layerIdx = end
+                    isFirstCB = false
+                } catch {
+                    enc.endEncoding()
+                    throw error
                 }
-                let end = min(layerIdx + g, stack.layers.count)
-                for j in layerIdx ..< end {
-                    try stack.layers[j].encodeStep(into: enc)
-                }
-                let isLast = end == stack.layers.count
-                if isLast {
-                    let norm = specNormSlots[ti]
-                    let inds = specIndsSlots[ti]
-                    let logits = specLogitsSlots[ti]
-                    SeedlessMetal.encodeRms(
-                        into: enc, h: stack.hBuf, w: normWBuf, out: norm,
-                        H: H, eps: config.rmsNormEps)
-                    fh.encodeCentroids(into: enc, h: norm)
-                    fh.encodeFusedAfterCentroids(into: enc, h: norm, inds: inds, logits: logits)
-                    SeedlessMetal.encodeFlashArgmaxToken(
-                        into: enc, logits: logits, inds: inds, tokenMap: fh.tokenMapBuf,
-                        ids: feedBuf, nProbes: fh.nProbes, clusterSize: fh.clusterSize,
-                        outRow: ti + 1, h: norm, forceRows: fh.forceRowsBuf,
-                        forceIds: fh.forceIdsBuf, nForce: fh.forceCount, H: H)
-                }
-                enc.endEncoding()
-                if isLast {
-                    cb.encodeSignalEvent(event, value: UInt64(ti + 1))
-                }
-                cb.commit()
-                lastCB = cb
-                layerIdx = end
-                isFirstCB = false
             }
         }
         lastCB?.waitUntilCompleted()
@@ -727,6 +740,12 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
 
     public func generate(prompt: [Int], maxTokens: Int, eos: Int? = 151_645) throws -> [Int] {
         guard !prompt.isEmpty, maxTokens > 0 else { return [] }
+        // Full-attn layers need prompt+gen ≤ fullMaxLen. Fail cleanly before Metal encode.
+        if prompt.count >= fullMaxLen {
+            throw SeedlessError.unsupportedShape(N: prompt.count, K: fullMaxLen, gs: 0)
+        }
+        let capped = min(maxTokens, fullMaxLen - prompt.count)
+        guard capped > 0 else { return [] }
         reset()
         var last = prompt[0]
         for i in 0 ..< prompt.count {
@@ -740,10 +759,10 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         let chainK = Self.envChainK
         var out: [Int] = []
         var y = last
-        while out.count < maxTokens {
+        while out.count < capped {
             out.append(y)
             if let eos, y == eos { break }
-            let remain = maxTokens - out.count
+            let remain = capped - out.count
             if remain == 0 { break }
             if chainK > 1, useFlashHead, flashFused {
                 let n = min(chainK, remain, specMaxM)

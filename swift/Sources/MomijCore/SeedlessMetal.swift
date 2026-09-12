@@ -1003,8 +1003,13 @@ public enum SeedlessMetal {
         let t0 = CFAbsoluteTimeGetCurrent()
         let cb = q.makeCommandBuffer()!
         let enc = cb.makeComputeCommandEncoder()!
-        try body(enc)
-        enc.endEncoding()
+        do {
+            try body(enc)
+            enc.endEncoding()
+        } catch {
+            enc.endEncoding()
+            throw error
+        }
         cb.commit()
         cb.waitUntilCompleted()
         let wallMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000

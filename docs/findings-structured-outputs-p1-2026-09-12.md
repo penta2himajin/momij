@@ -1,6 +1,6 @@
 # Findings: momij structured_outputs (P1) — 2026-09-12
 
-Branch: `cursor/omlx-dropin-api`.
+Branch: `cursor/omlx-dropin-api` (includes `399b4a4` + follow-on fixes).
 
 ## Implemented
 
@@ -11,21 +11,20 @@ Constrained decode matching oMLX's insurance surface (evprtr `EVPRTR_TOOLS_GRAMM
 | `structured_outputs.grammar` = `root ::= "ZQX"` | FiniteStringGuide | → `ZQX` |
 | `guided_grammar` (same) | FiniteStringGuide | → `ZQX` |
 | `structured_outputs.choice` | FiniteStringGuide | → `red` (first-alt on ties) |
-| `structured_outputs.json` const / object | XGrammarTokenGuide | valid JSON (e.g. `"ZQX"` / `{"name":": ","ok":true}`) |
+| `structured_outputs.json` const / object | XGrammarTokenGuide | valid JSON |
 | complex EBNF / non-literal `regex` | XGrammarTokenGuide | wired |
 | Top-level `grammar` | — | **ignored** (oMLX parity) |
 
 Dependency: `https://github.com/mattt/swift-xgrammar.git` from `0.1.0`.
 
-- Finite languages: `FiniteStringGuide` + token frontier.
-- JSON / complex: `XGrammarTokenGuide` — tokenizer.json → byteLevel vocab; per step matcher replay + full-vocab bitmask (correct but slow on long prompts).
+## Related fixes (same day)
 
-## Live smoke
+- `8b47021` — seedless `endEncoding` on encode errors; context 16k
+- `a3fe719` — SWA absolute RoPE + sliding mask; default serve strips forced `<think>`  
+  → unblocked Pi-length prompts for **mlx** markup primary (P0-E PASS)
 
-`--backend mlx` and `--backend seedless` both produce `ZQX` / choice / JSON for short prompts (release binary).
+## Known limits
 
-## Not done / known limits
-
-- Stateful xgrammar matcher + sparse allowed-ID enumeration (per-step full vocab scan is too slow for Pi-length prompts).
-- Seedless serve still crashes under agentic load (`Command encoder released without endEncoding`); see evprtr `docs/findings/momij-upstream-e-2026-09-12.md`.
-- P0-E Pi smoke still blocked on long-prompt degeneration (mlx) / seedless instability — not on missing grammar wiring.
+- Stateful xgrammar matcher + sparse allowed-ID enumeration (full-vocab scan is slow)
+- seedless long-prompt parity not re-verified after SWA work (Metal path separate)
+- Markup primary strips OpenAI `tools` before `attach_tools_structured_outputs` — grammar insurance needs order fix on evprtr if used with markup

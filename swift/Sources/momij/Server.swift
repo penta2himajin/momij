@@ -182,7 +182,7 @@ enum MomijHTTP {
                 frequencyPenalty: chatReq.frequencyPenalty,
                 repetitionPenalty: chatReq.repetitionPenalty,
                 eosTokenIds: [eos],
-                useSuffixSpec: ProcessInfo.processInfo.environment["MOMIJ_SUFFIX_SPEC"] == "1"
+                useSuffixSpec: SeedlessServeDefaults.suffixSpecFromEnv
                     && allowedNext == nil,
                 seed: chatReq.seed,
                 allowedNext: allowedNext,

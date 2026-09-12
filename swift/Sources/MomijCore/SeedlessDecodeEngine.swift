@@ -21,6 +21,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     private let lmHead: QuantProj
     private let flashHead: SeedlessFlashHead?
     public let useFlashHead: Bool
+    /// When true, greedy argmax and SuffixSpec verify use exact `lm_head`
+    /// (M-row 1-CB still packs). Default FlashHead; `MOMIJ_EXACT_HEAD=1` to opt out.
+    public let greedyExactHead: Bool
     /// FlashHead cluster probes (env `MOMIJ_FLASH_PROBES`, default 64). 0 if FlashHead off.
     public var flashProbes: Int { flashHead?.nProbes ?? 0 }
     /// True when `MOMIJ_FLASH_FUSE=1` (topk+gather in layer CB).
@@ -60,7 +63,10 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
 
     public private(set) var lastPhase = PhaseMs()
 
-    public init(store: WeightStore, fullMaxLen: Int = 2048, enableFlashHead: Bool? = nil) throws {
+    public init(
+        store: WeightStore, fullMaxLen: Int = 2048,
+        enableFlashHead: Bool? = nil, enableExactHead: Bool? = nil
+    ) throws {
         try SeedlessMetal.ensureCompiled()
         guard let device = SeedlessMetal.device else { throw SeedlessError.notReady }
         self.store = store
@@ -107,6 +113,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         let wantFlash = enableFlashHead ?? (flashEnv != "0")
         flashHead = wantFlash ? SeedlessFlashHead(store: store, device: device) : nil
         useFlashHead = flashHead != nil
+        greedyExactHead = enableExactHead ?? SeedlessServeDefaults.exactHeadFromEnv
         if wantFlash && flashHead == nil {
             fputs("[momij] FlashHead weights missing; using exact lm_head\n", stderr)
         }
@@ -120,14 +127,19 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         finalNormBuf = device.makeBuffer(length: H * 2, options: .storageModeShared)!
     }
 
+    /// True when this call should skip FlashHead argmax (exact `lm_head`).
+    private var greedySkipFlash: Bool { greedyExactHead || !useFlashHead }
+
     private func ensureSpecSlots() {
-        guard specFeedIds == nil, let device = SeedlessMetal.device, let fh = flashHead else { return }
+        guard specFeedIds == nil, let device = SeedlessMetal.device else { return }
         specFeedIds = device.makeBuffer(length: (specMaxM + 1) * 4, options: .storageModeShared)
-        let logitBytes = fh.nProbes * fh.clusterSize * MemoryLayout<Float>.size
         for _ in 0 ..< specMaxM {
             specNormSlots.append(device.makeBuffer(length: H * 2, options: .storageModeShared)!)
-            specIndsSlots.append(device.makeBuffer(length: fh.nProbes * 4, options: .storageModeShared)!)
-            specLogitsSlots.append(device.makeBuffer(length: logitBytes, options: .storageModeShared)!)
+            if let fh = flashHead {
+                let logitBytes = fh.nProbes * fh.clusterSize * MemoryLayout<Float>.size
+                specIndsSlots.append(device.makeBuffer(length: fh.nProbes * 4, options: .storageModeShared)!)
+                specLogitsSlots.append(device.makeBuffer(length: logitBytes, options: .storageModeShared)!)
+            }
         }
         if useMrow {
             specPackedNorm = device.makeBuffer(length: specMaxM * H * 2, options: .storageModeShared)
@@ -136,33 +148,32 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
 
     /// C2: draft-driven chain verify in **one CB / one wait** (GPU embed; Qwisp chained style).
     /// `feeds` = [y] + draft (length D+1). Returns greedy evals[0..<feeds.count].
-    /// With M-row enabled (default) and capacity, packs True M-row layers instead of M×M=1.
+    /// FlashHead gather is the default head; `greedyExactHead` uses packed exact `lm_head`.
     public func stepChainFeeds(_ feeds: [Int]) throws -> [Int] {
         precondition(!feeds.isEmpty && feeds.count <= specMaxM)
-        guard useFlashHead, let fh = flashHead, fh.fuseIntoLayerCB else {
-            var out: [Int] = []
-            for t in feeds { out.append(try step(t)) }
-            return out
-        }
-        let packMrow = try encodeChainFeeds(feeds)
+        let wantFlash = !greedySkipFlash && flashFused && flashHead != nil
+        let packMrow = try encodeChainFeeds(feeds, withFlash: wantFlash)
         let M = feeds.count
-        var evals: [Int] = []
-        evals.reserveCapacity(M)
-        if packMrow, let packed = specPackedNorm {
-            let base = packed.contents().bindMemory(to: Float16.self, capacity: M * H)
-            for i in 0 ..< M {
-                evals.append(fh.greedyAfterFusedGather(
-                    hostH: base.advanced(by: i * H),
-                    inds: specIndsSlots[i], logits: specLogitsSlots[i]))
+        if wantFlash, let fh = flashHead {
+            var evals: [Int] = []
+            evals.reserveCapacity(M)
+            if packMrow, let packed = specPackedNorm {
+                let base = packed.contents().bindMemory(to: Float16.self, capacity: M * H)
+                for i in 0 ..< M {
+                    evals.append(fh.greedyAfterFusedGather(
+                        hostH: base.advanced(by: i * H),
+                        inds: specIndsSlots[i], logits: specLogitsSlots[i]))
+                }
+            } else {
+                for i in 0 ..< M {
+                    let ptr = specNormSlots[i].contents().bindMemory(to: Float16.self, capacity: H)
+                    evals.append(fh.greedyAfterFusedGather(
+                        hostH: ptr, inds: specIndsSlots[i], logits: specLogitsSlots[i]))
+                }
             }
-        } else {
-            for i in 0 ..< M {
-                let ptr = specNormSlots[i].contents().bindMemory(to: Float16.self, capacity: H)
-                evals.append(fh.greedyAfterFusedGather(
-                    hostH: ptr, inds: specIndsSlots[i], logits: specLogitsSlots[i]))
-            }
+            return evals
         }
-        return evals
+        return argmaxExactFromChain(M: M, packed: packMrow)
     }
 
     /// Same GPU chain as `stepChainFeeds`, but returns FlashHead candidate logits per row
@@ -175,7 +186,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             for t in feeds { rows.append(try stepCandidates(t)) }
             return rows
         }
-        let packMrow = try encodeChainFeeds(feeds)
+        let packMrow = try encodeChainFeeds(feeds, withFlash: true)
         let M = feeds.count
         var rows: [(ids: [Int], logits: [Float])] = []
         rows.reserveCapacity(M)
@@ -196,15 +207,15 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         return rows
     }
 
-    /// One CB: embed `feeds` × layers ± packed M-row → per-row FlashHead gather into spec slots.
+    /// One CB: embed `feeds` × layers ± packed M-row. FlashHead gather is optional.
     /// Returns whether True M-row packing ran.
     @discardableResult
-    private func encodeChainFeeds(_ feeds: [Int]) throws -> Bool {
-        guard let fh = flashHead else { throw SeedlessError.notReady }
+    private func encodeChainFeeds(_ feeds: [Int], withFlash: Bool) throws -> Bool {
         ensureSpecSlots()
         guard let q = SeedlessMetal.queue, let feedBuf = specFeedIds else {
             throw SeedlessError.notReady
         }
+        let fh = withFlash ? flashHead : nil
         let M = feeds.count
         let ip = feedBuf.contents().bindMemory(to: Int32.self, capacity: M)
         for (i, t) in feeds.enumerated() { ip[i] = Int32(t) }
@@ -225,12 +236,14 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 SeedlessMetal.encodeRms(
                     into: enc, h: stack.hBuf, w: normWBuf, out: packed,
                     H: H, eps: config.rmsNormEps, M: M)
-                for i in 0 ..< M {
-                    let off = i * H * 2
-                    fh.encodeCentroids(into: enc, h: packed, hByteOffset: off)
-                    fh.encodeFusedAfterCentroids(
-                        into: enc, h: packed, inds: specIndsSlots[i],
-                        logits: specLogitsSlots[i], hByteOffset: off)
+                if let fh {
+                    for i in 0 ..< M {
+                        let off = i * H * 2
+                        fh.encodeCentroids(into: enc, h: packed, hByteOffset: off)
+                        fh.encodeFusedAfterCentroids(
+                            into: enc, h: packed, inds: specIndsSlots[i],
+                            logits: specLogitsSlots[i], hByteOffset: off)
+                    }
                 }
             } else {
                 for i in 0 ..< M {
@@ -242,9 +255,11 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                     let norm = specNormSlots[i]
                     SeedlessMetal.encodeRms(
                         into: enc, h: stack.hBuf, w: normWBuf, out: norm, H: H, eps: config.rmsNormEps)
-                    fh.encodeCentroids(into: enc, h: norm)
-                    fh.encodeFusedAfterCentroids(
-                        into: enc, h: norm, inds: specIndsSlots[i], logits: specLogitsSlots[i])
+                    if let fh {
+                        fh.encodeCentroids(into: enc, h: norm)
+                        fh.encodeFusedAfterCentroids(
+                            into: enc, h: norm, inds: specIndsSlots[i], logits: specLogitsSlots[i])
+                    }
                 }
             }
             enc.endEncoding()
@@ -255,6 +270,51 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         cb.commit()
         cb.waitUntilCompleted()
         return packMrow
+    }
+
+    private func argmaxExactFromChain(M: Int, packed: Bool) -> [Int] {
+        if packed, let packedBuf = specPackedNorm {
+            let base = packedBuf.contents().bindMemory(to: Float16.self, capacity: M * H)
+            return argmaxExactRows(base, M: M)
+        }
+        var out: [Int] = []
+        out.reserveCapacity(M)
+        for i in 0 ..< M {
+            let ptr = specNormSlots[i].contents().bindMemory(to: Float16.self, capacity: H)
+            out.append(contentsOf: argmaxExactRows(ptr, M: 1))
+        }
+        return out
+    }
+
+    private func argmaxExactRows(_ ptr: UnsafePointer<Float16>, M: Int) -> [Int] {
+        let h = MLXArray(UnsafeBufferPointer(start: ptr, count: M * H)).reshaped([M, 1, H])
+        let logits = lmHead.apply(h)
+        var ids: [Int] = []
+        ids.reserveCapacity(M)
+        for i in 0 ..< M {
+            var scores = ConstrainedPick.hostScores(logits[i])
+            ConstrainedPick.applyBanned(&scores, banned: decodeBanned)
+            ids.append(ConstrainedPick.argmaxAll(scores))
+        }
+        return ids
+    }
+
+    private func pickGreedyFromFinalNorm(skipFlash: Bool) -> Int {
+        if skipFlash || greedySkipFlash {
+            return nextToken()
+        }
+        guard let fh = flashHead else { return nextToken() }
+        let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
+        let id = fh.fuseIntoLayerCB
+            ? fh.greedyAfterFusedGather(hostH: ptr)
+            : fh.greedyAfterCentroids(hBuf: finalNormBuf, hostH: ptr)
+        if !decodeBanned.isEmpty && decodeBanned.contains(id) {
+            if let alt = fh.topTokenCandidates(k: 512).first(where: { !decodeBanned.contains($0) }) {
+                return alt
+            }
+            return nextTokenBannedFallback()
+        }
+        return id
     }
 
     /// Greedy GPU token-feedback chain with **layersPerCB commits** + MTLSharedEvent
@@ -425,6 +485,39 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             return nextTokenBannedFallback()
         }
         return id
+    }
+
+    /// Same prefill hidden: exact `lm_head` argmax vs FlashHead probe argmax.
+    func firstTokenExactVsFlash(_ prompt: [Int]) throws -> (
+        exact: Int, flash: Int, exactInFlashTop: Bool, flashTop: [Int]
+    ) {
+        guard let fh = flashHead else { throw SeedlessError.notReady }
+        reset()
+        try prefillPrompt(prompt, skipFlash: false)
+        let exact = nextToken()
+        let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
+        let flash = fh.greedyAfterFusedGather(hostH: ptr)
+        let top = fh.topTokenCandidates(k: 512)
+        return (exact, flash, top.contains(exact), top)
+    }
+
+    /// FlashHead-greedy continuation (not the serve path). For quality probes.
+    func generateFlashHeadGreedy(prompt: [Int], maxTokens: Int) throws -> [Int] {
+        guard let fh = flashHead, !prompt.isEmpty, maxTokens > 0 else { return [] }
+        reset()
+        try prefillPrompt(prompt, skipFlash: false)
+        let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
+        var y = fh.greedyAfterFusedGather(hostH: ptr)
+        var out: [Int] = []
+        while out.count < maxTokens {
+            out.append(y)
+            embedToken(y)
+            try stack.stepCommitWait(layersPerCB: layersPerCB)
+            try encodeFinalNorm(fromLastRow: 0, skipFlash: false)
+            y = fh.greedyAfterFusedGather(
+                hostH: finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H))
+        }
+        return out
     }
 
     /// Prefill `prompt` then return exact `lm_head` scores (for tests / banned-argmax).
@@ -902,7 +995,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         if let allowed {
             next = nextTokenConstrained(allowed)
         } else {
-            next = nextToken()
+            next = pickGreedyFromFinalNorm(skipFlash: skipFlash)
             observeRecycle(fromToken: token)
         }
         let t3 = CFAbsoluteTimeGetCurrent()
@@ -945,12 +1038,13 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         guard capped > 0 else { return [] }
         reset()
         let constrain = allowedNext != nil
-        try prefillPrompt(prompt, skipFlash: true)
+        let skipH = constrain || greedySkipFlash
+        try prefillPrompt(prompt, skipFlash: skipH)
         var last: Int
         if constrain, let allowedNext {
             last = nextTokenConstrained(allowedNext([]))
         } else {
-            last = nextToken()
+            last = pickGreedyFromFinalNorm(skipFlash: skipH)
         }
         let chainK = constrain ? 0 : Self.envChainK
         var out: [Int] = []
@@ -966,7 +1060,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 y = try step(y, skipFlash: true, allowed: allow)
                 continue
             }
-            if chainK > 1, useFlashHead, flashFused {
+            if chainK > 1, useFlashHead, flashFused, !greedySkipFlash {
                 let n = min(chainK, remain, specMaxM)
                 let toks = try stepGreedyChain(from: y, count: n)
                 if let eos, let ei = toks.firstIndex(of: eos) {
@@ -980,7 +1074,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                     y = toks.last!
                 }
             } else {
-                y = try step(y, skipFlash: true)
+                y = try step(y, skipFlash: skipH)
             }
         }
         return out
@@ -997,16 +1091,18 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     }
 
     /// SuffixSpec decode: free draft from history, early-exit greedy verify.
-    /// Lossless vs `generate`. Sequential verify ≈ greedy speed; early exit + gate
-    /// avoid wasted steps on cold drafts. Batched verify (future) is required for
-    /// peak ≫ greedy.
+    /// Head matches `generate` (FlashHead default; exact when `greedyExactHead`).
+    /// Hot drafts batch via M-row 1-CB (`MOMIJ_SPEC_BATCH=0` forces sequential).
     public func generateSuffixSpec(
-        prompt: [Int], maxTokens: Int, draftK: Int = 8, eos: Int? = 151_645
+        prompt: [Int], maxTokens: Int, draftK: Int = 8, eos: Int? = 151_645,
+        bannedTokenIds: [Int] = []
     ) throws -> (tokens: [Int], accepted: Int, attempts: Int, gated: Int) {
+        decodeBanned = bannedTokenIds
+        defer { decodeBanned = [] }
         guard !prompt.isEmpty, maxTokens > 0 else { return ([], 0, 0, 0) }
         reset()
-        try prefillPrompt(prompt, skipFlash: true)
-        let y = nextToken()
+        try prefillPrompt(prompt, skipFlash: greedySkipFlash)
+        let y = pickGreedyFromFinalNorm(skipFlash: greedySkipFlash)
         let r = try generateSuffixSpecFromPrefill(
             first: y, promptIds: prompt, maxTokens: maxTokens, draftK: draftK, eos: eos)
         return (r.tokens, r.accepted, r.attempts, r.gated)
@@ -1097,12 +1193,10 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
 
     /// Forced full-accept path: same feeds via sequential steps vs one-CB chain.
     public func benchmarkChainVerify(steps: Int = 8, trials: Int = 5) throws -> String {
-        guard useFlashHead, flashFused else {
-            return "chain-verify: skipped (need FlashHead fuse)"
-        }
         let K = min(steps, specMaxM)
         let prompt = Array(repeating: 100, count: 64)
         _ = try generate(prompt: prompt, maxTokens: 4, eos: nil)
+        let skipH = greedySkipFlash
 
         var seqTps: [Double] = []
         var chainTps: [Double] = []
@@ -1111,15 +1205,14 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             reset()
             var last = prompt[0]
             for i in 0 ..< prompt.count {
-                if i + 1 < prompt.count { _ = try step(prompt[i]) }
-                else { last = try step(prompt[i]) }
+                if i + 1 < prompt.count { _ = try step(prompt[i], skipFlash: skipH) }
+                else { last = try step(prompt[i], skipFlash: skipH) }
             }
-            // Build greedy chain feeds: embed last → o0; embed o0 → o1; ...
             var feeds: [Int] = [last]
             var cur = last
             var expected: [Int] = []
             for i in 0 ..< K {
-                let q = try step(cur)
+                let q = try step(cur, skipFlash: skipH)
                 expected.append(q)
                 cur = q
                 if i + 1 < K { feeds.append(q) }
@@ -1127,12 +1220,11 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             let snapFeeds = feeds
             let snapExpected = expected
 
-            // Rewind to post-prefill: re-prefill cleanly
             reset()
             last = prompt[0]
             for i in 0 ..< prompt.count {
-                if i + 1 < prompt.count { _ = try step(prompt[i]) }
-                else { last = try step(prompt[i]) }
+                if i + 1 < prompt.count { _ = try step(prompt[i], skipFlash: skipH) }
+                else { last = try step(prompt[i], skipFlash: skipH) }
             }
             let snap = stack.snapshotForChain(steps: K)
 
@@ -1140,7 +1232,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             cur = last
             var seq2: [Int] = []
             for _ in 0 ..< K {
-                let q = try step(cur)
+                let q = try step(cur, skipFlash: skipH)
                 seq2.append(q)
                 cur = q
             }
@@ -1154,8 +1246,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         }
         let s = seqTps.reduce(0, +) / Double(trials)
         let c = chainTps.reduce(0, +) / Double(trials)
-        return String(format: "chain-verify K=%d: sequential=%.1f tok/s  chain1cb=%.1f tok/s  match=%@  speedup=%.2fx",
-                      K, s, c, match ? "true" : "false", c / max(s, 1e-9))
+        let head = greedySkipFlash ? "exact" : "flash"
+        return String(format: "chain-verify K=%d head=%@: sequential=%.1f tok/s  chain1cb=%.1f tok/s  match=%@  speedup=%.2fx",
+                      K, head, s, c, match ? "true" : "false", c / max(s, 1e-9))
     }
 
     /// Prefill already done; `first` is the first generated token; `promptIds` is the prompt.
@@ -1229,18 +1322,16 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
 
             if (draft.isEmpty || suspend) && !reprobe {
                 if !draft.isEmpty { gated += 1 }
-                y = try step(y)
+                y = try step(y, skipFlash: greedySkipFlash)
                 out.append(y)
                 ids.append(y)
                 continue
             }
 
             attempts += 1
-            // Hot only: batch (+ M-row pack when useMrow). Cold must stay sequential
-            // early-exit / greedy — forced MOMIJ_SPEC_BATCH=1 still allowed for benches.
             let hotEnough = meanAccept >= 1.5
-            let useBatch = !batchOff && useFlashHead && flashFused
-                && (batchForce || hotEnough)
+            let canBatch = useMrow || (useFlashHead && flashFused)
+            let useBatch = !batchOff && canBatch && (batchForce || hotEnough)
             let accepted: Int
             if useBatch {
                 let r = try verifyDraftChain(y: y, draft: draft)
@@ -1257,7 +1348,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 var acc = 0
                 var cur = y
                 for (di, d) in draft.enumerated() {
-                    let q = try step(cur)
+                    let q = try step(cur, skipFlash: greedySkipFlash)
                     out.append(q)
                     ids.append(q)
                     y = q
@@ -1337,7 +1428,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         let snap = stack.snapshotForChain(steps: feeds.count)
         let evals = try stepChainFeeds(feeds)
         // Refresh recycle adjacency from each FlashHead row (open-chat TR).
-        if useRecycle {
+        if useRecycle, !greedySkipFlash, !specIndsSlots.isEmpty {
             for i in 0 ..< min(feeds.count, specIndsSlots.count) {
                 observeRecycle(fromToken: feeds[i], inds: specIndsSlots[i], logits: specLogitsSlots[i])
             }
@@ -1354,7 +1445,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         stack.restoreCaches(snap)
         if p == 0 {
             // Single greedy step from y (must match evals[0]).
-            let q = try step(y)
+            let q = try step(y, skipFlash: greedySkipFlash)
             return (0, q)
         }
         let replay = [y] + Array(draft.prefix(p))
@@ -1378,9 +1469,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             var last = prompt[0]
             for i in 0 ..< prompt.count {
                 if i + 1 < prompt.count {
-                    _ = try step(prompt[i], profile: false, skipFlash: true)
+                    _ = try step(prompt[i], profile: false, skipFlash: greedySkipFlash)
                 } else {
-                    last = try step(prompt[i], profile: false, skipFlash: true)
+                    last = try step(prompt[i], profile: false, skipFlash: greedySkipFlash)
                 }
             }
             let t1 = CFAbsoluteTimeGetCurrent()
@@ -1394,7 +1485,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                     produced += toks.count
                     y = toks.last!
                 } else {
-                    y = try step(y, profile: profile, skipFlash: true)
+                    y = try step(y, profile: profile, skipFlash: greedySkipFlash)
                     produced += 1
                     if profile {
                         accum.embed += lastPhase.embed

@@ -1908,8 +1908,8 @@ final class SeedlessContextTests: XCTestCase {
         XCTAssertTrue(mismatches.isEmpty, mismatches.joined(separator: "; "))
     }
 
-    /// Default serve loads FlashHead weights, but greedy decode must still
-    /// use exact `lm_head` (FlashHead probes miss the true argmax).
+    /// Default serve loads FlashHead; greedy dummy-100 is outside its clusters.
+    /// `MOMIJ_EXACT_HEAD` / `enableExactHead` keeps exact `lm_head` even with FlashHead loaded.
     func testGreedyFirstTokenIgnoresFlashHeadApprox() throws {
         guard FileManager.default.fileExists(atPath: modelDir) else {
             throw XCTSkip("model not present")
@@ -1918,12 +1918,82 @@ final class SeedlessContextTests: XCTestCase {
         store.residentAll()
         let exact = try SeedlessDecodeEngine(
             store: store, fullMaxLen: 256, enableFlashHead: false)
-        let flash = try SeedlessDecodeEngine(
-            store: store, fullMaxLen: 256, enableFlashHead: true)
+        let flashExact = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 256, enableFlashHead: true, enableExactHead: true)
         let prompt = Array(repeating: 100, count: 8)
         let a = try exact.generate(prompt: prompt, maxTokens: 1, eos: nil)
-        let b = try flash.generate(prompt: prompt, maxTokens: 1, eos: nil)
-        XCTAssertEqual(a, b, "greedy with FlashHead loaded \(b) != exact lm_head \(a)")
+        let b = try flashExact.generate(prompt: prompt, maxTokens: 1, eos: nil)
+        XCTAssertEqual(a, b, "exact-head with FlashHead loaded \(b) != exact lm_head \(a)")
+    }
+
+    /// Opt-in SuffixSpec sequential verify must stay on exact greedy (not FlashHead).
+    func testSuffixSpecSequentialMatchesExactGenerate() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let seed = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 256, enableFlashHead: true, enableExactHead: true)
+        let prompt = Array(repeating: 100, count: 16)
+        let greedy = try seed.generate(prompt: prompt, maxTokens: 8, eos: nil)
+        let spec = try seed.generateSuffixSpec(prompt: prompt, maxTokens: 8, eos: nil)
+        XCTAssertEqual(spec.tokens, greedy, "suffix-spec \(spec.tokens) != exact greedy \(greedy)")
+        let banned = ChatTemplatePatch.bannedAssistantTokenIds
+        let greedyBan = try seed.generate(
+            prompt: prompt, maxTokens: 8, eos: nil, bannedTokenIds: banned)
+        let specBan = try seed.generateSuffixSpec(
+            prompt: prompt, maxTokens: 8, eos: nil, bannedTokenIds: banned)
+        XCTAssertEqual(specBan.tokens, greedyBan)
+    }
+
+    /// Exact M-row 1-CB chain must match sequential skipFlash (lossless opt-out path).
+    func testExactMrowChainMatchesSequential() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let seed = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 256, enableFlashHead: true, enableExactHead: true)
+        XCTAssertTrue(seed.greedyExactHead)
+        func check(_ prompt: [Int]) throws {
+            seed.reset()
+            var last = prompt[0]
+            for i in 0 ..< prompt.count {
+                if i + 1 < prompt.count {
+                    _ = try seed.step(prompt[i], skipFlash: true)
+                } else {
+                    last = try seed.step(prompt[i], skipFlash: true)
+                }
+            }
+            let K = 4
+            var feeds = [last]
+            var expected: [Int] = []
+            var cur = last
+            for i in 0 ..< K {
+                let q = try seed.step(cur, skipFlash: true)
+                expected.append(q)
+                cur = q
+                if i + 1 < K { feeds.append(q) }
+            }
+            seed.reset()
+            last = prompt[0]
+            for i in 0 ..< prompt.count {
+                if i + 1 < prompt.count {
+                    _ = try seed.step(prompt[i], skipFlash: true)
+                } else {
+                    last = try seed.step(prompt[i], skipFlash: true)
+                }
+            }
+            let chain = try seed.stepChainFeeds(feeds)
+            XCTAssertEqual(chain, expected, "prompt=\(prompt.prefix(4))… chain=\(chain) seq=\(expected)")
+        }
+        try check(Array(repeating: 100, count: 16))
+        try check([
+            151_644, 872, 198, 20_841, 448, 6896, 25, 10_402, 151_645, 198,
+            151_644, 77_091, 198,
+        ])
     }
 
     /// After the first token, sequential Metal decode must stay on the MLX greedy path.
@@ -1935,7 +2005,7 @@ final class SeedlessContextTests: XCTestCase {
         store.residentAll()
         let mlx = MapleEngine(store: store, enableSeedlessMoE: false)
         let seed = try SeedlessDecodeEngine(
-            store: store, fullMaxLen: 1024, enableFlashHead: true)
+            store: store, fullMaxLen: 1024, enableFlashHead: true, enableExactHead: true)
         var mismatches: [String] = []
         for len in [16, 64, 128] {
             let prompt = Array(repeating: 100, count: len)
@@ -1969,6 +2039,58 @@ final class SeedlessContextTests: XCTestCase {
         let seedTok = try seed.generate(
             prompt: prompt, maxTokens: 8, eos: 151_645, bannedTokenIds: banned)
         XCTAssertEqual(seedTok, mlxTok, "seedless \(seedTok) != mlx \(mlxTok)")
+    }
+
+    /// Dummy token-100 vs real chat/code-like prefixes: is FlashHead miss an artifact?
+    func testFlashHeadVsExactOnDummyAndChat() throws {
+        guard FileManager.default.fileExists(atPath: modelDir) else {
+            throw XCTSkip("model not present")
+        }
+        let store = try WeightStore(modelDir: modelDir)
+        store.residentAll()
+        let seed = try SeedlessDecodeEngine(
+            store: store, fullMaxLen: 256, enableFlashHead: true)
+        XCTAssertTrue(seed.useFlashHead)
+
+        let chat = [
+            151_644, 872, 198, 20_841, 448, 6896, 25, 10_402, 151_645, 198,
+            151_644, 77_091, 198,
+        ]
+        // Minimal "code" ids already in the chat template plus a fib-like tail of
+        // distinct small-vocab tokens (not a single repeated dummy).
+        let codeish = chat + [16, 13, 17, 13, 18, 13, 19]
+
+        func probe(_ name: String, _ prompt: [Int]) throws -> (
+            name: String, exact: Int, flash: Int, inTop: Bool, flashTop: [Int]
+        ) {
+            let r = try seed.firstTokenExactVsFlash(prompt)
+            return (name, r.exact, r.flash, r.exactInFlashTop, r.flashTop)
+        }
+
+        let dummy8 = try probe("dummy8x100", Array(repeating: 100, count: 8))
+        let dummy1 = try probe("dummy1x100", [100])
+        let chat1 = try probe("chat13", chat)
+        let code1 = try probe("codeish", codeish)
+
+        let exactCont = try seed.generate(prompt: chat, maxTokens: 8, eos: nil)
+        let flashCont = try seed.generateFlashHeadGreedy(prompt: chat, maxTokens: 8)
+
+        let banned = ChatTemplatePatch.bannedAssistantTokenIds
+        let exactBan = try seed.generate(
+            prompt: chat, maxTokens: 1, eos: nil, bannedTokenIds: banned)
+        let flashBan = chat1.flashTop.first { !banned.contains($0) }
+
+        // Dummy token-100 is outside FlashHead's probed clusters (harsh, not chat).
+        XCTAssertNotEqual(dummy8.exact, dummy8.flash, "dummy8: \(dummy8)")
+        XCTAssertFalse(dummy8.inTop)
+        XCTAssertNotEqual(dummy1.exact, dummy1.flash, "dummy1: \(dummy1)")
+        XCTAssertFalse(dummy1.inTop)
+        // Natural chat / code-like prefixes: FlashHead hits the exact argmax.
+        XCTAssertEqual(chat1.exact, chat1.flash, "chat first \(chat1)")
+        XCTAssertTrue(chat1.inTop)
+        XCTAssertEqual(code1.exact, code1.flash, "codeish first \(code1)")
+        XCTAssertEqual(exactCont, flashCont, "chat 8-tok exact=\(exactCont) flash=\(flashCont)")
+        XCTAssertEqual(exactBan, [flashBan].compactMap { $0 }, "banned exact=\(exactBan) flashBan=\(String(describing: flashBan))")
     }
 
     /// Banning `<think>` must pick the same second-best as mlx (serve default).

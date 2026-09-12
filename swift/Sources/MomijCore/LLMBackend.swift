@@ -51,17 +51,61 @@ public struct GenerateOptions: Sendable {
             && frequencyPenalty == 0
             && abs(repetitionPenalty - 1) < 1e-6
     }
+
+    /// Fastest measured seedless path that keeps this request's sampling contract.
+    public func seedlessServePath(speculativeSample: Bool) -> SeedlessServePath {
+        if allowedNext != nil { return .grammar }
+        if isGreedyCompatible {
+            return useSuffixSpec ? .greedySuffixSpec : .greedyExact
+        }
+        return speculativeSample ? .sampledSpeculative : .sampled
+    }
+}
+
+/// Seedless serve decode route. SuffixSpec / sampled spec default on (`=0` off).
+public enum SeedlessServePath: Equatable, Sendable {
+    case grammar
+    case greedyExact
+    case greedySuffixSpec
+    case sampled
+    case sampledSpeculative
+}
+
+public enum SeedlessServeDefaults {
+    /// Default-on flags: unset or any value except `"0"`.
+    public static func envOnByDefault(_ value: String?) -> Bool { value != "0" }
+
+    /// Default-off flags: only `"1"` enables.
+    public static func envOffByDefault(_ value: String?) -> Bool { value == "1" }
+
+    /// SuffixSpec drafts + M-row verify. `MOMIJ_SUFFIX_SPEC=0` to disable.
+    public static var suffixSpecFromEnv: Bool {
+        envOnByDefault(ProcessInfo.processInfo.environment["MOMIJ_SUFFIX_SPEC"])
+    }
+
+    /// Sampled rejection-sampling drafts. `MOMIJ_SPEC_SAMPLE=0` to disable.
+    public static var speculativeSampleFromEnv: Bool {
+        envOnByDefault(ProcessInfo.processInfo.environment["MOMIJ_SPEC_SAMPLE"])
+    }
+
+    /// Greedy / SuffixSpec verify use exact `lm_head` (still M-row packed).
+    /// Measured p128/g128: FlashHead 1-step ~179 vs exact ~165; chain K=8
+    /// ~410 vs ~339 (`match=true` vs same-head sequential). Default FlashHead.
+    /// `MOMIJ_EXACT_HEAD=1` to opt out.
+    public static var exactHeadFromEnv: Bool {
+        envOffByDefault(ProcessInfo.processInfo.environment["MOMIJ_EXACT_HEAD"])
+    }
 }
 
 public protocol LLMBackend: AnyObject {
     func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncThrowingStream<Int, Error>
 }
 
-/// Production Seedless Metal backend. Greedy-compatible requests keep SuffixSpec/M-row;
-/// sampling / penalties use FlashHead candidate sampling (+ optional speculative).
+/// Production Seedless Metal backend. FlashHead greedy + SuffixSpec / sampled spec
+/// are default-on (`=0` to disable). `MOMIJ_EXACT_HEAD=1` keeps M-row verify.
 public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     public let engine: SeedlessDecodeEngine
-    /// When true (default), non-greedy paths use rejection-sampling drafts.
+    /// When true, non-greedy paths use rejection-sampling drafts (`MOMIJ_SPEC_SAMPLE=0` off).
     public let speculativeSample: Bool
 
     public init(modelDir: String, fullMaxLen: Int = 16_384) throws {
@@ -69,7 +113,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         store.residentAll()
         try SeedlessMetal.ensureCompiled()
         self.engine = try SeedlessDecodeEngine(store: store, fullMaxLen: fullMaxLen)
-        self.speculativeSample = ProcessInfo.processInfo.environment["MOMIJ_SPEC_SAMPLE"] != "0"
+        self.speculativeSample = SeedlessServeDefaults.speculativeSampleFromEnv
     }
 
     public init(engine: SeedlessDecodeEngine, speculativeSample: Bool = true) {
@@ -83,34 +127,33 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 do {
                     let eos = options.eosTokenIds.first
                     let tokens: [Int]
-                    if let allowedNext = options.allowedNext {
+                    switch options.seedlessServePath(speculativeSample: self.speculativeSample) {
+                    case .grammar:
                         tokens = try self.engine.generate(
                             prompt: prompt, maxTokens: options.maxTokens,
-                            eos: eos, allowedNext: allowedNext,
+                            eos: eos, allowedNext: options.allowedNext,
                             bannedTokenIds: options.bannedTokenIds)
-                    } else if options.isGreedyCompatible {
-                        if options.useSuffixSpec {
-                            let r = try self.engine.generateSuffixSpec(
-                                prompt: prompt, maxTokens: options.maxTokens,
-                                draftK: options.draftK, eos: eos)
-                            tokens = r.tokens
-                        } else {
-                            tokens = try self.engine.generate(
-                                prompt: prompt, maxTokens: options.maxTokens, eos: eos,
-                                bannedTokenIds: options.bannedTokenIds)
-                        }
-                    } else {
+                    case .greedySuffixSpec:
+                        let r = try self.engine.generateSuffixSpec(
+                            prompt: prompt, maxTokens: options.maxTokens,
+                            draftK: options.draftK, eos: eos,
+                            bannedTokenIds: options.bannedTokenIds)
+                        tokens = r.tokens
+                    case .greedyExact:
+                        tokens = try self.engine.generate(
+                            prompt: prompt, maxTokens: options.maxTokens, eos: eos,
+                            bannedTokenIds: options.bannedTokenIds)
+                    case .sampledSpeculative:
                         let proc = LogitsProcessor.from(options)
-                        if self.speculativeSample {
-                            tokens = try self.engine.generateSampledSpeculative(
-                                prompt: prompt, maxTokens: options.maxTokens,
-                                processor: proc, draftK: options.draftK,
-                                eos: eos, seed: options.seed)
-                        } else {
-                            tokens = try self.engine.generateSampled(
-                                prompt: prompt, maxTokens: options.maxTokens,
-                                processor: proc, eos: eos, seed: options.seed)
-                        }
+                        tokens = try self.engine.generateSampledSpeculative(
+                            prompt: prompt, maxTokens: options.maxTokens,
+                            processor: proc, draftK: options.draftK,
+                            eos: eos, seed: options.seed)
+                    case .sampled:
+                        let proc = LogitsProcessor.from(options)
+                        tokens = try self.engine.generateSampled(
+                            prompt: prompt, maxTokens: options.maxTokens,
+                            processor: proc, eos: eos, seed: options.seed)
                     }
                     for t in tokens { cont.yield(t) }
                     cont.finish()

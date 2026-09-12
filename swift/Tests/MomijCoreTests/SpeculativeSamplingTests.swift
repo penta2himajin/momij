@@ -61,6 +61,35 @@ final class SpeculativeSamplingTests: XCTestCase {
         XCTAssertTrue(opts.isGreedyCompatible)
     }
 
+    /// Serve flags default on (`=0` to disable); exact head is opt-out (`=1`).
+    func testSeedlessServePathPicksFastestLosslessDefault() {
+        XCTAssertTrue(SeedlessServeDefaults.envOnByDefault(nil))
+        XCTAssertTrue(SeedlessServeDefaults.envOnByDefault("1"))
+        XCTAssertFalse(SeedlessServeDefaults.envOnByDefault("0"))
+        XCTAssertFalse(SeedlessServeDefaults.envOffByDefault(nil))
+        XCTAssertTrue(SeedlessServeDefaults.envOffByDefault("1"))
+
+        let greedy = GenerateOptions()
+        XCTAssertEqual(greedy.seedlessServePath(speculativeSample: false), .greedyExact)
+        XCTAssertEqual(greedy.seedlessServePath(speculativeSample: true), .greedyExact)
+
+        var specOn = GenerateOptions()
+        specOn.useSuffixSpec = true
+        XCTAssertEqual(specOn.seedlessServePath(speculativeSample: false), .greedySuffixSpec)
+
+        var grammar = GenerateOptions()
+        grammar.allowedNext = { _ in [1] }
+        grammar.useSuffixSpec = true
+        XCTAssertEqual(grammar.seedlessServePath(speculativeSample: true), .grammar)
+
+        let sampled = GenerateOptions(temperature: 0.7)
+        XCTAssertEqual(sampled.seedlessServePath(speculativeSample: false), .sampled)
+        XCTAssertEqual(sampled.seedlessServePath(speculativeSample: true), .sampledSpeculative)
+        XCTAssertEqual(
+            GenerateOptions(presencePenalty: 0.1).seedlessServePath(speculativeSample: false),
+            .sampled)
+    }
+
     /// temp=0 + draft matches per-row argmax → full accept, bonus from last row.
     func testWalkDraftGreedyFullAccept() {
         var rng = SplitMix64(seed: 1)

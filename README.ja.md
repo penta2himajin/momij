@@ -61,8 +61,9 @@ swift run -c release momij -- seedless-bench --model ~/models/deepgrove/maple-pr
 # OpenAI server (default port 8742) — point evprtr / clients here instead of oMLX for Maple
 swift run -c release momij -- serve --model ~/models/deepgrove/maple-preview-2bit-mlx --port 8742
 
-# SuffixSpec (env or flag)
-MOMIJ_SUFFIX_SPEC=1 swift run -c release momij -- serve --model ~/models/deepgrove/maple-preview-2bit-mlx
+# SuffixSpec / sampled spec は既定 on（`=0` で off）。exact lm_head は `MOMIJ_EXACT_HEAD=1`
+MOMIJ_SUFFIX_SPEC=0 swift run -c release momij -- serve --model ~/models/deepgrove/maple-preview-2bit-mlx
+MOMIJ_EXACT_HEAD=1 swift run -c release momij -- serve --model ~/models/deepgrove/maple-preview-2bit-mlx
 ```
 
 ## Build & Test

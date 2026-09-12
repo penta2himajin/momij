@@ -241,7 +241,8 @@ struct MomijMain {
         default:
             backend = try SeedlessBackend(modelDir: model)
         }
-        let engine = MomijHTTP.MomijEngine(tokenizer: tokenizer, backend: backend, modelID: modelID)
+        let engine = MomijHTTP.MomijEngine(
+            tokenizer: tokenizer, backend: backend, modelID: modelID, modelDir: model)
         try await MomijHTTP.runServe(engine: engine, host: host, port: port)
     }
 

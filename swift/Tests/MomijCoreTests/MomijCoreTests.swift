@@ -1632,6 +1632,39 @@ final class OpenAIChatCompatTests: XCTestCase {
         XCTAssertEqual(req.messages[0].content, "hi")
         XCTAssertEqual(req.maxTokens, 16)
         XCTAssertEqual(req.model, "maple")
+        // P0: unknown fields ignored for parse success; P1: JSON schema captured.
+        if case .jsonSchema(let schema)? = req.structuredConstraint {
+            XCTAssertTrue(schema.contains("object"))
+        } else {
+            XCTFail("expected jsonSchema constraint, got \(String(describing: req.structuredConstraint))")
+        }
+    }
+
+    func testParsesGuidedGrammarLiteralUnion() throws {
+        let raw = """
+        {"messages":[{"role":"user","content":"x"}],\
+        "guided_grammar":"root ::= \\"ZQX\\"",\
+        "max_tokens":8}
+        """.data(using: .utf8)!
+        let req = try OpenAIChatCompat.parseRequest(from: raw)
+        XCTAssertEqual(req.structuredConstraint, .choice(["ZQX"]))
+    }
+
+    func testParsesStructuredOutputsChoice() throws {
+        let raw = """
+        {"messages":[{"role":"user","content":"x"}],\
+        "structured_outputs":{"choice":["red","green","blue"]}}
+        """.data(using: .utf8)!
+        let req = try OpenAIChatCompat.parseRequest(from: raw)
+        XCTAssertEqual(req.structuredConstraint, .choice(["red", "green", "blue"]))
+    }
+
+    func testTopLevelGrammarIgnored() throws {
+        let raw = """
+        {"messages":[{"role":"user","content":"x"}],"grammar":"root ::= \\"ZQX\\""}
+        """.data(using: .utf8)!
+        let req = try OpenAIChatCompat.parseRequest(from: raw)
+        XCTAssertNil(req.structuredConstraint)
     }
 
     func testNullContentIsEmptyString() throws {
@@ -1719,6 +1752,46 @@ final class OpenAIChatCompatTests: XCTestCase {
         XCTAssertEqual(choices[0]["finish_reason"] as? String, "stop")
         let usage = obj["usage"] as! [String: Any]
         XCTAssertEqual(usage["total_tokens"] as? Int, 4)
+    }
+}
+
+final class StructuredOutputsTests: XCTestCase {
+    func testParseLiteralEBNF() {
+        XCTAssertEqual(
+            StructuredOutputs.parseLiteralUnionEBNF(#"root ::= "ZQX""#),
+            .choice(["ZQX"]))
+        XCTAssertEqual(
+            StructuredOutputs.parseLiteralUnionEBNF(#"root ::= "red" | "green" | "blue""#),
+            .choice(["red", "green", "blue"]))
+    }
+
+    func testFiniteStringGuideFrontier() throws {
+        let guide = try FiniteStringGuide(
+            strings: ["ab", "ac"],
+            encode: { Array($0.unicodeScalars.map { Int($0.value) }) },
+            eosTokenId: 999)
+        XCTAssertEqual(guide.allowedNext(prefix: []), Set([Int(("a" as Character).asciiValue!)]))
+        XCTAssertEqual(
+            guide.allowedNext(prefix: [Int(("a" as Character).asciiValue!)]),
+            Set([Int(("b" as Character).asciiValue!), Int(("c" as Character).asciiValue!)]))
+        XCTAssertEqual(
+            guide.allowedNext(prefix: [
+                Int(("a" as Character).asciiValue!),
+                Int(("b" as Character).asciiValue!),
+            ]),
+            Set([999]))
+    }
+
+    func testSeedlessConstrainedWalkEmitsLiteral() {
+        let guide = try! FiniteStringGuide(
+            strings: ["ZQX"],
+            encode: { Array($0.utf8.map { Int($0) }) },
+            eosTokenId: 7)
+        let toks = SeedlessBackend.generateConstrained(
+            maxTokens: 16,
+            eos: 7,
+            allowedNext: { guide.allowedNext(prefix: $0) })
+        XCTAssertEqual(toks, Array("ZQX".utf8.map { Int($0) }) + [7])
     }
 }
 

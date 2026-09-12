@@ -1,5 +1,5 @@
 {
-  "originHash" : "0ee6b3ab89d107ddf72b2b3eefdedde7d34f11a1e4938727688071f32b35354a",
+  "originHash" : "345eb2ad88d9d9505db3472dfd249da9cdc91f18ce3bd8ba8ead1b8906ee7d37",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -269,6 +269,15 @@
       "state" : {
         "revision" : "c21fdcde390313a6d98d8e33a346f2c3486c3ab0",
         "version" : "1.3.4"
+      }
+    },
+    {
+      "identity" : "swift-xgrammar",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/mattt/swift-xgrammar.git",
+      "state" : {
+        "revision" : "e0f2de361aa4891dbca5113629bc90ab8e5c3888",
+        "version" : "0.1.0"
       }
     },
     {

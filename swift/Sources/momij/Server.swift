@@ -2,6 +2,7 @@ import Foundation
 import Hummingbird
 import HTTPTypes
 import MomijCore
+import XGrammar
 
 enum MomijHTTP {
     struct ModelObject: ResponseEncodable, Codable {
@@ -35,18 +36,33 @@ enum MomijHTTP {
         let tokenizer: any TokenizerAdapter
         let backend: any LLMBackend
         let modelID: String
+        let modelDir: String
         private let lock = AsyncLock()
+        private var xgrammarTokenizer: TokenizerInfo?
 
-        init(tokenizer: any TokenizerAdapter, backend: any LLMBackend, modelID: String) {
+        init(
+            tokenizer: any TokenizerAdapter,
+            backend: any LLMBackend,
+            modelID: String,
+            modelDir: String
+        ) {
             self.tokenizer = tokenizer
             self.backend = backend
             self.modelID = modelID
+            self.modelDir = modelDir
         }
 
         func withLock<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T {
             await lock.acquire()
             defer { Task { await lock.release() } }
             return try await body()
+        }
+
+        func grammarTokenizerInfo(eos: Int) throws -> TokenizerInfo {
+            if let cached = xgrammarTokenizer { return cached }
+            let info = try XGrammarTokenizer.load(modelDir: modelDir, eosTokenId: eos)
+            xgrammarTokenizer = info
+            return info
         }
     }
 
@@ -104,6 +120,52 @@ enum MomijHTTP {
             if chatReq.n > 1 {
                 return jsonError(status: .badRequest, message: "n>1 unsupported")
             }
+            let eos = 151_645
+            var allowedNext: (@Sendable ([Int]) -> Set<Int>)? = nil
+            do {
+                switch chatReq.structuredConstraint {
+                case .choice(let strs):
+                    let guide = try FiniteStringGuide(
+                        strings: strs,
+                        encode: { try engine.tokenizer.encode($0) },
+                        eosTokenId: eos)
+                    allowedNext = { prefix in guide.allowedNext(prefix: prefix) }
+                case .jsonSchema(let schema):
+                    let tokInfo = try engine.grammarTokenizerInfo(eos: eos)
+                    let guide = try await XGrammarTokenGuide.compileJSONSchema(
+                        schema, tokenizerInfo: tokInfo, eosTokenId: eos)
+                    allowedNext = { prefix in
+                        (try? guide.allowedNext(prefix: prefix)) ?? [eos]
+                    }
+                case .ebnf(let ebnf):
+                    let tokInfo = try engine.grammarTokenizerInfo(eos: eos)
+                    let guide = try await XGrammarTokenGuide.compileEBNF(
+                        ebnf, tokenizerInfo: tokInfo, eosTokenId: eos)
+                    allowedNext = { prefix in
+                        (try? guide.allowedNext(prefix: prefix)) ?? [eos]
+                    }
+                case .regex(let pattern):
+                    // Compile as EBNF root wrapping the regex via Grammar(regex:).
+                    let tokInfo = try engine.grammarTokenizerInfo(eos: eos)
+                    let grammar = Grammar(regex: pattern)
+                    let compiled = await grammar.compiled(for: tokInfo)
+                    let guide = XGrammarTokenGuide(
+                        compiled: compiled, vocabSize: tokInfo.vocabulary.size, eosTokenId: eos)
+                    allowedNext = { prefix in
+                        (try? guide.allowedNext(prefix: prefix)) ?? [eos]
+                    }
+                case .unsupported(let why):
+                    return jsonError(
+                        status: .badRequest,
+                        message: "structured output not supported yet: \(why)")
+                case nil:
+                    break
+                }
+            } catch {
+                return jsonError(
+                    status: .badRequest,
+                    message: "structured output setup failed: \(error)")
+            }
 
             let promptIds: [Int]
             do {
@@ -119,8 +181,11 @@ enum MomijHTTP {
                 presencePenalty: chatReq.presencePenalty,
                 frequencyPenalty: chatReq.frequencyPenalty,
                 repetitionPenalty: chatReq.repetitionPenalty,
-                useSuffixSpec: ProcessInfo.processInfo.environment["MOMIJ_SUFFIX_SPEC"] == "1",
-                seed: chatReq.seed
+                eosTokenIds: [eos],
+                useSuffixSpec: ProcessInfo.processInfo.environment["MOMIJ_SUFFIX_SPEC"] == "1"
+                    && allowedNext == nil,
+                seed: chatReq.seed,
+                allowedNext: allowedNext
             )
             if chatReq.stream {
                 return try await streamSSE(engine: engine, prompt: promptIds, options: opts)

@@ -27,7 +27,8 @@ swift run -c release momij -- serve --model ~/models/deepgrove/maple-preview-2bi
 契約の要点:
 
 - 既定: `127.0.0.1:8742`。`--model-id` が `/v1/models` とレスポンス `model`（既定 `maple-preview`）。
-- 余分なリクエスト欄（`tools` / `structured_outputs` など）は**無視**して生成続行。
+- 余分なリクエスト欄（`tools` / `tool_choice` / `response_format` など）は**無視**して生成続行。
+- 制約デコード（P1）: `structured_outputs.choice`、リテラル和の `grammar` / `guided_grammar`、加えて **xgrammar** による `structured_outputs.json`・フル EBNF・非リテラル `regex`。トップレベル `grammar` は無視（oMLX と同じ）。
 - serve では HF `chat_template` **必須**（byte tokenizer フォールバックなし）。失敗時は 5xx / 起動失敗。
 - `<tool_call>` を含む assistant 本文は `choices[0].message.content`。ネイティブ `tool_calls` は不要。
 - `Authorization` は無視（401 にしない）。同時実行はプロセス内ロックで逐次。

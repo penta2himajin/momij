@@ -161,27 +161,63 @@ public final class MapleEngine: @unchecked Sendable {
     }
 
     /// Prefill + decode. Returns generated token ids (not including prompt).
-    public func generate(prompt: [Int], maxTokens: Int, eos: Int? = 151_645) -> [Int] {
+    ///
+    /// When `allowedNext` is set, each step's argmax is restricted to that set
+    /// (finite-string / grammar frontier). Empty set → stop.
+    public func generate(
+        prompt: [Int],
+        maxTokens: Int,
+        eos: Int? = 151_645,
+        allowedNext: (([Int]) -> Set<Int>)? = nil
+    ) -> [Int] {
         guard !prompt.isEmpty, maxTokens > 0 else { return [] }
         let logits0 = forwardLastLogits(prompt, reset: true)
-        var y = MLX.argMax(logits0[0, 0], axis: -1)
+        var y = pickToken(logits0, prefix: [], allowedNext: allowedNext)
         asyncEval(y)
         var out: [Int] = []
         for i in 0 ..< maxTokens {
-            // Overlap next forward with reading current token (mlx_lm.generate_step).
             var nextY: MLXArray? = nil
-            if i + 1 < maxTokens {
-                let logits = stepLogits(y)
-                nextY = MLX.argMax(logits[0, 0], axis: -1)
-                asyncEval(nextY!)
-            }
             let next = y.item(Int.self)
             out.append(next)
             if let eos, next == eos { break }
+            if i + 1 < maxTokens {
+                let logits = stepLogits(y)
+                nextY = pickToken(logits, prefix: out, allowedNext: allowedNext)
+                asyncEval(nextY!)
+            }
             guard let n = nextY else { break }
             y = n
         }
         return out
+    }
+
+    private func pickToken(
+        _ logits: MLXArray,
+        prefix: [Int],
+        allowedNext: (([Int]) -> Set<Int>)?
+    ) -> MLXArray {
+        guard let allowedNext else {
+            return MLX.argMax(logits[0, 0], axis: -1)
+        }
+        let allowed = allowedNext(prefix)
+        guard !allowed.isEmpty else {
+            // No legal continuation — emit a sentinel zeros vector (caller stops).
+            return MLXArray(Int32(0))
+        }
+        if allowed.count == 1, let only = allowed.first {
+            return MLXArray(Int32(only))
+        }
+        let row = logits[0, 0]
+        var bestId = allowed.first!
+        var bestScore = -Float.greatestFiniteMagnitude
+        for id in allowed {
+            let score = row[id].item(Float.self)
+            if score > bestScore {
+                bestScore = score
+                bestId = id
+            }
+        }
+        return MLXArray(Int32(bestId))
     }
 
     public func benchmark(promptTokens: Int, genTokens: Int, trials: Int)

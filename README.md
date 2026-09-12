@@ -25,7 +25,8 @@ swift run -c release momij -- serve --model ~/models/deepgrove/maple-preview-2bi
 Contract notes:
 
 - Default listen: `127.0.0.1:8742` (`--host` / `--port`). `--model-id` sets `/v1/models` and response `model` (default `maple-preview`).
-- Extra request fields (`tools`, `tool_choice`, `structured_outputs`, …) are **ignored**; generation continues.
+- Extra request fields (`tools`, `tool_choice`, `response_format`, …) are **ignored**; generation continues.
+- Constrained decode (P1, oMLX insurance): `structured_outputs.choice`, literal-union `grammar` / `guided_grammar`, plus **xgrammar** for `structured_outputs.json`, full EBNF, and non-literal `regex`. Top-level `grammar` stays ignored (oMLX parity).
 - HF `chat_template` is **required** on serve (no byte-tokenizer fallback). Template failure → 5xx / serve exit.
 - Assistant text (including `<tool_call>` markup) is returned in `choices[0].message.content`. Native OpenAI `tool_calls` are not required.
 - `Authorization` is ignored (no 401). One request at a time (in-process lock).

@@ -25,6 +25,8 @@ public enum OpenAIChatCompat {
         public var stream: Bool
         public var n: Int
         public var seed: UInt64?
+        /// From `structured_outputs` / `guided_grammar` (nil = unconstrained).
+        public var structuredConstraint: StructuredOutputs.Constraint?
 
         public init(
             model: String? = nil,
@@ -37,7 +39,8 @@ public enum OpenAIChatCompat {
             repetitionPenalty: Double = 1,
             stream: Bool = false,
             n: Int = 1,
-            seed: UInt64? = nil
+            seed: UInt64? = nil,
+            structuredConstraint: StructuredOutputs.Constraint? = nil
         ) {
             self.model = model
             self.messages = messages
@@ -50,6 +53,7 @@ public enum OpenAIChatCompat {
             self.stream = stream
             self.n = n
             self.seed = seed
+            self.structuredConstraint = structuredConstraint
         }
     }
 
@@ -112,7 +116,8 @@ public enum OpenAIChatCompat {
             repetitionPenalty: doubleValue(root["repetition_penalty"]) ?? 1,
             stream: boolValue(root["stream"]) ?? false,
             n: intValue(root["n"]) ?? 1,
-            seed: uint64Value(root["seed"])
+            seed: uint64Value(root["seed"]),
+            structuredConstraint: StructuredOutputs.parseConstraint(from: root)
         )
     }
 

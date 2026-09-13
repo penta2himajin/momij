@@ -202,7 +202,10 @@ enum MomijHTTP {
                 bannedTokenIds: ChatTemplatePatch.bannedAssistantTokenIds
             )
             if chatReq.stream {
-                return try await streamSSE(engine: engine, prompt: promptIds, options: opts)
+                return try await streamSSE(
+                    engine: engine, prompt: promptIds, options: opts,
+                    toolsAttached: !chatReq.toolsLines.isEmpty,
+                    effectiveMessages: effective.messages)
             }
 
             let tokens: [Int]
@@ -218,7 +221,7 @@ enum MomijHTTP {
                 return jsonError(status: .internalServerError, message: "generation failed: \(error)")
             }
 
-            let finish = OpenAIChatCompat.finishReason(
+            var finish = OpenAIChatCompat.finishReason(
                 completionTokens: tokens, maxTokens: opts.maxTokens, eosTokenIds: opts.eosTokenIds)
             let decodeIds = OpenAIChatCompat.contentTokenIds(tokens, eosTokenIds: opts.eosTokenIds)
             let text: String
@@ -228,7 +231,40 @@ enum MomijHTTP {
             } catch {
                 return jsonError(status: .internalServerError, message: "decode failed: \(error)")
             }
-            let parsed = ToolMarkup.parsePseudoToolCalls(text)
+            var parsed = ToolMarkup.parsePseudoToolCalls(text)
+            // Degenerate-call repair (compositor parity): an empty tool name
+            // is the collapse signature — retry once with a corrective nudge.
+            if parsed.calls.contains(where: { $0.name.isEmpty }) {
+                var repair = effective.messages
+                repair.append(OpenAIChatCompat.ChatMessage(
+                    role: "assistant", content: text))
+                repair.append(OpenAIChatCompat.ChatMessage(
+                    role: "user",
+                    content: "Your last reply was malformed. Respond with exactly one tool call in the correct format, or plain text."))
+                do {
+                    let repairPrompt = try engine.tokenizer.applyChatTemplate(repair)
+                    let repairOpts = opts
+                    let repairBudget = max(8, opts.maxTokens - tokens.count)
+                    let extra = try await engine.withLock { () -> [Int] in
+                        var out: [Int] = []
+                        for try await t in engine.backend.generate(repairPrompt, options: opts.withMaxTokens(repairBudget)) {
+                            out.append(t)
+                        }
+                        return out
+                    }
+                    let repairIds = OpenAIChatCompat.contentTokenIds(
+                        extra, eosTokenIds: opts.eosTokenIds)
+                    let repairRaw = try engine.tokenizer.decode(repairIds)
+                    let repairText = ChatTemplatePatch.stripThinkForContent(repairRaw)
+                    let reparsed = ToolMarkup.parsePseudoToolCalls(repairText)
+                    if !reparsed.calls.contains(where: { $0.name.isEmpty }) {
+                        parsed = reparsed
+                        finish = parsed.calls.isEmpty ? finish : "tool_calls"
+                    }
+                } catch {
+                    // Keep the original parse on repair failure.
+                }
+            }
             let respFinish = parsed.calls.isEmpty ? finish : "tool_calls"
             do {
                 let data = try OpenAIChatCompat.nonStreamJSON(
@@ -266,7 +302,10 @@ enum MomijHTTP {
         )
     }
 
-    static func streamSSE(engine: MomijEngine, prompt: [Int], options: GenerateOptions) async throws -> Response {
+    static func streamSSE(
+        engine: MomijEngine, prompt: [Int], options: GenerateOptions,
+        toolsAttached: Bool, effectiveMessages: [OpenAIChatCompat.ChatMessage]
+    ) async throws -> Response {
         let stream = AsyncStream<ByteBuffer> { cont in
             Task {
                 do {
@@ -279,7 +318,7 @@ enum MomijHTTP {
                             let piece = pieceIds.isEmpty
                                 ? ""
                                 : ((try? engine.tokenizer.decode(pieceIds)) ?? "")
-                            if !piece.isEmpty {
+                            if !piece.isEmpty, !toolsAttached {
                                 let chunk: [String: Any] = [
                                     "id": "chatcmpl-momij",
                                     "object": "chat.completion.chunk",
@@ -301,10 +340,66 @@ enum MomijHTTP {
                         }
                         return out
                     }
-                    let finish = OpenAIChatCompat.finishReason(
+                    var finish = OpenAIChatCompat.finishReason(
                         completionTokens: tokens,
                         maxTokens: options.maxTokens,
                         eosTokenIds: options.eosTokenIds)
+                    if toolsAttached {
+                        let decodeIds = OpenAIChatCompat.contentTokenIds(
+                            tokens, eosTokenIds: options.eosTokenIds)
+                        let raw = try engine.tokenizer.decode(decodeIds)
+                        let text = ChatTemplatePatch.stripThinkForContent(raw)
+                        let parsed = ToolMarkup.parsePseudoToolCalls(text)
+                        if !parsed.cleanedContent.isEmpty {
+                            let contentChunk: [String: Any] = [
+                                "id": "chatcmpl-momij",
+                                "object": "chat.completion.chunk",
+                                "created": Int(Date().timeIntervalSince1970),
+                                "model": engine.modelID,
+                                "choices": [[
+                                    "index": 0,
+                                    "delta": ["content": parsed.cleanedContent],
+                                    "finish_reason": NSNull(),
+                                ]],
+                            ]
+                            if let data = try? JSONSerialization.data(withJSONObject: contentChunk),
+                               let line = String(data: data, encoding: .utf8) {
+                                var buf = ByteBufferAllocator().buffer(capacity: line.count + 16)
+                                buf.writeString("data: \(line)\n\n")
+                                cont.yield(buf)
+                            }
+                        }
+                        if !parsed.calls.isEmpty {
+                            finish = "tool_calls"
+                            let callsDelta: [String: Any] = [
+                                "id": "chatcmpl-momij",
+                                "object": "chat.completion.chunk",
+                                "created": Int(Date().timeIntervalSince1970),
+                                "model": engine.modelID,
+                                "choices": [[
+                                    "index": 0,
+                                    "delta": ["tool_calls": parsed.calls.map { call in
+                                        [
+                                            "id": call.id,
+                                            "type": "function",
+                                            "function": [
+                                                "name": call.name,
+                                                "arguments": call.arguments,
+                                            ],
+                                            "index": 0,
+                                        ]
+                                    }],
+                                    "finish_reason": NSNull(),
+                                ]],
+                            ]
+                            if let data = try? JSONSerialization.data(withJSONObject: callsDelta),
+                               let line = String(data: data, encoding: .utf8) {
+                                var buf = ByteBufferAllocator().buffer(capacity: line.count + 16)
+                                buf.writeString("data: \(line)\n\n")
+                                cont.yield(buf)
+                            }
+                        }
+                    }
                     let finalChunk: [String: Any] = [
                         "id": "chatcmpl-momij",
                         "object": "chat.completion.chunk",

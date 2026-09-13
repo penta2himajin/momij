@@ -20,6 +20,13 @@ public struct GenerateOptions: Sendable {
     /// Token ids never sampled (e.g. `<think>` when thinking is disabled).
     public var bannedTokenIds: [Int] = []
 
+    /// Copy with a replaced maxTokens (repair retries use the remaining budget).
+    public func withMaxTokens(_ budget: Int) -> GenerateOptions {
+        var copy = self
+        copy.maxTokens = budget
+        return copy
+    }
+
     public init(
         maxTokens: Int = 256, temperature: Double = 0, topP: Double = 1,
         presencePenalty: Double = 0, frequencyPenalty: Double = 0,

@@ -74,6 +74,27 @@ final class PathPolicyTests: XCTestCase {
         XCTAssertTrue(line.contains("Never write absolute paths"), line)
     }
 
+
+    func testIsOutsideWorkspace() {
+        XCTAssertTrue(PathPolicy.isOutsideWorkspace("/mijij-subagent-test/x.py", root: root))
+        XCTAssertFalse(PathPolicy.isOutsideWorkspace(root + "/scratch/x.py", root: root))
+        // Relative is always fine.
+        XCTAssertFalse(PathPolicy.isOutsideWorkspace("scratch/x.py", root: root))
+        // Escape debris normalized before the check.
+        XCTAssertTrue(PathPolicy.isOutsideWorkspace(#"\\\/mnt\\\/x.py"#, root: root))
+    }
+
+    func testRepairFieldsAlias() {
+        // The call used file_path; the detector speaks of path.
+        let detail = ["reason": "path_not_filelike"]
+        XCTAssertEqual(
+            ArgRepair.repairFields(detail: detail, args: ["file_path": "x"]),
+            ["file_path"])
+        XCTAssertEqual(
+            ArgRepair.repairFields(detail: detail, args: ["path": "x"]),
+            ["path"])
+    }
+
     func testWorkspaceRootFromEnv() {
         // Env unset in the test process -> nil (mode off).
         XCTAssertNil(PathPolicy.workspaceRoot())

@@ -84,6 +84,16 @@ public enum PathPolicy {
             .replacingOccurrences(of: root, with: "")
     }
 
+    /// True when the path (after escape normalization) is absolute and
+    /// OUTSIDE the workspace root — a workspace-discipline violation that
+    /// the repair pipeline should re-ask for, and the sandbox would reject.
+    public static func isOutsideWorkspace(_ value: String, root: String) -> Bool {
+        let cleaned = normalizeEscapes(value)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard cleaned.hasPrefix("/") else { return false }
+        return !cleaned.hasPrefix(root)
+    }
+
     /// The instruction line appended to the tools suffix in workspace mode.
     public static func suffixLine() -> String {
         "Paths in tool calls are RELATIVE to the workspace root. "

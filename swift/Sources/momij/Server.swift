@@ -319,7 +319,8 @@ enum MomijHTTP {
             let emptyNameAtStart = parsed.calls.contains(where: { $0.name.isEmpty })
             var pendingFix: (idx: Int, fields: [String], reasons: [String: String], kind: String)? = nil
             if let hit = degenerateHit, hit.onset < parsed.calls.count {
-                let fields = ArgRepair.fieldsToFix(detail: hit.detail)
+                let hitArgs = ArgRepair.parseArgs(parsed.calls[hit.onset].arguments)
+                let fields = ArgRepair.repairFields(detail: hit.detail, args: hitArgs)
                 if !fields.isEmpty {
                     let reason = (hit.detail["reason"] as? String) ?? "unusable"
                     pendingFix = (hit.onset, fields,
@@ -328,15 +329,28 @@ enum MomijHTTP {
             }
             if pendingFix == nil {
                 for (i, call) in parsed.calls.enumerated() where !call.name.isEmpty {
+                    let args = ArgRepair.parseArgs(call.arguments)
                     let missing = ArgRepair.missingRequiredFields(
-                        toolLines: chatReq.toolsLines, tool: call.name,
-                        args: ArgRepair.parseArgs(call.arguments))
+                        toolLines: chatReq.toolsLines, tool: call.name, args: args)
                     if !missing.isEmpty {
                         pendingFix = (i, missing,
                             Dictionary(uniqueKeysWithValues: missing.map {
                                 ($0, "missing required property") }),
                             "missing_required_property")
                         break
+                    }
+                    // Workspace discipline: absolute paths outside the root
+                    // would be rejected by the harness sandbox — repair them
+                    // here into relative form instead.
+                    if let root = workspaceRoot {
+                        for f in PathPolicy.pathFields {
+                            if let v = args[f] as? String, !v.isEmpty,
+                               PathPolicy.isOutsideWorkspace(v, root: root) {
+                                pendingFix = (i, [f], [f: "absolute path outside the workspace root (use a relative path)"], "path_outside_workspace")
+                                break
+                            }
+                        }
+                        if pendingFix != nil { break }
                     }
                 }
             }
@@ -729,7 +743,8 @@ enum MomijHTTP {
                         let streamEmptyName = parsed.calls.contains(where: { $0.name.isEmpty })
                         var pendingFix: (idx: Int, fields: [String], reasons: [String: String], kind: String)? = nil
                         if let hit = degenerateHit, hit.onset < parsed.calls.count {
-                            let fields = ArgRepair.fieldsToFix(detail: hit.detail)
+                            let hitArgs = ArgRepair.parseArgs(parsed.calls[hit.onset].arguments)
+                            let fields = ArgRepair.repairFields(detail: hit.detail, args: hitArgs)
                             if !fields.isEmpty {
                                 let reason = (hit.detail["reason"] as? String) ?? "unusable"
                                 pendingFix = (hit.onset, fields,
@@ -739,15 +754,27 @@ enum MomijHTTP {
                         }
                         if pendingFix == nil {
                             for (i, call) in parsed.calls.enumerated() where !call.name.isEmpty {
+                                let args = ArgRepair.parseArgs(call.arguments)
                                 let missing = ArgRepair.missingRequiredFields(
-                                    toolLines: toolsLines, tool: call.name,
-                                    args: ArgRepair.parseArgs(call.arguments))
+                                    toolLines: toolsLines, tool: call.name, args: args)
                                 if !missing.isEmpty {
                                     pendingFix = (i, missing,
                                         Dictionary(uniqueKeysWithValues: missing.map {
                                             ($0, "missing required property") }),
                                         "missing_required_property")
                                     break
+                                }
+                                // Workspace discipline: absolute paths outside
+                                // the root get repaired into relative form.
+                                if let root = PathPolicy.workspaceRoot() {
+                                    for f in PathPolicy.pathFields {
+                                        if let v = args[f] as? String, !v.isEmpty,
+                                           PathPolicy.isOutsideWorkspace(v, root: root) {
+                                            pendingFix = (i, [f], [f: "absolute path outside the workspace root (use a relative path)"], "path_outside_workspace")
+                                            break
+                                        }
+                                    }
+                                    if pendingFix != nil { break }
                                 }
                             }
                         }

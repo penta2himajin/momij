@@ -25,6 +25,19 @@ public enum ArgRepair {
         }
     }
 
+    /// fieldsToFix adapted to the field names the call actually uses
+    /// (path <-> file_path aliasing — live calls use either key).
+    public static func repairFields(detail: [String: Any], args: [String: Any]) -> [String] {
+        let base = fieldsToFix(detail: detail)
+        guard !base.isEmpty else { return [] }
+        return base.map { f in
+            if args[f] != nil { return f }
+            if f == "path", args["file_path"] != nil { return "file_path" }
+            if f == "file_path", args["path"] != nil { return "path" }
+            return f
+        }
+    }
+
     /// Required argument fields (per the tool's JSON schema) that are absent
     /// or null — the harness-side "missing required property" rejection,
     /// caught here so the repair can fill them BEFORE the call leaves.

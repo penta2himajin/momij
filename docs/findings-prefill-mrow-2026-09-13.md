@@ -145,3 +145,20 @@ Final position with existing assets: prefill 683-734 tok/s, decode
 196 sequential / 268.6 spec / 459.8 chain-verify (all lossless),
 E2E 4.9-5.2 s at 4k. Remaining headroom beyond this requires either a
 trained drafter (deferred) or >300 GB/s sustained streaming kernels.
+
+## Stage 1: native OpenAI tools in momij (compositor integration, 2026-09-13)
+
+momij now accepts OpenAI tools on /v1/chat/completions and applies the
+Maple markup contract internally (ToolMarkup port of maple_tool_markup.py
++ pseudo_tool.py, byte-parity jsonDumps). Direct request verified:
+tools -> tool_calls ls, finish tool_calls; full suite 107 tests green.
+
+Hop cost measured (same tools request, median of 12, both correct):
+- direct momij (native tools): 353.2 ms
+- evprtr mediated:             385.7 ms
+- overhead: 32.6 ms per request (9%)
+
+The compositor is no longer required for the single-model single-runtime
+path. Stage 2 candidates: verify/repair loops, buffered approvals, and
+native streaming (replacing the fake SSE shim), each measured the same
+way before adoption.

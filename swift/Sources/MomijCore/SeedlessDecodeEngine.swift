@@ -1343,13 +1343,18 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                     // budget violates the OpenAI max_tokens contract.
                     let budget = maxTokens - out.count
                     if budget > 0 {
-                        let chunk = Array(draft.prefix(min(accepted, budget)))
+                        var chunk = Array(draft.prefix(min(accepted, budget)))
+                        // eos terminates output: keep it as the chunk tail and
+                        // drop any post-eos bonus so it cannot leak into text.
+                        if let eos, let ei = chunk.firstIndex(of: eos) {
+                            chunk = Array(chunk.prefix(ei + 1))
+                        }
                         out.append(contentsOf: chunk)
                         ids.append(contentsOf: chunk)
                     }
                 }
                 y = r.next
-                if out.count < maxTokens {
+                if out.count < maxTokens, out.last != eos {
                     out.append(y)
                     ids.append(y)
                 }

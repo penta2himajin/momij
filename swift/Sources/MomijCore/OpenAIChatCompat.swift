@@ -158,13 +158,17 @@ public enum OpenAIChatCompat {
         return "stop"
     }
 
-    /// Tokens to decode for `message.content` (drop trailing EOS if present).
+    /// Tokens to decode for `message.content`. eos terminates generation: cut
+    /// at the first occurrence, not only the trailing one (a speculative chunk
+    /// could carry eos mid-sequence).
     public static func contentTokenIds(
         _ tokens: [Int],
         eosTokenIds: [Int] = [151_645]
     ) -> [Int] {
-        guard let last = tokens.last, eosTokenIds.contains(last) else { return tokens }
-        return Array(tokens.dropLast())
+        if let ei = tokens.firstIndex(where: { eosTokenIds.contains($0) }) {
+            return Array(tokens.prefix(ei))
+        }
+        return tokens
     }
 
     public static func nonStreamJSON(

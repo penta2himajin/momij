@@ -41,6 +41,10 @@ appended past the budget).
 3. `MapleMLXBackend.generate`: ignore `useSuffixSpec`. The MLX spec path is a
    naive full-prefix-regen wiring; serve must not hang. MLX stays the
    parity/fallback path (plain greedy ~5.4–7.6 s at 2.6–4.8k prompt).
+4. eos handling: a speculative chunk could carry eos mid-sequence, leaking
+   `<|im_end|>` into `message.content`. The batch branch now keeps eos as the
+   chunk tail and drops the post-eos bonus; `OpenAIChatCompat.contentTokenIds`
+   cuts at the first eos (was: trailing only).
 
 ## Post-fix measurements (M1 Max, release, omlx stopped)
 

@@ -131,7 +131,7 @@ public enum ToolMarkup {
 
     /// Serialize a string via JSONSerialization (matches Python escapes).
     public static func jsonDumpString(_ s: String) -> String {
-        let data = try! JSONSerialization.data(withJSONObject: [s], options: [.fragmentsAllowed])
+        let data = try! JSONSerialization.data(withJSONObject: s, options: [.fragmentsAllowed])
         return String(data: data, encoding: .utf8) ?? "\""
     }
 

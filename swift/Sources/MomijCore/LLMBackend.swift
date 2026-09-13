@@ -88,12 +88,14 @@ public enum SeedlessServeDefaults {
         envOnByDefault(ProcessInfo.processInfo.environment["MOMIJ_SPEC_SAMPLE"])
     }
 
-    /// Greedy / SuffixSpec verify use exact `lm_head` (still M-row packed).
-    /// Measured p128/g128: FlashHead 1-step ~179 vs exact ~165; chain K=8
-    /// ~410 vs ~339 (`match=true` vs same-head sequential). Default FlashHead.
-    /// `MOMIJ_EXACT_HEAD=1` to opt out.
+    /// Greedy / SuffixSpec verify use exact `lm_head` by default (lossless).
+    /// FlashHead cluster probes are an approximation and measurably drift off
+    /// exact greedy on agentic markup prompts (evprtr tool-contract smoke),
+    /// so approximation is opt-in: `MOMIJ_EXACT_HEAD=0` selects FlashHead.
+    /// Measured p128/g128: FlashHead 1-step ~179 vs exact ~165-173; exact
+    /// M-row chain K=8 SuffixSpec ~339 with lossless output.
     public static var exactHeadFromEnv: Bool {
-        envOffByDefault(ProcessInfo.processInfo.environment["MOMIJ_EXACT_HEAD"])
+        ProcessInfo.processInfo.environment["MOMIJ_EXACT_HEAD"] != "0"
     }
 }
 
@@ -101,8 +103,9 @@ public protocol LLMBackend: AnyObject {
     func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncThrowingStream<Int, Error>
 }
 
-/// Production Seedless Metal backend. FlashHead greedy + SuffixSpec / sampled spec
-/// are default-on (`=0` to disable). `MOMIJ_EXACT_HEAD=1` keeps M-row verify.
+/// Production Seedless Metal backend. Greedy / SuffixSpec verify default to the
+/// exact `lm_head` (lossless; `MOMIJ_EXACT_HEAD=0` opts into FlashHead probes).
+/// SuffixSpec / sampled spec default on (`=0` to disable).
 public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     public let engine: SeedlessDecodeEngine
     /// When true, non-greedy paths use rejection-sampling drafts (`MOMIJ_SPEC_SAMPLE=0` off).
@@ -211,28 +214,16 @@ public final class MapleMLXBackend: LLMBackend, @unchecked Sendable {
         AsyncThrowingStream { cont in
             Task {
                 do {
-                    let tokens: [Int]
-                    if options.useSuffixSpec {
-                        tokens = try SuffixSpec.run(
-                            prompt: prompt, maxTokens: options.maxTokens,
-                            draftK: options.draftK, eos: options.eosTokenIds.first,
-                            step: { ids in
-                                // Greedy one-step: regenerate from full prefix (correct but slow verify).
-                                // Prefill each time is wasteful; good enough for SuffixSpec wiring.
-                                let out = self.engine.generate(
-                                    prompt: ids, maxTokens: 1, eos: nil)
-                                return out.first
-                            },
-                            multiStep: { ids, k in
-                                self.engine.generate(prompt: ids, maxTokens: k, eos: nil)
-                            })
-                    } else {
-                        tokens = self.engine.generate(
-                            prompt: prompt, maxTokens: options.maxTokens,
-                            eos: options.eosTokenIds.first,
-                            allowedNext: options.allowedNext,
-                            bannedTokenIds: options.bannedTokenIds)
-                    }
+                    // `useSuffixSpec` is intentionally ignored here: the MLX
+                    // verify step regenerates from the full prefix (no KV
+                    // reuse), which is O(prompt × drafts) — measured >240 s on
+                    // a ~4.8k-token agentic prompt (vs 7.7 s plain greedy).
+                    // Serve must not hang; MLX stays the parity/fallback path.
+                    let tokens = self.engine.generate(
+                        prompt: prompt, maxTokens: options.maxTokens,
+                        eos: options.eosTokenIds.first,
+                        allowedNext: options.allowedNext,
+                        bannedTokenIds: options.bannedTokenIds)
                     for t in tokens { cont.yield(t) }
                     cont.finish()
                 } catch {

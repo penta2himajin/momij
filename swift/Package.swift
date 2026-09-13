@@ -40,6 +40,8 @@ let package = Package(
             dependencies: [
                 "MomijCore",
                 .product(name: "XGrammar", package: "swift-xgrammar"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "Hub", package: "swift-transformers"),
             ]
         ),
     ]

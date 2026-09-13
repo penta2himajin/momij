@@ -22,7 +22,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     private let flashHead: SeedlessFlashHead?
     public let useFlashHead: Bool
     /// When true, greedy argmax and SuffixSpec verify use exact `lm_head`
-    /// (M-row 1-CB still packs). Default FlashHead; `MOMIJ_EXACT_HEAD=1` to opt out.
+    /// (M-row 1-CB still packs). Default exact; `MOMIJ_EXACT_HEAD=0` opts into
+    /// FlashHead probes (approximate, opt-in for speed probes).
     public let greedyExactHead: Bool
     /// FlashHead cluster probes (env `MOMIJ_FLASH_PROBES`, default 64). 0 if FlashHead off.
     public var flashProbes: Int { flashHead?.nProbes ?? 0 }
@@ -1337,13 +1338,21 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 let r = try verifyDraftChain(y: y, draft: draft)
                 accepted = r.accepted
                 if accepted > 0 {
-                    let chunk = Array(draft.prefix(accepted))
-                    out.append(contentsOf: chunk)
-                    ids.append(contentsOf: chunk)
+                    // Clamp to the request budget: a chain can accept more than
+                    // `maxTokens - out.count` in one round; emitting past the
+                    // budget violates the OpenAI max_tokens contract.
+                    let budget = maxTokens - out.count
+                    if budget > 0 {
+                        let chunk = Array(draft.prefix(min(accepted, budget)))
+                        out.append(contentsOf: chunk)
+                        ids.append(contentsOf: chunk)
+                    }
                 }
                 y = r.next
-                out.append(y)
-                ids.append(y)
+                if out.count < maxTokens {
+                    out.append(y)
+                    ids.append(y)
+                }
             } else {
                 var acc = 0
                 var cur = y

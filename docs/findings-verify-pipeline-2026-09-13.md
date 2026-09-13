@@ -82,3 +82,23 @@ not sanitize, so nothing is cut.
 - Live smoke: verify verdicts recorded for stream + non-stream.
 - Paired measurement: verdict parity confirmed on identical upstream
   outputs; sanitize divergence quantified (1899 vs 1395 chars).
+
+## Follow-up: whitespace-motif guard applied and re-measured
+
+The false positive was confirmed down to the byte level: the model's
+healthy Python code block used a 20-space comment indent, which matched
+char motif `"  "` × 10 at onset 1395 — evprtr truncated exactly there
+(cut away: the rest of the `factorial` example including the print).
+
+Fix (evprtr `3f515a3`, mirrored in momij `640ad3b`): a char motif that
+contains no non-whitespace character is idiomatic formatting
+(markdown hard breaks, code indentation) and is ignored. Real motifs
+are unaffected; word_run/ngram_run are token-based and unchanged.
+
+Re-measurement with both implementations guarded (same request set):
+
+- momij-direct: 32 requests — char_motif fires **8 -> 0**; only the
+  by-design pseudo_tool_markup observability records remain (12).
+- evprtr-mediated: 16 requests — verify fires **NONE** (was 4).
+- Decisive pair (longgen 512tok): direct **1899 == mediated 1899** —
+  evprtr no longer cuts healthy content; verdict parity preserved.

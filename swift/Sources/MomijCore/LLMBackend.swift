@@ -27,6 +27,15 @@ public struct GenerateOptions: Sendable {
         return copy
     }
 
+    /// Copy with a grammar guide (structured / constrained re-ask).
+    public func withAllowedNext(
+        _ guide: (@Sendable ([Int]) -> Set<Int>)?
+    ) -> GenerateOptions {
+        var copy = self
+        copy.allowedNext = guide
+        return copy
+    }
+
     public init(
         maxTokens: Int = 256, temperature: Double = 0, topP: Double = 1,
         presencePenalty: Double = 0, frequencyPenalty: Double = 0,

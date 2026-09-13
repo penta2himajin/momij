@@ -83,7 +83,11 @@ public enum ToolMarkup {
             cleaned += rest[..<open.lowerBound]
             rest = rest[open.upperBound...]
             guard let close = rest.range(of: callClose) else {
-                cleaned += callOpen
+                // Unterminated block (model stopped mid-call): drop the bare
+                // open tag and keep the body as prose — evprtr strip parity.
+                // Leaking the raw tag into harness content breaks clients.
+                cleaned += rest
+                rest = ""
                 break
             }
             let inner = String(rest[..<close.lowerBound])

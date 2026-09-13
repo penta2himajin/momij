@@ -66,9 +66,13 @@ final class ToolMarkupTests: XCTestCase {
     }
 
     func testParseRobustness() {
-        // Unterminated block: kept raw, no crash, no phantom call.
+        // Unterminated block: bare open tag stripped (no tag leak to the
+        // harness — observed live when the model stopped mid-call), body
+        // kept as prose, no phantom call.
         let p1 = ToolMarkup.parsePseudoToolCalls("oops " + tcOpen + "\n{\"name\"")
         XCTAssertTrue(p1.calls.isEmpty)
+        XCTAssertFalse(p1.cleanedContent.contains(tcOpen), p1.cleanedContent)
+        XCTAssertTrue(p1.cleanedContent.contains("{\"name\""), p1.cleanedContent)
         // Garbage inside: no phantom call, prose kept.
         let p2 = ToolMarkup.parsePseudoToolCalls("not json " + tcOpen + " ??? " + tcClose + " done")
         XCTAssertTrue(p2.calls.isEmpty)

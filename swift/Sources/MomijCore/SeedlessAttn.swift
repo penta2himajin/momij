@@ -270,18 +270,32 @@ public final class SeedlessLayerBlock {
     }
 
     /// Encode `M` decode tokens at current `offset`, then advance offset by M.
-    /// `M>1` requires True M-row scratch (`maxM`) and no SWA rotate in the window.
+    /// Sliding layers with a full ring use the cyclic-window path: rows wrap
+    /// the ring (FIFO eviction unchanged) and SDPA reads the window ending at
+    /// each row's own slot, so M-row chunks keep working after the window
+    /// fills. Full-attn layers stay append-only.
     public func encodeStep(into enc: MTLComputeCommandEncoder, M: Int = 1) throws {
         precondition(M >= 1 && M <= maxM)
         if !isSliding && offset + M > maxLen {
             throw SeedlessError.unsupportedShape(N: offset + M, K: maxLen, gs: 0)
         }
-        // SWA wrap is M=1 only (ring overwrite). M-row stays append-only.
-        if isSliding && M > 1 && offset + M > maxLen {
+        if isSliding && offset < maxLen && offset + M > maxLen {
+            // A chunk may not straddle the first wrap: rows would overwrite
+            // still-live slots before earlier rows' SDPA reads them.
             throw SeedlessError.unsupportedShape(N: offset + M, K: maxLen, gs: 0)
         }
-        let writePos = Self.kvWritePos(offset: offset, maxLen: maxLen, isSliding: isSliding)
-        let seqLen = Self.kvSeqLen(offset: offset, maxLen: maxLen, isSliding: isSliding)
+        let ring = isSliding ? maxLen : 0
+        let writePos: Int
+        let nUseBase: Int
+        if isSliding && offset >= maxLen {
+            // Wrapped ring: cyclic write from slot `offset % maxLen`; row m's
+            // window is the `min(offset, maxLen - M) + m + 1` newest slots.
+            writePos = Self.kvWritePos(offset: offset, maxLen: maxLen, isSliding: true)
+            nUseBase = min(offset, maxLen - M) + 1
+        } else {
+            writePos = offset
+            nUseBase = offset + 1
+        }
         let ropePos = offset
         try SeedlessMetal.encodeLayerBlock(
             into: enc, h: hBuf, inNorm: inNorm, postNorm: postNorm, gateW: gateW,
@@ -296,8 +310,8 @@ public final class SeedlessLayerBlock {
             ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
             H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs,
             numHeads: numHeads, numKV: numKV, headDim: headDim, ropeDim: ropeDim,
-            ropePos: ropePos, writePos: writePos, maxLen: maxLen, seqLen: seqLen,
-            rotateFirst: false, M: M)
+            ropePos: ropePos, writePos: writePos, maxLen: maxLen, nUseBase: nUseBase,
+            ring: ring, M: M)
         offset += M
     }
 
@@ -306,18 +320,17 @@ public final class SeedlessLayerBlock {
         offset = newOffset
     }
 
-    /// True when this layer can pack `M` tokens without SWA rotate / overflow.
+    /// True when this layer can pack `M` tokens without overflowing its cache.
+    /// Sliding layers may run M-row once the ring is full (cyclic write+read).
     public func canEncodeMrow(M: Int) -> Bool {
         guard M >= 1, M <= maxM else { return false }
         if !isSliding { return offset + M <= maxLen }
-        if offset >= maxLen { return M == 1 }  // rotateFirst is M=1 only
-        return offset + M <= maxLen
+        if offset < maxLen { return offset + M <= maxLen }
+        return M <= maxLen
     }
 
     /// Encode without advancing offset (microbench helper).
     public func encode(into enc: MTLComputeCommandEncoder, at pos: Int) throws {
-        let writePos = Self.kvWritePos(offset: pos, maxLen: maxLen, isSliding: isSliding)
-        let seqLen = Self.kvSeqLen(offset: pos, maxLen: maxLen, isSliding: isSliding)
         try SeedlessMetal.encodeLayerBlock(
             into: enc, h: hBuf, inNorm: inNorm, postNorm: postNorm, gateW: gateW,
             qkvW: qkvW, qkvS: qkvS, qkvB: qkvB,
@@ -331,7 +344,7 @@ public final class SeedlessLayerBlock {
             ugOut: ugOut, act: act, downOut: downOut, moeOut: moeOut,
             H: H, I: I, E: E, Ktop: Ktop, eps: eps, gs: gs,
             numHeads: numHeads, numKV: numKV, headDim: headDim, ropeDim: ropeDim,
-            ropePos: pos, writePos: writePos, maxLen: maxLen, seqLen: seqLen, rotateFirst: false)
+            ropePos: pos, writePos: pos, maxLen: maxLen, nUseBase: pos + 1, ring: 0)
     }
 
     public func encodeAttnOnly(into enc: MTLComputeCommandEncoder, at pos: Int) throws {
@@ -346,8 +359,8 @@ public final class SeedlessLayerBlock {
             qkvOut: qkvOut, qkOut: qkOut, attnTmp: attnTmp, attnOut: attnOut,
             kCache: kCache, vCache: vCache,
             H: H, numHeads: numHeads, numKV: numKV, headDim: headDim,
-            ropeDim: ropeDim, ropePos: pos, writePos: writePos, maxLen: maxLen, seqLen: seqLen,
-            eps: eps, gs: gs, rotateFirst: false)
+            ropeDim: ropeDim, ropePos: pos, writePos: writePos, maxLen: maxLen,
+            nUseBase: seqLen, ring: 0, eps: eps, gs: gs)
         SeedlessMetal.encodeResid(into: enc, h: hBuf, delta: attnOut, H: H)
     }
 }

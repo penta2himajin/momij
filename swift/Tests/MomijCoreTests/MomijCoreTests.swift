@@ -1410,7 +1410,7 @@ final class SeedlessAttnEncodeTests: XCTestCase {
             qkvOut: qkvOut, qkOut: qkOut, attnTmp: attnTmp, attnOut: attnOut,
             kCache: kCache, vCache: vCache,
             H: H, numHeads: heads, numKV: kv, headDim: d,
-            ropeDim: 64, ropePos: 0, writePos: 0, maxLen: maxLen, seqLen: 1, eps: 1e-6, gs: gs)
+            ropeDim: 64, ropePos: 0, writePos: 0, maxLen: maxLen, nUseBase: 1, ring: 0, eps: 1e-6, gs: gs)
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
@@ -1507,7 +1507,8 @@ final class SeedlessAttnEncodeTests: XCTestCase {
         let enc = cb.makeComputeCommandEncoder()!
         SeedlessMetal.encodeSdpa(
             into: enc, queries: qM, kCache: kCache, vCache: vCache, out: yM,
-            numHeads: heads, numKV: kv, headDim: d, maxLen: maxLen, seqLen: seqLen, M: M)
+            numHeads: heads, numKV: kv, headDim: d, maxLen: maxLen, nUseBase: seqLen,
+            ring: 0, endSlot: seqLen - 1, M: M)
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
@@ -1524,7 +1525,8 @@ final class SeedlessAttnEncodeTests: XCTestCase {
             let enc1 = cb1.makeComputeCommandEncoder()!
             SeedlessMetal.encodeSdpa(
                 into: enc1, queries: q1, kCache: kCache, vCache: vCache, out: y1,
-                numHeads: heads, numKV: kv, headDim: d, maxLen: maxLen, seqLen: seqLen, M: 1)
+                numHeads: heads, numKV: kv, headDim: d, maxLen: maxLen, nUseBase: seqLen,
+                ring: 0, endSlot: seqLen - 1, M: 1)
             enc1.endEncoding()
             cb1.commit()
             cb1.waitUntilCompleted()
@@ -1617,8 +1619,8 @@ final class SeedlessAttnEncodeTests: XCTestCase {
             qkvOut: qkvOut, qkOut: qkOut, attnTmp: attnTmp, attnOut: yM,
             kCache: kCache, vCache: vCache,
             H: H, numHeads: heads, numKV: kv, headDim: d,
-            ropeDim: 64, ropePos: ropePos, writePos: writePos, maxLen: maxLen, seqLen: seqLen,
-            eps: 1e-6, gs: gs, M: M)
+            ropeDim: 64, ropePos: ropePos, writePos: writePos, maxLen: maxLen, nUseBase: seqLen,
+            ring: 0, eps: 1e-6, gs: gs, M: M)
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
@@ -1640,7 +1642,7 @@ final class SeedlessAttnEncodeTests: XCTestCase {
                 kCache: kSeq, vCache: vSeq,
                 H: H, numHeads: heads, numKV: kv, headDim: d,
                 ropeDim: 64, ropePos: ropePos + m, writePos: writePos + m, maxLen: maxLen,
-                seqLen: seqLen + m, eps: 1e-6, gs: gs, M: 1)
+                nUseBase: seqLen + m, ring: 0, eps: 1e-6, gs: gs, M: 1)
             enc1.endEncoding()
             cb1.commit()
             cb1.waitUntilCompleted()

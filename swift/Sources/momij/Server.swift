@@ -270,9 +270,10 @@ enum MomijHTTP {
             var finish = OpenAIChatCompat.finishReason(
                 completionTokens: tokens, maxTokens: opts.maxTokens, eosTokenIds: opts.eosTokenIds)
             let decodeIds = OpenAIChatCompat.contentTokenIds(tokens, eosTokenIds: opts.eosTokenIds)
+            let raw: String
             let text: String
             do {
-                let raw = try engine.tokenizer.decode(decodeIds)
+                raw = try engine.tokenizer.decode(decodeIds)
                 text = ChatTemplatePatch.stripThinkForContent(raw)
             } catch {
                 return fail(.internalServerError, "decode failed: \(error)", trace: trace)
@@ -311,23 +312,48 @@ enum MomijHTTP {
                     // Keep the original parse on repair failure.
                 }
             }
-            let respFinish = parsed.calls.isEmpty ? finish : "tool_calls"
+            // Native verify pass (evprtr verify pipeline parity): every
+            // detector runs and records into the trace; sanitize is opt-in
+            // (MOMIJ_VERIFY_SANITIZE=1) so the default path only measures.
+            let sanitizeEnabled = ProcessInfo.processInfo.environment["MOMIJ_VERIFY_SANITIZE"] == "1"
+            let verifyMsg = ResponseVerify.Message(
+                content: text, reasoningContent: ResponseVerify.thinkInterior(of: raw),
+                toolCalls: parsed.calls)
+            let verifyOutcome = ResponseVerify.verify(verifyMsg)
+            var respContent = parsed.cleanedContent
+            var respToolCalls = parsed.calls
+            var respFinish = parsed.calls.isEmpty ? finish : "tool_calls"
+            if sanitizeEnabled, let hit = verifyOutcome.first {
+                if hit.kind == "degenerate_tool_args" {
+                    // evprtr sanitize: unusable calls are dropped so the
+                    // harness never sees a tool_calls finish without calls.
+                    respToolCalls = []
+                    respFinish = "stop"
+                } else if hit.field == "content",
+                          ["word_run", "ngram_run", "char_motif"].contains(hit.kind) {
+                    respContent = ResponseVerify.truncateBeforeRepetition(respContent)
+                }
+            }
+            trace.event("verify", verifyOutcome.hits.isEmpty ? "ok" : "hit", detail: [
+                "hits": verifyOutcome.hits.map { $0.eventDetail() },
+                "sanitized": sanitizeEnabled && verifyOutcome.first != nil,
+            ])
             trace.event("decode", "ok", detail: [
                 "finish": respFinish,
                 "tokens": tokens.count,
-                "tool_calls": parsed.calls.count,
+                "tool_calls": respToolCalls.count,
                 "degenerate": parsed.calls.contains(where: { $0.name.isEmpty }),
             ])
             do {
                 let data = try OpenAIChatCompat.nonStreamJSON(
                     modelID: engine.modelID,
-                    content: parsed.cleanedContent,
+                    content: respContent,
                     finishReason: respFinish,
                     promptTokens: promptIds.count,
                     completionTokens: tokens.count,
-                    toolCalls: parsed.calls)
+                    toolCalls: respToolCalls)
                 trace.event("present", "ok", detail: [
-                    "tool_calls": parsed.calls.count,
+                    "tool_calls": respToolCalls.count,
                     "usage": ["prompt": promptIds.count, "completion": tokens.count],
                 ])
                 recordTrace(trace)
@@ -468,6 +494,12 @@ enum MomijHTTP {
                         let text = ChatTemplatePatch.stripThinkForContent(raw)
                         let parsed = ToolMarkup.parsePseudoToolCalls(text)
                         streamToolCalls = parsed.calls.count
+                        let verifyOutcome = ResponseVerify.verify(.init(
+                            content: text, reasoningContent: ResponseVerify.thinkInterior(of: raw),
+                            toolCalls: parsed.calls))
+                        trace.event("verify", verifyOutcome.hits.isEmpty ? "ok" : "hit", detail: [
+                            "hits": verifyOutcome.hits.map { $0.eventDetail() },
+                        ])
                         if !parsed.cleanedContent.isEmpty {
                             let contentChunk: [String: Any] = [
                                 "id": "chatcmpl-momij",
@@ -516,6 +548,18 @@ enum MomijHTTP {
                                 buf.writeString("data: \(line)\n\n")
                                 cont.yield(buf)
                             }
+                        }
+                    } else {
+                        // Non-tools stream: verify the assembled content too.
+                        let decodeIds = OpenAIChatCompat.contentTokenIds(
+                            tokens, eosTokenIds: options.eosTokenIds)
+                        if let raw = try? engine.tokenizer.decode(decodeIds) {
+                            let text = ChatTemplatePatch.stripThinkForContent(raw)
+                            let verifyOutcome = ResponseVerify.verify(.init(
+                                content: text, reasoningContent: ResponseVerify.thinkInterior(of: raw)))
+                            trace.event("verify", verifyOutcome.hits.isEmpty ? "ok" : "hit", detail: [
+                                "hits": verifyOutcome.hits.map { $0.eventDetail() },
+                            ])
                         }
                     }
                     let finalChunk: [String: Any] = [

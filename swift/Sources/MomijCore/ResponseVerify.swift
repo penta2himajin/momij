@@ -18,7 +18,7 @@ public enum ResponseVerify {
         public let onset: Int
         public let detail: [String: Any]
 
-        func eventDetail() -> [String: Any] {
+        public func eventDetail() -> [String: Any] {
             [
                 "policy_id": policyId,
                 "field": field,

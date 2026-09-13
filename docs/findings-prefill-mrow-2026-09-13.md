@@ -122,3 +122,26 @@ expert streaming (simdgroup-matrix fused-expert kernel) or a change in
 the traffic itself (e.g., quantized expert cache in DRAM-friendly
 layout). Documented as the remaining headroom; decode side is at
 196 sequential / 268 spec / 459.8 chain-verify (lossless, 2.42x).
+
+## Round: acceptance diagnostics + pipelining verdict (2026-09-13, spec-throughput)
+
+- Acceptance on realistic (non-synthetic) agentic text, fresh engine:
+  **1.16 accept/attempt, 0.55 accept/gen** (142/256 tokens accepted
+  free). The existing tree/recycle/PLD drafters are healthy on agentic
+  content; the chain batches engage (gate 1.0).
+- Chain draft width (K=8/16/24, specMaxM=64): accept/gen flat at
+  0.59-0.60 — acceptance is drafter+content bound, not width bound.
+- Prefill chunk decomposition (M=32): embed 0.01 ms, commitWait
+  44.5-46.8 ms — the chunk is >99.9% GPU execution; multi-chunk CPU
+  pipelining has ~1% headroom, ruled out by measurement.
+- Pure-bandwidth probe (MLX sum): 64 MB 120 / 128 138 / 175 232 (warm,
+  105 cold) / 256 209-224 / 512 271-317 / 1 GB **335 GB/s**. The
+  machine reaches 350-class only at ~1 GB transfers; at the head's
+  175 MB the warm ceiling is ~232-260 GB/s, and the v3 head kernel
+  (246-260 GB/s) is at or above it. The 400->260 gap is per-call fixed
+  cost + page warm-up + CPU-shared unified memory, not a kernel defect.
+
+Final position with existing assets: prefill 683-734 tok/s, decode
+196 sequential / 268.6 spec / 459.8 chain-verify (all lossless),
+E2E 4.9-5.2 s at 4k. Remaining headroom beyond this requires either a
+trained drafter (deferred) or >300 GB/s sustained streaming kernels.

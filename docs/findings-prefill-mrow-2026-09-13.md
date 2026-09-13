@@ -50,3 +50,32 @@ config sweep only measures M=1/2/4 today; extend it to 16/32/64, then:
    the chunk width, is the limit now.
 
 Target: ≥1,000 tok/s needs ~64 ms per 64-token chunk (from 85 ms).
+## Raw-Metal lm_head argmax (2026-09-13, same branch)
+
+Decomposed the decode head phase (0.93 ms): the MLX quantizedMM+argMax
+eval itself is ~0.78 ms — item() sync is ~0.001 ms — so the head is
+bandwidth-bound (175 MB of 4-bit head weights+groups per token, MLX
+effective ~224 GB/s), not sync-bound. Two naive raw-Metal kernels
+(thread-per-row, simd-per-row) both hit only ~58 GB/s — the x-vector
+scalar loads (2.4 G loads/token) and 18,992 tiny threadgroups were the
+limiters.
+
+Final kernel (`maple_lm_head_argmax` + `maple_lm_head_reduce`):
+- threadgroup owns a contiguous 256-row slab (~594 TGs), x staged once
+  into threadgroup memory, each SIMD group walks 32 rows with coalesced
+  128-byte word loads, banned ids score -inf, per-TG partial folded by
+  the reduce kernel
+- encoded into the layer CB tail: zero extra sync, zero MLX roundtrip;
+  also replaces the chain path's per-row 608 KB host copies
+
+Measured (same build, head on vs off): head ~0.71 ms vs MLX 0.925 ms;
+decode bench 187.4 -> 193.9-196.0 tok/s (layersPerCB 4 -> 8); suffix
+spec 240 -> 268.6 tok/s; chain-verify K=8 385.9 -> 459.8 tok/s
+(match=true, 2.42x). E2E 4k-token prompt: 4.9-5.2 s. All parity tests
+green with the head enabled by default (`MOMIJ_METAL_HEAD=0` disables;
+`MOMIJ_LAYERS_PER_CB=8` pairs well with it).
+
+Remaining decode gap to 200: ~0.5 ms/token = head bandwidth (~250-260
+GB/s measured) + layer floor. Next candidates: simdgroup-matrix loads
+for the head, and prefill MoE tuning (w16/splitK) + chunk pipelining
+for the 1,000 tok/s prefill target.

@@ -2996,10 +2996,12 @@ public enum SeedlessMetal {
         if (simd_lid == 0) { for (int i = 0; i < v_per_thread; i++) out[i] = half(o[i]); }
     }
 
-    // Exact lm_head argmax (4-bit affine, group gs): one SIMD GROUP per vocab
-    // row (coalesced 4-byte word loads), banned rows score -inf; a tiny second
-    // kernel folds the per-simdgroup partials. Encoded into the layer CB tail
-    // — no host sync, no MLX. Requires gs == 64 (8 words per group).
+    // Exact lm_head argmax (4-bit affine, gs=64): each threadgroup owns a
+    // contiguous 256-row slab (64 KB streamed per TG, ~594 TGs total). x is
+    // staged once into threadgroup memory; each SIMD group walks 32 rows with
+    // coalesced 128-byte word loads and writes one partial per TG. A tiny
+    // second kernel folds the partials. Encoded into the layer CB tail —
+    // no host sync, no MLX roundtrip.
     kernel void maple_lm_head_argmax(
         device const half* x         [[buffer(0)]],   // [M, K]
         device const uint* w         [[buffer(1)]],   // [V, K/8]
@@ -3014,49 +3016,65 @@ public enum SeedlessMetal {
         constant int& M              [[buffer(10)]],
         constant int& nBanned        [[buffer(11)]],
         constant int& numTGPartial   [[buffer(12)]],
-        uint3 gid [[threadgroup_position_in_grid]],                  // x: row block, y: token row
-        uint simd_gid [[simdgroup_index_in_threadgroup]],            // row in block
-        uint simd_lid [[thread_index_in_simdgroup]])
+        uint3 gid [[threadgroup_position_in_grid]],                  // x: row slab, y: token row
+        uint simd_gid [[simdgroup_index_in_threadgroup]],            // simd group (8 per TG)
+        uint simd_lid [[thread_index_in_simdgroup]],
+        uint tid_in_tg [[thread_index_in_threadgroup]])
     {
-        int row = (int)(gid.x * 8u) + (int)simd_gid;
         int m = (int)gid.y;
         if (m >= M) return;
-        float acc = -INFINITY;
-        if (row < (int)V) {
-            bool keep = true;
-            for (int b = 0; b < nBanned; b++) {
-                if (banned[b] == row) { keep = false; break; }
-            }
-            if (keep) {
-                uint packs = (uint)K / 8u;
-                const device uint* wr = w + (size_t)row * packs;
-                const device half* sr = scales + (size_t)row * (uint)(K / (uint)gs);
-                const device half* br = biases + (size_t)row * (uint)(K / (uint)gs);
-                const device half* xm = x + (size_t)m * (size_t)K;
-                float accX = 0.0f;
-                for (uint wk = simd_lid; wk < packs; wk += 32u) {
-                    uint pack = wr[wk];
-                    float sc = float(sr[wk >> 3]);
-                    float bi = float(br[wk >> 3]);
-                    uint k0 = wk * 8u;
-                    for (uint e = 0; e < 8u; e++) {
-                        uint nib = (pack >> (e * 4u)) & 0xfu;
-                        accX += (float(nib) * sc + bi) * float(xm[k0 + e]);
-                    }
-                }
-                acc = simd_sum(accX);
-            }
+        threadgroup half shx[2048];
+        for (uint i = tid_in_tg; i < (uint)K; i += 256u) {
+            shx[i] = x[(size_t)m * (size_t)K + i];
         }
-        float best = acc;
-        int bestId = acc == -INFINITY ? V : row;
-        for (uint off = 16u; off >= 1u; off >>= 1u) {
-            float o = simd_shuffle(best, simd_lid ^ off);
-            int oi = (int)simd_shuffle((uint)bestId, simd_lid ^ off);
-            if (o > best || (o == best && oi < bestId)) { best = o; bestId = oi; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int slabBase = (int)gid.x * 256;
+        float sBest = -INFINITY;
+        int sId = V;
+        for (int r = 0; r < 32; r++) {
+            int row = slabBase + (int)simd_gid * 32 + r;
+            float acc = -INFINITY;
+            if (row < (int)V) {
+                bool keep = true;
+                for (int b = 0; b < nBanned; b++) {
+                    if (banned[b] == row) { keep = false; break; }
+                }
+                if (keep) {
+                    uint packs = (uint)K / 8u;
+                    const device uint* wr = w + (size_t)row * packs;
+                    const device half* sr = scales + (size_t)row * (uint)(K / (uint)gs);
+                    const device half* br = biases + (size_t)row * (uint)(K / (uint)gs);
+                    float accX = 0.0f;
+                    for (uint wk = simd_lid; wk < packs; wk += 32u) {
+                        uint pack = wr[wk];
+                        float sc = float(sr[wk >> 3]);
+                        float bi = float(br[wk >> 3]);
+                        uint k0 = wk * 8u;
+                        uint nib0 = pack & 0xfu;
+                        uint nib1 = (pack >> 4u) & 0xfu;
+                        uint nib2 = (pack >> 8u) & 0xfu;
+                        uint nib3 = (pack >> 12u) & 0xfu;
+                        uint nib4 = (pack >> 16u) & 0xfu;
+                        uint nib5 = (pack >> 20u) & 0xfu;
+                        uint nib6 = (pack >> 24u) & 0xfu;
+                        uint nib7 = (pack >> 28u) & 0xfu;
+                        accX += (float(nib0) * sc + bi) * float(shx[k0])
+                              + (float(nib1) * sc + bi) * float(shx[k0 + 1u])
+                              + (float(nib2) * sc + bi) * float(shx[k0 + 2u])
+                              + (float(nib3) * sc + bi) * float(shx[k0 + 3u])
+                              + (float(nib4) * sc + bi) * float(shx[k0 + 4u])
+                              + (float(nib5) * sc + bi) * float(shx[k0 + 5u])
+                              + (float(nib6) * sc + bi) * float(shx[k0 + 6u])
+                              + (float(nib7) * sc + bi) * float(shx[k0 + 7u]);
+                    }
+                    acc = simd_sum(accX);
+                }
+            }
+            if (acc > sBest || (acc == sBest && row < sId)) { sBest = acc; sId = row; }
         }
         threadgroup float shMax[8];
         threadgroup int shId[8];
-        if (simd_lid == 0) { shMax[simd_gid] = best; shId[simd_gid] = bestId; }
+        if (simd_lid == 0) { shMax[simd_gid] = sBest; shId[simd_gid] = sId; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (simd_gid == 0u && simd_lid == 0u) {
             float gBest = shMax[0];
@@ -3071,7 +3089,7 @@ public enum SeedlessMetal {
         }
     }
 
-    // Fold per-simdgroup partials into the final argmax id per token row.
+    // Fold per-threadgroup partials into the final argmax id per token row.
     kernel void maple_lm_head_reduce(
         device const float* tgMax [[buffer(0)]],
         device const int* tgId    [[buffer(1)]],

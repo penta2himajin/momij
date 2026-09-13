@@ -142,7 +142,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         // Raw-Metal exact lm_head argmax: alias the quantized head weights and
         // stage small scratch buffers. Enabled only for the 4-bit head layout.
         useMetalHead = config.headBits == 4
-            && ProcessInfo.processInfo.environment["MOMIJ_METAL_HEAD"] == "1"
+            && ProcessInfo.processInfo.environment["MOMIJ_METAL_HEAD"] != "0"
         if useMetalHead {
             guard let wb = SeedlessMetal.mtlBuf(store.req("lm_head.weight"), device),
                   let sb = SeedlessMetal.mtlBuf(store.req("lm_head.scales"), device),
@@ -151,7 +151,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             lmHeadW = wb
             lmHeadS = sb
             lmHeadB = bb
-            let tgCount = (vocab + 7) / 8
+            let tgCount = (vocab + 255) / 256
             lmHeadNumTG = tgCount
             lmHeadTgMax = device.makeBuffer(length: specMaxM * tgCount * 4, options: .storageModeShared)!
             lmHeadTgId = device.makeBuffer(length: specMaxM * tgCount * 4, options: .storageModeShared)!

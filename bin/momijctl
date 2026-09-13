@@ -44,19 +44,31 @@ case "$cmd" in
     exit 1
     ;;
   stop)
-    if alive; then
-      kill "$(pid)" 2>/dev/null || true
-      for i in $(seq 1 10); do alive || break; sleep 1; done
-      alive && kill -9 "$(pid)" 2>/dev/null || true
-      echo "stopped (pid $(pid))"; rm -f "$PIDFILE"
+    # Kill the real listener(s) on our dedicated port, not just the wrapper
+    # pid — nohup's $! is the subshell and the server child survives it.
+    pids="$(lsof -ti :$PORT 2>/dev/null | sort -u | tr '\n' ' ')"
+    w="$(pid)"
+    [ -n "$w" ] && pids="$pids $w"
+    if [ -n "$(echo $pids | tr -d ' ')" ]; then
+      for p in $pids; do kill "$p" 2>/dev/null || true; done
+      for i in $(seq 1 10); do
+        leftover=""
+        for p in $pids; do kill -0 "$p" 2>/dev/null && leftover="$p"; done
+        [ -z "$leftover" ] && break
+        sleep 1
+      done
+      for p in $pids; do kill -9 "$p" 2>/dev/null || true; done
+      echo "stopped ($pids)"
     else
-      echo "not running"; rm -f "$PIDFILE"
+      echo "not running"
     fi
+    rm -f "$PIDFILE"
     ;;
   restart) "$0" stop; "$0" start ;;
   status)
-    if alive; then
-      echo "running: pid $(pid), $BASE, $(healthy && echo healthy || echo NOT-RESPONDING)"
+    listener="$(lsof -ti :$PORT 2>/dev/null | head -1)"
+    if [ -n "$listener" ]; then
+      echo "running: pid $listener, $BASE, $(healthy && echo healthy || echo NOT-RESPONDING)"
     else
       echo "stopped"; exit 1
     fi

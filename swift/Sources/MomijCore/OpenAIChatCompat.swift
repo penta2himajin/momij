@@ -42,6 +42,8 @@ public enum OpenAIChatCompat {
         public var frequencyPenalty: Double
         public var repetitionPenalty: Double
         public var stream: Bool
+        /// `stream_options.include_usage` — clients request usage in the SSE tail.
+        public var streamOptionsIncludeUsage: Bool
         public var n: Int
         public var seed: UInt64?
         /// From `structured_outputs` / `guided_grammar` (nil = unconstrained).
@@ -58,6 +60,7 @@ public enum OpenAIChatCompat {
             frequencyPenalty: Double = 0,
             repetitionPenalty: Double = 1,
             stream: Bool = false,
+            streamOptionsIncludeUsage: Bool = false,
             n: Int = 1,
             seed: UInt64? = nil,
             structuredConstraint: StructuredOutputs.Constraint? = nil
@@ -72,6 +75,7 @@ public enum OpenAIChatCompat {
             self.frequencyPenalty = frequencyPenalty
             self.repetitionPenalty = repetitionPenalty
             self.stream = stream
+            self.streamOptionsIncludeUsage = streamOptionsIncludeUsage
             self.n = n
             self.seed = seed
             self.structuredConstraint = structuredConstraint
@@ -157,6 +161,8 @@ public enum OpenAIChatCompat {
             frequencyPenalty: doubleValue(root["frequency_penalty"]) ?? 0,
             repetitionPenalty: doubleValue(root["repetition_penalty"]) ?? 1,
             stream: boolValue(root["stream"]) ?? false,
+            streamOptionsIncludeUsage: (root["stream_options"] as? [String: Any])
+                .flatMap { boolValue($0["include_usage"]) } ?? false,
             n: intValue(root["n"]) ?? 1,
             seed: uint64Value(root["seed"]),
             structuredConstraint: StructuredOutputs.parseConstraint(from: root)

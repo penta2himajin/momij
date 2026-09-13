@@ -1716,6 +1716,20 @@ final class OpenAIChatCompatTests: XCTestCase {
         XCTAssertEqual(req.structuredConstraint, .choice(["ZQX"]))
     }
 
+    func testParsesStreamOptionsIncludeUsage() throws {
+        let raw = """
+        {"messages":[{"role":"user","content":"x"}],"stream":true,\
+        "stream_options":{"include_usage":true}}
+        """.data(using: .utf8)!
+        let req = try OpenAIChatCompat.parseRequest(from: raw)
+        XCTAssertTrue(req.stream)
+        XCTAssertTrue(req.streamOptionsIncludeUsage)
+        // Absent stream_options parses as false (clients that omit it).
+        let plain = try OpenAIChatCompat.parseRequest(
+            from: Data(#"{"messages":[{"role":"user","content":"x"}],"stream":true}"#.utf8))
+        XCTAssertFalse(plain.streamOptionsIncludeUsage)
+    }
+
     func testParsesStructuredOutputsChoice() throws {
         let raw = """
         {"messages":[{"role":"user","content":"x"}],\

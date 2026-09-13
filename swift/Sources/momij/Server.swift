@@ -251,6 +251,7 @@ enum MomijHTTP {
                     engine: engine, prompt: promptIds, options: opts,
                     toolsAttached: !chatReq.toolsLines.isEmpty,
                     effectiveMessages: effective.messages,
+                    includeUsage: chatReq.streamOptionsIncludeUsage,
                     trace: trace, traces: traces)
             }
 
@@ -280,14 +281,28 @@ enum MomijHTTP {
             }
             var parsed = ToolMarkup.parsePseudoToolCalls(text)
             // Degenerate-call repair (compositor parity): an empty tool name
-            // is the collapse signature — retry once with a corrective nudge.
-            if parsed.calls.contains(where: { $0.name.isEmpty }) {
+            // OR unusable arguments (write/edit sanity, fed back from the
+            // DSH subagent test — a write with an empty path) is the collapse
+            // signature — retry once with a corrective nudge.
+            let degenerateHit = ResponseVerify.degenerateToolArgs(.init(toolCalls: parsed.calls))
+            let repairNudge: String
+            if let hit = degenerateHit {
+                let reason = (hit.detail["reason"] as? String) ?? "unusable"
+                let tool = (hit.detail["tool"] as? String) ?? "tool"
+                repairNudge = "Your previous \(tool) tool call had unusable arguments (\(reason)). "
+                    + "Retry with valid arguments: for write, path must be a real file path "
+                    + "and content the full file text. Or reply in plain text."
+            } else {
+                repairNudge = "Your last reply was malformed. Respond with exactly one tool call "
+                    + "in the correct format, or plain text."
+            }
+            if parsed.calls.contains(where: { $0.name.isEmpty }) || degenerateHit != nil {
                 var repair = effective.messages
                 repair.append(OpenAIChatCompat.ChatMessage(
                     role: "assistant", content: text))
                 repair.append(OpenAIChatCompat.ChatMessage(
                     role: "user",
-                    content: "Your last reply was malformed. Respond with exactly one tool call in the correct format, or plain text."))
+                    content: repairNudge))
                 do {
                     let repairPrompt = try engine.tokenizer.applyChatTemplate(repair)
                     let repairOpts = opts
@@ -304,12 +319,18 @@ enum MomijHTTP {
                     let repairRaw = try engine.tokenizer.decode(repairIds)
                     let repairText = ChatTemplatePatch.stripThinkForContent(repairRaw)
                     let reparsed = ToolMarkup.parsePseudoToolCalls(repairText)
-                    if !reparsed.calls.contains(where: { $0.name.isEmpty }) {
+                    let reparsedClean = reparsed.calls.contains(where: { $0.name.isEmpty }) == false
+                        && ResponseVerify.degenerateToolArgs(.init(toolCalls: reparsed.calls)) == nil
+                    if reparsedClean {
                         parsed = reparsed
                         finish = parsed.calls.isEmpty ? finish : "tool_calls"
+                        trace.event("repair", "ok", detail: ["trigger": degenerateHit?.kind ?? "empty_name"])
+                    } else {
+                        trace.event("repair", "error", detail: ["trigger": degenerateHit?.kind ?? "empty_name"])
                     }
                 } catch {
                     // Keep the original parse on repair failure.
+                    trace.event("repair", "error", detail: ["error": "\(error)"])
                 }
             }
             // Native verify pass (evprtr verify pipeline parity): every
@@ -446,6 +467,7 @@ enum MomijHTTP {
     static func streamSSE(
         engine: MomijEngine, prompt: [Int], options: GenerateOptions,
         toolsAttached: Bool, effectiveMessages: [OpenAIChatCompat.ChatMessage],
+        includeUsage: Bool,
         trace: RequestTrace, traces: TraceStore
     ) async throws -> Response {
         let stream = AsyncStream<ByteBuffer> { cont in
@@ -492,7 +514,53 @@ enum MomijHTTP {
                             tokens, eosTokenIds: options.eosTokenIds)
                         let raw = try engine.tokenizer.decode(decodeIds)
                         let text = ChatTemplatePatch.stripThinkForContent(raw)
-                        let parsed = ToolMarkup.parsePseudoToolCalls(text)
+                        var parsed = ToolMarkup.parsePseudoToolCalls(text)
+                        // Degenerate-call repair on the stream path too: a
+                        // broken write/edit (e.g. empty path) must not reach
+                        // the harness as a tool_calls chunk. Retry once with
+                        // a corrective nudge, then emit the corrected calls.
+                        let degenerateHit = ResponseVerify.degenerateToolArgs(
+                            .init(toolCalls: parsed.calls))
+                        let needsRepair = degenerateHit != nil
+                            || parsed.calls.contains(where: { $0.name.isEmpty })
+                        if needsRepair {
+                            let reason = (degenerateHit?.detail["reason"] as? String) ?? "malformed"
+                            let nudge = "Your previous tool call had unusable arguments (\(reason)). "
+                                + "Retry with valid arguments: for write, path must be a real "
+                                + "file path and content the full file text. Or reply in plain text."
+                            do {
+                                var repair = effectiveMessages
+                                repair.append(OpenAIChatCompat.ChatMessage(role: "assistant", content: text))
+                                repair.append(OpenAIChatCompat.ChatMessage(role: "user", content: nudge))
+                                let repairPrompt = try engine.tokenizer.applyChatTemplate(repair)
+                                let repairBudget = max(8, options.maxTokens - tokens.count)
+                                let extra = try await engine.withLock { () -> [Int] in
+                                    var out: [Int] = []
+                                    for try await t in engine.backend.generate(
+                                        repairPrompt, options: options.withMaxTokens(repairBudget)) {
+                                        out.append(t)
+                                    }
+                                    return out
+                                }
+                                let repairIds = OpenAIChatCompat.contentTokenIds(
+                                    extra, eosTokenIds: options.eosTokenIds)
+                                let repairRaw = try engine.tokenizer.decode(repairIds)
+                                let repairText = ChatTemplatePatch.stripThinkForContent(repairRaw)
+                                let reparsed = ToolMarkup.parsePseudoToolCalls(repairText)
+                                let reparsedClean = reparsed.calls.contains(where: { $0.name.isEmpty }) == false
+                                    && ResponseVerify.degenerateToolArgs(.init(toolCalls: reparsed.calls)) == nil
+                                if reparsedClean {
+                                    parsed = reparsed
+                                    trace.event("repair", "ok", detail: [
+                                        "trigger": degenerateHit?.kind ?? "empty_name"])
+                                } else {
+                                    trace.event("repair", "error", detail: [
+                                        "trigger": degenerateHit?.kind ?? "empty_name"])
+                                }
+                            } catch {
+                                trace.event("repair", "error", detail: ["error": "\(error)"])
+                            }
+                        }
                         streamToolCalls = parsed.calls.count
                         let verifyOutcome = ResponseVerify.verify(.init(
                             content: text, reasoningContent: ResponseVerify.thinkInterior(of: raw),
@@ -579,6 +647,30 @@ enum MomijHTTP {
                         buf.writeString("data: \(line)\n\n")
                         cont.yield(buf)
                     }
+                    // OpenAI spec: with stream_options.include_usage the tail
+                    // chunk carries usage with empty choices. DSH's client
+                    // reads chunk.usage on any chunk for its token counters
+                    // (0toks display fix, fed back from the subagent test).
+                    if includeUsage {
+                        let usageChunk: [String: Any] = [
+                            "id": "chatcmpl-momij",
+                            "object": "chat.completion.chunk",
+                            "created": Int(Date().timeIntervalSince1970),
+                            "model": engine.modelID,
+                            "choices": [] as [[String: Any]],
+                            "usage": [
+                                "prompt_tokens": prompt.count,
+                                "completion_tokens": tokens.count,
+                                "total_tokens": prompt.count + tokens.count,
+                            ],
+                        ]
+                        if let data = try? JSONSerialization.data(withJSONObject: usageChunk),
+                           let line = String(data: data, encoding: .utf8) {
+                            var ub = ByteBufferAllocator().buffer(capacity: line.count + 16)
+                            ub.writeString("data: \(line)\n\n")
+                            cont.yield(ub)
+                        }
+                    }
                     var done = ByteBufferAllocator().buffer(capacity: 16)
                     done.writeString("data: [DONE]\n\n")
                     cont.yield(done)
@@ -589,6 +681,7 @@ enum MomijHTTP {
                         "finish": finish,
                         "tokens": tokens.count,
                         "tool_calls": streamToolCalls,
+                        "usage": ["prompt": prompt.count, "completion": tokens.count],
                     ])
                     traces.write(trace.record(), id: trace.id)
                 } catch {

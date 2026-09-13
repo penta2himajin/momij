@@ -59,10 +59,38 @@ appended past the budget).
 
 ## Pre-existing, unrelated (observed while running the full suite)
 
-- Full `swift test` run shows order-dependent failures at `ffe44eb` (identical
+- Full `swift test` run showed order-dependent failures at `ffe44eb` (identical
   with and without this fix): `testAttnBlockMrowMatchesSequential` rel_l2=1.034,
   `testBannedPrefillArgmaxMatchesMLX` argmax flip, and a `signal 5` crash in
   `testFlashHeadVsExactOnDummyAndChat` (Index out of range). Same tests pass in
-  isolation. Suspect: fresh engines read recycled/uninitialized Metal buffer
-  regions (process-state dependent), i.e. cross-test contamination. Not caused
-  by this fix; tracked separately.
+  isolation. **Root-caused and fixed the same day — see below.**
+
+## Root cause of the order-dependent suite failures (fixed)
+
+The dense-projection kernels (`gqmm2_rows*`) read `inds[mk]` for **every row
+mk** of an M-row chunk, but `SeedlessLayerBlock.densInds` was a **single-entry
+buffer**. Rows `mk >= 1` read out of bounds and used arbitrary heap bytes as
+the weight-block index `e`, so the qkv / o projections for those rows
+multiplied garbage weights. Symptoms scaled with heap layout:
+
+- fresh process: neighbour memory zero → `e = 0` → correct → tests pass solo;
+- after other allocations: garbage `e` → wrong weights → corrupted KV →
+  degenerate output (`0`-token loops, argmax flips) → suite failures whose
+  values depended on test order; garbage inds also drove the host-side
+  `Index out of range` crash.
+
+Every M-row prefill (any prompt ≥ 2 tokens) was exposed; serve usually saw
+zeroed neighbour pages, tests with allocation churn did not.
+
+Fixes:
+1. `SeedlessLayerBlock.densInds` sized `maxM` entries (all zero → block 0).
+2. `testAttnBlockMrowMatchesSequential` now supplies M entries (kernel contract).
+3. `SeedlessMetal.syncMLXStream()` at engine/layer-stack/FlashHead init: the
+   noCopy-aliased weight buffers are read on the SeedlessMetal queue while MLX
+   `eval` is asynchronous — one stream sync closes that gap.
+4. New `ContaminationProbeTests`: engine output must be identical across fresh
+   engines and after heavy alloc/free churn (regression guard for this class).
+
+Verification: full suite 103 tests / 0 failures, twice consecutively
+(previously 1 failure + signal-5 crash per run); bench decode unchanged
+(190.0 tok/s); E2E Pi-like tool calls still correct (16.0-16.2 s).

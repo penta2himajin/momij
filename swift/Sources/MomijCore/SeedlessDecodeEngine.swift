@@ -119,6 +119,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             fputs("[momij] FlashHead weights missing; using exact lm_head\n", stderr)
         }
         MLX.eval(embTable, normW)
+        SeedlessMetal.syncMLXStream()
         vocab = embTable.dim(0)
         guard let ebuf = SeedlessMetal.mtlBuf(embTable, device),
               let nbuf = SeedlessMetal.mtlBuf(normW, device)

@@ -156,8 +156,12 @@ public final class SeedlessLayerBlock {
         downB = try mtl(dB)
 
         hBuf = sharedH ?? device.makeBuffer(length: self.maxM * H * 2, options: .storageModeShared)!
-        densInds = device.makeBuffer(length: 4, options: .storageModeShared)!
-        densInds.contents().storeBytes(of: Int32(0), as: Int32.self)
+        // Dense projections read `inds[mk]` for every row mk of an M-row chunk;
+        // the buffer must hold M entries (all zero → weight block 0) or rows
+        // mk >= 1 read out of bounds and pick garbage weight blocks.
+        densInds = device.makeBuffer(length: self.maxM * 4, options: .storageModeShared)!
+        let densPtr = densInds.contents().bindMemory(to: Int32.self, capacity: self.maxM)
+        for i in 0 ..< self.maxM { densPtr[i] = 0 }
 
         let qDim = numHeads * headDim
         let kvDim = numKV * headDim
@@ -368,6 +372,9 @@ public final class SeedlessLayerStack {
                 store: store, layer: i, device: device, sharedH: hBuf, maxLen: ml, maxM: self.maxM))
         }
         layers = built
+        // Weight buffers alias MLX allocations; block until their evals land
+        // before any seedless kernel reads them (see SeedlessMetal.syncMLXStream).
+        SeedlessMetal.syncMLXStream()
     }
 
     public func canEncodeMrow(M: Int) -> Bool {

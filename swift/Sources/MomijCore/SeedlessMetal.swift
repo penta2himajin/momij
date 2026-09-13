@@ -111,6 +111,20 @@ public enum SeedlessMetal {
         return a.asMTLBuffer(device: device, noCopy: false)
     }
 
+    /// Block until MLX's GPU stream completes.
+    ///
+    /// Weight / embedding / norm buffers are noCopy-aliased out of the MLX
+    /// allocator and then read on the SeedlessMetal command queue (a different
+    /// queue). MLX `eval` is asynchronous: when an engine is created while the
+    /// MLX stream is still draining earlier work, the seedless kernels can
+    /// read the aliases before the evals land. Measured effects: all-zero
+    /// logits (argmax 0) and deterministically flipped tokens, order-dependent
+    /// on prior process allocations. Init paths that alias MLX arrays call
+    /// this once before returning.
+    static func syncMLXStream() {
+        Stream.defaultStream(Device.gpu).synchronize()
+    }
+
     /// Owned copy via host bytes. Does not alias MLX storage.
     static func mtlBufHostCopy(_ a: MLXArray, _ device: MTLDevice) -> MTLBuffer? {
         a.eval()

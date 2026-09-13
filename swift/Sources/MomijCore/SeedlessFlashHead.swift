@@ -142,6 +142,9 @@ public final class SeedlessFlashHead {
         }
         topScratch = Array(repeating: 0, count: nClusters)
         forceRows = forceFlat
+        // centroids/token_map alias MLX allocations read by seedless kernels;
+        // block until their evals land (see SeedlessMetal.syncMLXStream).
+        SeedlessMetal.syncMLXStream()
     }
 
     public func encodeCentroids(

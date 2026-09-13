@@ -1569,8 +1569,11 @@ final class SeedlessAttnEncodeTests: XCTestCase {
             let p = b.contents().bindMemory(to: Float16.self, capacity: n)
             for i in 0 ..< n { p[i] = v }
         }
-        let dens = buf(1, 4)
-        dens.contents().storeBytes(of: Int32(0), as: Int32.self)
+        // The M-row attn kernel reads `inds[mk]` per row; the buffer must hold
+        // one entry per row (dense → all zeros).
+        let dens = buf(M, 4)
+        let densPtr = dens.contents().bindMemory(to: Int32.self, capacity: M)
+        for i in 0 ..< M { densPtr[i] = 0 }
         let x = buf(M * H)
         let xp = x.contents().bindMemory(to: Float16.self, capacity: M * H)
         for i in 0 ..< (M * H) { xp[i] = Float16((Float(i % 17) - 8.0) * 0.01) }

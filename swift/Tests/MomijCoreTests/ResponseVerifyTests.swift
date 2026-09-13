@@ -59,6 +59,36 @@ final class ResponseVerifyTests: XCTestCase {
         XCTAssertEqual(ResponseVerify.truncateBeforeRepetition(text), "start of the analysis here")
     }
 
+    func testFindRepetitionIgnoresWhitespaceOnlyMotif() {
+        // Live-measured false positive (both implementations): a healthy
+        // Python code block fired char_motif "  " x10 on the 20-space
+        // comment indent; evprtr truncated the answer 1899 -> 1395 chars.
+        // Guard (evprtr 3f515a3): whitespace-only motifs are idiomatic.
+        let text = """
+            Recursion is a function calling itself.
+
+            ```python
+            def factorial(n):
+                if n == 0:               # base case
+                    return 1
+                else:
+                                # recursive case
+                    return n * factorial(n - 1)
+            ```
+            The base case stops the recursion.
+            """
+        XCTAssertNil(ResponseVerify.findRepetition(text),
+                     "healthy code indentation must not fire")
+    }
+
+    func testFindRepetitionNonWhitespaceMotifStillFires() {
+        // The guard must not suppress real collapse motifs.
+        let text = "processing complete: " + String(repeating: "tr", count: 20) + " end"
+        let hit = ResponseVerify.findRepetition(text)
+        XCTAssertEqual(hit?.kind, "char_motif")
+        XCTAssertEqual(hit?.detail["motif"] as? String, "tr")
+    }
+
     func testFindRepetitionNgramRun() {
         // 7 identical tokens (5 identical 3-grams, total words >= 15):
         // ngram_run fires; word_run does not (needs 8).

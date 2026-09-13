@@ -136,15 +136,20 @@ public enum ResponseVerify {
 
         // Char motif: a 2..24 char unit repeated >= 8 times contiguously.
         // Like Python's re, the dot must not match "\n".
+        // Guard (evprtr parity, 2026-09-13 fix): whitespace-only motifs
+        // (markdown hard breaks, code indentation runs) are idiomatic
+        // formatting, not model collapse.
         let motifRe = try! NSRegularExpression(pattern: "(.{2,24}?)\\1{7,}")
         if let m = motifRe.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) {
             let motif = ns.substring(with: m.range(at: 1))
-            hits.append(RepetitionHit(
-                kind: "char_motif", onset: m.range.location,
-                detail: [
-                    "motif": String(motif.pyPrefix(80)),
-                    "span": m.range.length,
-                ]))
+            if !motif.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                hits.append(RepetitionHit(
+                    kind: "char_motif", onset: m.range.location,
+                    detail: [
+                        "motif": String(motif.pyPrefix(80)),
+                        "span": m.range.length,
+                    ]))
+            }
         }
 
         guard !hits.isEmpty else { return nil }

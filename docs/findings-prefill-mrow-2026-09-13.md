@@ -79,3 +79,30 @@ Remaining decode gap to 200: ~0.5 ms/token = head bandwidth (~250-260
 GB/s measured) + layer floor. Next candidates: simdgroup-matrix loads
 for the head, and prefill MoE tuning (w16/splitK) + chunk pipelining
 for the 1,000 tok/s prefill target.
+
+## Round 5: specMaxM sweep + kernel variants (2026-09-13)
+
+Serve-path prefill across specMaxM (cyclic-ring M-row, same build):
+
+| prompt tok | M=32 | M=64 | M=128 |
+|---:|---:|---:|---:|
+| 825 | 691 | 721 | 734 |
+| 3,234 | 688 | 710 | 728 |
+| 6,457 | **603** | 489 | 479 |
+
+- M=32 is the sweet spot at 8k tokens; M=64/128 get WORSE there (the
+  fused-expert dispatch depth = M*Ktop makes per-chunk cost super-linear
+  as the KV/attention term grows).
+- Kernel variants `MOMIJ_GQMM2_W16=1` / `MOMIJ_GQMM2_TG2D=1`: no
+  meaningful change (686-692 vs 687-692 baseline at M=32).
+- The extended micro-sweep (M=1..64) runs for minutes at a time; not a
+  regression, just expensive diagnostics.
+
+Honest ceiling with current fused-expert kernels: ~690-775 tok/s
+prefill. Reaching 1,000 needs a faster fused-expert kernel at M>16
+(e.g., multi-row threadgroups with expert-union batching), which is
+deeper kernel work than the remaining round budget.
+
+Decode side delivered this round: raw-Metal exact head 196 tok/s
+sequential (250-260 GB/s head stream, +12% over MLX), 268.6 tok/s spec,
+459.8 tok/s chain-verify (2.42x, match=true), E2E 4.9-5.2 s at 4k.

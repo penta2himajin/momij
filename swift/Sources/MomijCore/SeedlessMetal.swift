@@ -1315,7 +1315,7 @@ public enum SeedlessMetal {
     /// `disjoint` = token m uses experts `[m·Ktop ..)`. Reports ms/token vs M=1.
     public static func benchGqmm2Mrow(
         K: Int = 2048, N: Int = 1024, Ktop: Int = 8, E: Int = 256, gs: Int = 128,
-        maxM: Int = 8, iters: Int = 40, lhsPerExpert: Bool = false
+        maxM: Int = 64, iters: Int = 40, lhsPerExpert: Bool = false
     ) throws -> String {
         try ensureCompiled()
         guard let device else { throw SeedlessError.notReady }
@@ -1384,7 +1384,7 @@ public enum SeedlessMetal {
                 acc[M] = (a.gpu + t.gpu, a.n + 1)
             }
             let gpu1 = (acc[1] ?? (0, 1)).gpu / Double((acc[1] ?? (0, 1)).n)
-            for M in [1, 2, 4, 8] where M <= maxM {
+            for M in ([1, 2, 4, 8, 16, 32, 64].filter { $0 <= maxM }) {
                 let a = acc[M]!
                 let gpu = a.gpu / Double(a.n)
                 let per = gpu / Double(M)
@@ -1449,7 +1449,7 @@ public enum SeedlessMetal {
     /// expert layout as `benchGqmm2Mrow`. Warm interleaved `M=1,2,4,8,8,4,2,1`.
     public static func benchFusedExpertMrow(
         H: Int = 2048, I: Int = 512, E: Int = 256, Ktop: Int = 8,
-        maxM: Int = 8, iters: Int = 30
+        maxM: Int = 64, iters: Int = 30
     ) throws -> String {
         try ensureCompiled()
         guard let device else { throw SeedlessError.notReady }
@@ -1533,7 +1533,7 @@ public enum SeedlessMetal {
                 acc[M] = (a.gpu + gpu, a.n + 1)
             }
             let gpu1 = (acc[1] ?? (0, 1)).gpu / Double((acc[1] ?? (0, 1)).n)
-            for M in [1, 2, 4, 8] where M <= maxM {
+            for M in ([1, 2, 4, 8, 16, 32, 64].filter { $0 <= maxM }) {
                 let a = acc[M]!
                 let gpu = a.gpu / Double(a.n)
                 let per = gpu / Double(M)
@@ -1551,7 +1551,7 @@ public enum SeedlessMetal {
     /// (`tid.y` query row, shared KV). Warm interleaved `M=1,2,4,8,8,4,2,1`.
     public static func benchAttnMrow(
         H: Int = 2048, numHeads: Int = 16, numKV: Int = 4, headDim: Int = 128,
-        maxM: Int = 8, iters: Int = 20, seqLens: [Int] = [128, 512]
+        maxM: Int = 64, iters: Int = 20, seqLens: [Int] = [128, 512]
     ) throws -> String {
         try ensureCompiled()
         guard let device, sdpaPipeline != nil else { throw SeedlessError.notReady }
@@ -1615,7 +1615,7 @@ public enum SeedlessMetal {
             }
             let gpu1 = (acc[1] ?? (0, 1)).gpu / Double((acc[1] ?? (0, 1)).n)
             var lines = [title, "  mode        M   gpu_ms   ms/tok     vsM1    tok/s"]
-            for M in [1, 2, 4, 8] where M <= maxM {
+            for M in ([1, 2, 4, 8, 16, 32, 64].filter { $0 <= maxM }) {
                 let a = acc[M]!
                 let gpu = a.gpu / Double(a.n)
                 let per = gpu / Double(M)
@@ -1680,7 +1680,7 @@ public enum SeedlessMetal {
     /// GPU-timed full `encodeAttnBlock` M-row (qkv + qk-norm/RoPE + writeKV + causal SDPA + o).
     public static func benchAttnBlockMrow(
         H: Int = 2048, numHeads: Int = 16, numKV: Int = 4, headDim: Int = 128,
-        maxM: Int = 8, iters: Int = 20, writePos: Int = 32, maxLen: Int = 128
+        maxM: Int = 64, iters: Int = 20, writePos: Int = 32, maxLen: Int = 128
     ) throws -> String {
         try ensureCompiled()
         guard let device else { throw SeedlessError.notReady }
@@ -1780,7 +1780,7 @@ public enum SeedlessMetal {
             "attn-block M-row (H=\(H) 16h/4kv N=\(seqLen), \(iters) iters, warm)",
             "  mode        M   gpu_ms   ms/tok     vsM1    tok/s"
         ]
-        for M in [1, 2, 4, 8] where M <= maxM {
+        for M in ([1, 2, 4, 8, 16, 32, 64].filter { $0 <= maxM }) {
             let a = acc[M]!
             let gpu = a.gpu / Double(a.n)
             let per = gpu / Double(M)
@@ -1848,7 +1848,7 @@ public enum SeedlessMetal {
     /// GPU-timed full MoE block M-row (rms + gate + route + fused expert + resid).
     public static func benchMoEBlockMrow(
         H: Int = 2048, I: Int = 512, E: Int = 256, Ktop: Int = 8,
-        maxM: Int = 8, iters: Int = 20
+        maxM: Int = 64, iters: Int = 20
     ) throws -> String {
         try ensureCompiled()
         guard let device else { throw SeedlessError.notReady }
@@ -1931,7 +1931,7 @@ public enum SeedlessMetal {
             "moe-block M-row (H=\(H) I=\(I) E=\(E) K=\(Ktop), \(iters) iters, warm)",
             "  mode        M   gpu_ms   ms/tok     vsM1    tok/s"
         ]
-        for M in [1, 2, 4, 8] where M <= maxM {
+        for M in ([1, 2, 4, 8, 16, 32, 64].filter { $0 <= maxM }) {
             let a = acc[M]!
             let gpu = a.gpu / Double(a.n)
             let per = gpu / Double(M)
@@ -1949,7 +1949,7 @@ public enum SeedlessMetal {
     public static func benchLayerMrowConfigs(
         H: Int = 2048, I: Int = 512, E: Int = 256, Ktop: Int = 8,
         numHeads: Int = 16, numKV: Int = 4, headDim: Int = 128,
-        maxM: Int = 4, iters: Int = 12, writePos: Int = 32, maxLen: Int = 128
+        maxM: Int = 64, iters: Int = 12, writePos: Int = 32, maxLen: Int = 128
     ) throws -> String {
         try ensureCompiled()
         guard let device else { throw SeedlessError.notReady }

@@ -213,6 +213,16 @@ enum MomijHTTP {
 
             // Native Maple tools contract: rewrite tool history into markup
             // form and append the tools instruction (compositor parity).
+            // Tool-call loop breaker: a trailing run of identical calls
+            // (escape-escalation variants normalize equal) gets a steering
+            // message so the retry loop ends this turn. Per-request only —
+            // the harness's own history is untouched. NOTE: detect BEFORE
+            // rewriteMessages — the rewrite folds tool_calls into markup
+            // content, leaving nothing for the detector to see.
+            if let loop = LoopBreaker.detect(in: chatReq.messages) {
+                trace.event("loop_break", "ok", detail: [
+                    "tool": loop.tool, "count": loop.count])
+            }
             var effective = chatReq
             if !chatReq.toolsLines.isEmpty {
                 var msgs = ToolMarkup.rewriteMessages(chatReq.messages)
@@ -224,16 +234,10 @@ enum MomijHTTP {
                 }
                 effective.messages = msgs
             }
-            // Tool-call loop breaker: a trailing run of identical calls
-            // (escape-escalation variants normalize equal) gets a steering
-            // message so the retry loop ends this turn. Per-request only —
-            // the harness's own history is untouched.
-            if let loop = LoopBreaker.detect(in: effective.messages) {
+            if let loop = LoopBreaker.detect(in: chatReq.messages) {
                 effective.messages.append(OpenAIChatCompat.ChatMessage(
                     role: "user", content: LoopBreaker.breakNudge(
                         tool: loop.tool, count: loop.count)))
-                trace.event("loop_break", "ok", detail: [
-                    "tool": loop.tool, "count": loop.count])
             }
             let promptIds: [Int]
             do {

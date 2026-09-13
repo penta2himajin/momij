@@ -658,10 +658,12 @@ enum MomijHTTP {
                     var streamToolCalls = 0
                     var streamToolArgs: [[String: Any]] = []
                     var respContentHead = ""
+                    var rawHead = ""
                     if toolsAttached {
                         let decodeIds = OpenAIChatCompat.contentTokenIds(
                             tokens, eosTokenIds: options.eosTokenIds)
                         let raw = try engine.tokenizer.decode(decodeIds)
+                        rawHead = raw
                         let text = ChatTemplatePatch.stripThinkForContent(raw)
                         var parsed = ToolMarkup.parsePseudoToolCalls(text)
                         // Degenerate-call repair on the stream path too, 3
@@ -922,6 +924,7 @@ enum MomijHTTP {
                         "tool_calls": streamToolCalls,
                         "tool_args": streamToolArgs,
                         "content_head": String(respContentHead.prefix(300)),
+                        "raw_head": String(rawHead.prefix(400)),
                         "usage": ["prompt": prompt.count, "completion": tokens.count],
                     ])
                     traces.write(trace.record(), id: trace.id)

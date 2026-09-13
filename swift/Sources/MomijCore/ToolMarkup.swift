@@ -195,8 +195,34 @@ public enum ToolMarkup {
 
     /// Parse a JSON text into Swift values (for re-serialization).
     public static func jsonParseValue(_ text: String) -> Any? {
-        guard let data = text.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data, options: [])
+        if let data = text.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data, options: []) {
+            return obj
+        }
+        // Lenient retry: the model emits literal newlines/tabs INSIDE string
+        // values (invalid strict JSON — observed live in multiline python -c
+        // commands). Escape control chars inside string literals and retry.
+        var out = ""
+        var inString = false
+        var escaped = false
+        for ch in text {
+            if escaped { out.append(ch); escaped = false; continue }
+            if inString {
+                switch ch {
+                case "\\": out.append(ch); escaped = true
+                case "\"": out.append(ch); inString = false
+                case "\n": out.append("\\"); out.append("n")
+                case "\t": out.append("\\"); out.append("t")
+                case "\r": out.append("\\"); out.append("r")
+                default: out.append(ch)
+                }
+            } else {
+                if ch == "\"" { inString = true }
+                out.append(ch)
+            }
+        }
+        guard let data = out.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: out.data(using: .utf8)!, options: [])
         else { return nil }
         return obj
     }

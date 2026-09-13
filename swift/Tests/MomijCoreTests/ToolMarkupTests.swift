@@ -150,3 +150,19 @@ final class ToolMarkupTests: XCTestCase {
     }
 }
 
+
+    func testLenientJSONWithLiteralNewlines() {
+        // Live failure (2026-09-14): Maple emitted a bash tool call whose
+        // command value contained RAW newlines (multiline python -c) —
+        // invalid strict JSON, so the call was dropped and the body leaked
+        // as prose. The lenient retry must recover it.
+        let open = ToolMarkup.callOpen
+        let close = ToolMarkup.callClose
+        let inner = "{\"name\": \"bash\", \"arguments\": {\"command\": \"python3 -c \"\nimport json\nprint(1)\n\", \"description\": \"run\"}}"
+        let p = ToolMarkup.parsePseudoToolCalls("trying:\n" + open + "\n" + inner + "\n" + close)
+        XCTAssertEqual(p.calls.count, 1, "multiline command must parse as a call")
+        XCTAssertEqual(p.calls[0].name, "bash")
+        XCTAssertTrue(p.calls[0].arguments.contains("import json"))
+        XCTAssertTrue(p.cleanedContent.contains("trying:"), p.cleanedContent)
+        XCTAssertFalse(p.cleanedContent.contains(open), p.cleanedContent)
+    }

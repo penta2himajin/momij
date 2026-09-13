@@ -170,16 +170,17 @@ public enum ArgRepair {
     }
 
     /// Extract the first JSON object from a model reply (the constrained
-    /// generation should be pure JSON; tolerate stray prose/markdown).
+    /// generation should be pure JSON; tolerate stray prose/markdown and
+    /// literal newlines inside strings — same lenient path as ToolMarkup).
     public static func firstJSONObject(in text: String) -> [String: Any]? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let obj = (try? JSONSerialization.jsonObject(with: Data(trimmed.utf8))) as? [String: Any] {
+        if let obj = ToolMarkup.jsonParseValue(trimmed) as? [String: Any] {
             return obj
         }
         guard let start = trimmed.firstIndex(of: "{"),
               let end = trimmed.lastIndex(of: "}"), start < end
         else { return nil }
         let slice = String(trimmed[start ... end])
-        return (try? JSONSerialization.jsonObject(with: Data(slice.utf8))) as? [String: Any]
+        return ToolMarkup.jsonParseValue(slice) as? [String: Any]
     }
 }

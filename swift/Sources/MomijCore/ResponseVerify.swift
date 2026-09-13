@@ -287,7 +287,8 @@ public enum ResponseVerify {
     }
 
     static func writeProblem(_ args: [String: Any]) -> [String: Any]? {
-        let path = (args["path"] as? String ?? "").trimmingCharacters(in: .whitespaces)
+        let path = ((args["path"] as? String) ?? (args["file_path"] as? String) ?? "")
+            .trimmingCharacters(in: .whitespaces)
         let content = args["content"] as? String ?? ""
         if !looksLikePath(path) {
             return ["reason": "path_not_filelike", "path": path, "content_len": content.count]
@@ -313,7 +314,8 @@ public enum ResponseVerify {
     }
 
     static func editProblem(_ args: [String: Any]) -> [String: Any]? {
-        let path = (args["path"] as? String ?? "").trimmingCharacters(in: .whitespaces)
+        let path = ((args["path"] as? String) ?? (args["file_path"] as? String) ?? "")
+            .trimmingCharacters(in: .whitespaces)
         if !path.isEmpty && !looksLikePath(path) {
             return ["reason": "path_not_filelike", "path": path]
         }

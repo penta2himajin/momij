@@ -478,6 +478,7 @@ enum MomijHTTP {
                     "tool_args": respToolCalls.map { call in
                         ["name": call.name, "arguments": String(call.arguments.prefix(300))]
                     },
+                    "content_head": String(respContent.prefix(300)),
                     "usage": ["prompt": promptIds.count, "completion": tokens.count],
                 ])
                 recordTrace(trace)
@@ -656,6 +657,7 @@ enum MomijHTTP {
                         eosTokenIds: options.eosTokenIds)
                     var streamToolCalls = 0
                     var streamToolArgs: [[String: Any]] = []
+                    var respContentHead = ""
                     if toolsAttached {
                         let decodeIds = OpenAIChatCompat.contentTokenIds(
                             tokens, eosTokenIds: options.eosTokenIds)
@@ -775,6 +777,7 @@ enum MomijHTTP {
                         streamToolArgs = parsed.calls.map { call in
                             ["name": call.name, "arguments": String(call.arguments.prefix(300))]
                         }
+                        respContentHead = parsed.cleanedContent
                         let verifyOutcome = ResponseVerify.verify(.init(
                             content: text, reasoningContent: ResponseVerify.thinkInterior(of: raw),
                             toolCalls: parsed.calls))
@@ -918,6 +921,7 @@ enum MomijHTTP {
                         "tokens": tokens.count,
                         "tool_calls": streamToolCalls,
                         "tool_args": streamToolArgs,
+                        "content_head": String(respContentHead.prefix(300)),
                         "usage": ["prompt": prompt.count, "completion": tokens.count],
                     ])
                     traces.write(trace.record(), id: trace.id)

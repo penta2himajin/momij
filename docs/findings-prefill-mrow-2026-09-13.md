@@ -106,3 +106,19 @@ deeper kernel work than the remaining round budget.
 Decode side delivered this round: raw-Metal exact head 196 tok/s
 sequential (250-260 GB/s head stream, +12% over MLX), 268.6 tok/s spec,
 459.8 tok/s chain-verify (2.42x, match=true), E2E 4.9-5.2 s at 4k.
+
+## Bandwidth feasibility analysis (2026-09-13)
+
+The MoE per-token expert traffic is the wall: 8 experts x ~2.25 MB
+(up_gate 2*I*K + down K*I at 2-bit) x 24 layers = ~430 MB/token of
+required weight streaming. Measured effective bandwidth for these
+kernels is ~230-260 GB/s (the 24L-1CB class), which puts the hard
+per-token floor at ~1.1-1.4 ms -> ~700-900 tok/s prefill even with
+perfect M-row amortization and expert-union reuse.
+
+Measured ceilings agree: prefill 690-775 tok/s across chunk widths and
+kernel variants. Reaching 1,000 tok/s would need >350 GB/s sustained
+expert streaming (simdgroup-matrix fused-expert kernel) or a change in
+the traffic itself (e.g., quantized expert cache in DRAM-friendly
+layout). Documented as the remaining headroom; decode side is at
+196 sequential / 268 spec / 459.8 chain-verify (lossless, 2.42x).

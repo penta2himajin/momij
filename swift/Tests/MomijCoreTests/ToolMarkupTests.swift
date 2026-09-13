@@ -66,9 +66,8 @@ final class ToolMarkupTests: XCTestCase {
     }
 
     func testParseRobustness() {
-        // Unterminated block: bare open tag stripped (no tag leak to the
-        // harness — observed live when the model stopped mid-call), body
-        // kept as prose, no phantom call.
+        // Unterminated block with truncated JSON: no recovery possible —
+        // bare open tag stripped, body kept as prose, no phantom call.
         let p1 = ToolMarkup.parsePseudoToolCalls("oops " + tcOpen + "\n{\"name\"")
         XCTAssertTrue(p1.calls.isEmpty)
         XCTAssertFalse(p1.cleanedContent.contains(tcOpen), p1.cleanedContent)
@@ -81,6 +80,55 @@ final class ToolMarkupTests: XCTestCase {
         let p3 = ToolMarkup.parsePseudoToolCalls("")
         XCTAssertTrue(p3.calls.isEmpty)
         XCTAssertEqual(p3.cleanedContent, "")
+    }
+
+    func testUnterminatedBlockRecovery() {
+        // JSON complete, only the close tag missing (EOS cut right after
+        // the object): recover the real call, consume the body.
+        let body = "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}"
+        let p = ToolMarkup.parsePseudoToolCalls("listing:\n" + tcOpen + "\n" + body)
+        XCTAssertEqual(p.calls.count, 1)
+        XCTAssertEqual(p.calls[0].name, "bash")
+        XCTAssertTrue(p.calls[0].arguments.contains("ls -la"))
+        XCTAssertFalse(p.cleanedContent.contains(tcOpen), p.cleanedContent)
+        XCTAssertFalse(p.cleanedContent.contains("ls -la"), p.cleanedContent)
+    }
+
+    func testUnterminatedBlockRecoversFirstOfConcatenatedObjects() {
+        // Live shape (2026-09-13 subagent session): a complete call object
+        // followed by a stray second object (the model trying to add a
+        // description field). Recover the FIRST complete object only.
+        let body = "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la x\"}}{\n  \"description\": \"List test file\"}\n}"
+        let p = ToolMarkup.parsePseudoToolCalls(tcOpen + "\n" + body)
+        XCTAssertEqual(p.calls.count, 1)
+        XCTAssertEqual(p.calls[0].name, "bash")
+        XCTAssertTrue(p.calls[0].arguments.contains("ls -la x"))
+        XCTAssertFalse(p.cleanedContent.contains("description"), p.cleanedContent)
+    }
+
+    func testUnterminatedBlockStringAwareScanner() {
+        // A brace inside a string must not count for balancing; the object
+        // never completes (string left open) -> prose fallback.
+        let body = "{\"name\": \"bash\", \"command\": \"echo \\\"}\""
+        let p = ToolMarkup.parsePseudoToolCalls("note " + tcOpen + body)
+        XCTAssertTrue(p.calls.isEmpty)
+        XCTAssertFalse(p.cleanedContent.contains(tcOpen), p.cleanedContent)
+    }
+
+    func testStrayCloseTagStripped() {
+        // Close tag without a matching open: bare-tag garbage, stripped.
+        let p = ToolMarkup.parsePseudoToolCalls("text " + tcClose + " more")
+        XCTAssertTrue(p.calls.isEmpty)
+        XCTAssertFalse(p.cleanedContent.contains(tcClose), p.cleanedContent)
+        XCTAssertEqual(p.cleanedContent, "text  more")
+    }
+
+    func testFirstCompleteJSONObjectScanner() {
+        XCTAssertEqual(
+            ToolMarkup.firstCompleteJSONObject(in: "x {\"a\": \"}\"} tail"),
+            "{\"a\": \"}\"}")
+        XCTAssertEqual(ToolMarkup.firstCompleteJSONObject(in: "{\"broken {"), "")
+        XCTAssertEqual(ToolMarkup.firstCompleteJSONObject(in: "no braces"), "")
     }
 
     func testRewriteMessages() {

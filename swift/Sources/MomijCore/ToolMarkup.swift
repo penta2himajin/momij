@@ -83,10 +83,22 @@ public enum ToolMarkup {
             cleaned += rest[..<open.lowerBound]
             rest = rest[open.upperBound...]
             guard let close = rest.range(of: callClose) else {
-                // Unterminated block (model stopped mid-call): drop the bare
-                // open tag and keep the body as prose — evprtr strip parity.
-                // Leaking the raw tag into harness content breaks clients.
-                cleaned += rest
+                // Unterminated block (model stopped mid-call). First try
+                // terminator completion: if the body already contains a
+                // complete JSON call object, recover it as a real call —
+                // only the tag is missing. NEVER invent missing JSON.
+                // Otherwise strip the bare tag and keep the body as prose
+                // (evprtr strip parity).
+                let body = String(rest)
+                if let obj = jsonParseValue(firstCompleteJSONObject(in: body) ?? "")
+                    as? [String: Any],
+                    let name = obj["name"] as? String, !name.isEmpty {
+                    let args = jsonDumps(obj["arguments"] ?? NSNull())
+                    calls.append(OpenAIChatCompat.ToolCallSpec(
+                        id: newCallId(), name: name, arguments: args))
+                } else {
+                    cleaned += body
+                }
                 rest = ""
                 break
             }
@@ -100,9 +112,46 @@ public enum ToolMarkup {
             rest = rest[close.upperBound...]
         }
         cleaned += rest
+        // Stray close tags (close without a matching open) are bare-tag
+        // garbage — strip them like evprtr's block regex does.
+        cleaned = cleaned.replacingOccurrences(of: callClose, with: "")
         return ParsedToolCalls(
             cleanedContent: cleaned.trimmingCharacters(in: .whitespacesAndNewlines),
             calls: calls)
+    }
+
+    /// First balanced `{...}` object from text, string- and escape-aware
+    /// (braces inside JSON strings do not count). Returns "" when none.
+    static func firstCompleteJSONObject(in text: String) -> String {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var start = -1
+        for (offset, ch) in text.enumerated() {
+            if escaped { escaped = false; continue }
+            if inString {
+                if ch == "\\" { escaped = true }
+                else if ch == "\"" { inString = false }
+                continue
+            }
+            switch ch {
+            case "\"": inString = true
+            case "{":
+                if depth == 0 { start = offset }
+                depth += 1
+            case "}":
+                if depth > 0 {
+                    depth -= 1
+                    if depth == 0, start >= 0 {
+                        let begin = text.index(text.startIndex, offsetBy: start)
+                        let end = text.index(text.startIndex, offsetBy: offset + 1)
+                        return String(text[begin ..< end])
+                    }
+                }
+            default: break
+            }
+        }
+        return ""
     }
 
     static func newCallId() -> String {

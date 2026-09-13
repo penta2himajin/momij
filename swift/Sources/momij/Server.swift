@@ -103,22 +103,69 @@ enum MomijHTTP {
     static func makeRouter(engine: MomijEngine) -> Router<BasicRequestContext> {
         let router = Router(context: BasicRequestContext.self)
         // Authorization (if present) is ignored — no 401 for Bearer from evprtr.
+        let traces = TraceStore(
+            dir: URL(fileURLWithPath: ProcessInfo.processInfo.environment["MOMIJ_TRACE_DIR"]
+                ?? NSString("~/.momij/traces").expandingTildeInPath))
+        // Fire-and-forget persistence: tracing must never fail or delay a request.
+        @Sendable func recordTrace(_ t: RequestTrace) {
+            Task { traces.write(t.record(), id: t.id) }
+        }
         router.get("/v1/models") { _, _ -> ModelsResponse in
             ModelsResponse(data: [ModelObject(id: engine.modelID)])
         }
         router.get("/healthz") { _, _ -> String in "ok" }
+        router.get("/v1/traces") { _, _ -> Response in
+            let records = traces.list(limit: 20)
+            guard let data = try? JSONSerialization.data(withJSONObject: ["object": "list", "data": records])
+            else {
+                return jsonError(status: .internalServerError, message: "trace list failed")
+            }
+            return Response(
+                status: .ok,
+                headers: [.contentType: "application/json"],
+                body: .init(byteBuffer: .init(data: data))
+            )
+        }
+        router.get("/v1/traces/:id") { _, context -> Response in
+            let id = context.parameters.get("id", as: String.self) ?? ""
+            guard let record = traces.get(id) else {
+                return jsonError(status: .notFound, message: "trace not found: \(id)")
+            }
+            guard let data = try? JSONSerialization.data(withJSONObject: record) else {
+                return jsonError(status: .internalServerError, message: "trace encode failed")
+            }
+            return Response(
+                status: .ok,
+                headers: [.contentType: "application/json"],
+                body: .init(byteBuffer: .init(data: data))
+            )
+        }
+
+        @Sendable func fail(_ status: HTTPResponse.Status, _ message: String, trace: RequestTrace) -> Response {
+            trace.fail(message)
+            recordTrace(trace)
+            return jsonError(status: status, message: message, traceId: trace.id, locus: trace.locus)
+        }
+
         router.post("/v1/chat/completions") { req, _ -> Response in
+            var trace = RequestTrace()
             let body = try await req.body.collect(upTo: 8_000_000)
             let chatReq: OpenAIChatCompat.ChatCompletionRequest
             do {
                 chatReq = try OpenAIChatCompat.parseRequest(from: Data(body.readableBytesView))
+                trace.event("parse", "ok", detail: [
+                    "messages": chatReq.messages.count,
+                    "has_tools": !chatReq.toolsLines.isEmpty,
+                    "stream": chatReq.stream,
+                    "max_tokens": chatReq.maxTokens,
+                ])
             } catch let e as OpenAIChatCompat.ParseError {
-                return jsonError(status: .badRequest, message: e.description)
+                return fail(.badRequest, e.description, trace: trace)
             } catch {
-                return jsonError(status: .badRequest, message: "invalid request")
+                return fail(.badRequest, "invalid request", trace: trace)
             }
             if chatReq.n > 1 {
-                return jsonError(status: .badRequest, message: "n>1 unsupported")
+                return fail(.badRequest, "n>1 unsupported", trace: trace)
             }
             let eos = 151_645
             var allowedNext: (@Sendable ([Int]) -> Set<Int>)? = nil
@@ -155,16 +202,13 @@ enum MomijHTTP {
                         (try? guide.allowedNext(prefix: prefix)) ?? [eos]
                     }
                 case .unsupported(let why):
-                    return jsonError(
-                        status: .badRequest,
-                        message: "structured output not supported yet: \(why)")
+                    return fail(
+                        .badRequest, "structured output not supported yet: \(why)", trace: trace)
                 case nil:
                     break
                 }
             } catch {
-                return jsonError(
-                    status: .badRequest,
-                    message: "structured output setup failed: \(error)")
+                return fail(.badRequest, "structured output setup failed: \(error)", trace: trace)
             }
 
             // Native Maple tools contract: rewrite tool history into markup
@@ -184,7 +228,7 @@ enum MomijHTTP {
             do {
                 promptIds = try engine.tokenizer.applyChatTemplate(effective.messages)
             } catch {
-                return jsonError(status: .internalServerError, message: "\(error)")
+                return fail(.internalServerError, "chat template failed: \(error)", trace: trace)
             }
 
             let opts = GenerateOptions(
@@ -202,10 +246,12 @@ enum MomijHTTP {
                 bannedTokenIds: ChatTemplatePatch.bannedAssistantTokenIds
             )
             if chatReq.stream {
+                trace.event("route", "ok", detail: ["mode": "stream"])
                 return try await streamSSE(
                     engine: engine, prompt: promptIds, options: opts,
                     toolsAttached: !chatReq.toolsLines.isEmpty,
-                    effectiveMessages: effective.messages)
+                    effectiveMessages: effective.messages,
+                    trace: trace, traces: traces)
             }
 
             let tokens: [Int]
@@ -218,7 +264,7 @@ enum MomijHTTP {
                     return out
                 }
             } catch {
-                return jsonError(status: .internalServerError, message: "generation failed: \(error)")
+                return fail(.internalServerError, "generation failed: \(error)", trace: trace)
             }
 
             var finish = OpenAIChatCompat.finishReason(
@@ -229,7 +275,7 @@ enum MomijHTTP {
                 let raw = try engine.tokenizer.decode(decodeIds)
                 text = ChatTemplatePatch.stripThinkForContent(raw)
             } catch {
-                return jsonError(status: .internalServerError, message: "decode failed: \(error)")
+                return fail(.internalServerError, "decode failed: \(error)", trace: trace)
             }
             var parsed = ToolMarkup.parsePseudoToolCalls(text)
             // Degenerate-call repair (compositor parity): an empty tool name
@@ -266,6 +312,12 @@ enum MomijHTTP {
                 }
             }
             let respFinish = parsed.calls.isEmpty ? finish : "tool_calls"
+            trace.event("decode", "ok", detail: [
+                "finish": respFinish,
+                "tokens": tokens.count,
+                "tool_calls": parsed.calls.count,
+                "degenerate": parsed.calls.contains(where: { $0.name.isEmpty }),
+            ])
             do {
                 let data = try OpenAIChatCompat.nonStreamJSON(
                     modelID: engine.modelID,
@@ -274,25 +326,89 @@ enum MomijHTTP {
                     promptTokens: promptIds.count,
                     completionTokens: tokens.count,
                     toolCalls: parsed.calls)
+                trace.event("present", "ok", detail: [
+                    "tool_calls": parsed.calls.count,
+                    "usage": ["prompt": promptIds.count, "completion": tokens.count],
+                ])
+                recordTrace(trace)
                 return Response(
                     status: .ok,
                     headers: [.contentType: "application/json"],
                     body: .init(byteBuffer: .init(data: data))
                 )
             } catch {
-                return jsonError(status: .internalServerError, message: "response encode failed")
+                return fail(.internalServerError, "response encode failed", trace: trace)
             }
         }
         return router
     }
 
-    static func jsonError(status: HTTPResponse.Status, message: String) -> Response {
-        let payload: [String: Any] = [
-            "error": [
-                "message": message,
-                "type": "invalid_request_error",
-            ],
+    /// Per-request structured trace (lightweight compositor parity).
+    /// Class + lock so it can be captured across task boundaries.
+    final class RequestTrace: @unchecked Sendable {
+        let id = TraceStore.newID()
+        private let startedAt = CFAbsoluteTimeGetCurrent()
+        private let gate = NSLock()
+        private var ok = true
+        private(set) var locus = "none"
+        private var error: String?
+        private var events: [[String: Any]] = []
+
+        init() {
+            event("accept", "ok")
+        }
+
+        func event(_ stage: String, _ status: String, detail: [String: Any] = [:]) {
+            gate.lock()
+            defer { gate.unlock() }
+            events.append([
+                "stage": stage,
+                "status": status,
+                "at": CFAbsoluteTimeGetCurrent(),
+                "detail": detail,
+            ])
+        }
+
+        func fail(_ message: String) {
+            gate.lock()
+            defer { gate.unlock() }
+            ok = false
+            locus = "upstream"
+            error = message
+            events.append([
+                "stage": "fail",
+                "status": "error",
+                "at": CFAbsoluteTimeGetCurrent(),
+                "detail": ["message": message],
+            ])
+        }
+
+        func record() -> [String: Any] {
+            gate.lock()
+            defer { gate.unlock() }
+            return [
+                "trace_id": id,
+                "started_at": startedAt,
+                "finished_at": CFAbsoluteTimeGetCurrent(),
+                "ok": ok,
+                "locus": locus,
+                "error": error ?? NSNull(),
+                "events": events,
+            ]
+        }
+    }
+
+    static func jsonError(
+        status: HTTPResponse.Status, message: String,
+        traceId: String? = nil, locus: String? = nil
+    ) -> Response {
+        var errorBody: [String: Any] = [
+            "message": message,
+            "type": "invalid_request_error",
         ]
+        if let traceId { errorBody["trace_id"] = traceId }
+        if let locus { errorBody["locus"] = locus }
+        let payload: [String: Any] = ["error": errorBody]
         let data = (try? JSONSerialization.data(withJSONObject: payload))
             ?? Data(#"{"error":{"message":"error","type":"invalid_request_error"}}"#.utf8)
         return Response(
@@ -301,10 +417,10 @@ enum MomijHTTP {
             body: .init(byteBuffer: .init(data: data))
         )
     }
-
     static func streamSSE(
         engine: MomijEngine, prompt: [Int], options: GenerateOptions,
-        toolsAttached: Bool, effectiveMessages: [OpenAIChatCompat.ChatMessage]
+        toolsAttached: Bool, effectiveMessages: [OpenAIChatCompat.ChatMessage],
+        trace: RequestTrace, traces: TraceStore
     ) async throws -> Response {
         let stream = AsyncStream<ByteBuffer> { cont in
             Task {
@@ -344,12 +460,14 @@ enum MomijHTTP {
                         completionTokens: tokens,
                         maxTokens: options.maxTokens,
                         eosTokenIds: options.eosTokenIds)
+                    var streamToolCalls = 0
                     if toolsAttached {
                         let decodeIds = OpenAIChatCompat.contentTokenIds(
                             tokens, eosTokenIds: options.eosTokenIds)
                         let raw = try engine.tokenizer.decode(decodeIds)
                         let text = ChatTemplatePatch.stripThinkForContent(raw)
                         let parsed = ToolMarkup.parsePseudoToolCalls(text)
+                        streamToolCalls = parsed.calls.count
                         if !parsed.cleanedContent.isEmpty {
                             let contentChunk: [String: Any] = [
                                 "id": "chatcmpl-momij",
@@ -421,7 +539,17 @@ enum MomijHTTP {
                     done.writeString("data: [DONE]\n\n")
                     cont.yield(done)
                     cont.finish()
+                    // Fire-and-forget trace write after the stream completes.
+                    trace.event("present", "ok", detail: [
+                        "mode": "stream",
+                        "finish": finish,
+                        "tokens": tokens.count,
+                        "tool_calls": streamToolCalls,
+                    ])
+                    traces.write(trace.record(), id: trace.id)
                 } catch {
+                    trace.fail("stream generation failed: \(error)")
+                    traces.write(trace.record(), id: trace.id)
                     cont.finish()
                 }
             }

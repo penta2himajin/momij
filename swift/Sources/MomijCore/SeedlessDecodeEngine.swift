@@ -526,12 +526,16 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             }
             lastPrefillChunks.append(M)
             let lastChunk = i + M == prompt.count
+            let tEmbed = CFAbsoluteTimeGetCurrent()
             embedTokens(prompt[i ..< (i + M)])
-            let tChunk = CFAbsoluteTimeGetCurrent()
+            let tEmbedDone = CFAbsoluteTimeGetCurrent()
             try stack.stepCommitWait(layersPerCB: layersPerCB, M: M)
+            let tCommit = CFAbsoluteTimeGetCurrent()
             if ProcessInfo.processInfo.environment["MOMIJ_PROFILE_PREFILL"] == "1" {
-                fputs(String(format: "[prefill] chunk M=%d pos=%d wall=%.2fms\n", M, i,
-                             (CFAbsoluteTimeGetCurrent() - tChunk) * 1000), stderr)
+                fputs(String(format: "[prefill] chunk M=%d pos=%d wall=%.2fms embed=%.2fms commitWait=%.2fms\n",
+                             M, i, (CFAbsoluteTimeGetCurrent() - tEmbed) * 1000,
+                             (tEmbedDone - tEmbed) * 1000,
+                             (CFAbsoluteTimeGetCurrent() - tEmbedDone) * 1000), stderr)
             }
             if lastChunk {
                 try encodeFinalNorm(fromLastRow: M - 1, skipFlash: skipFlash)

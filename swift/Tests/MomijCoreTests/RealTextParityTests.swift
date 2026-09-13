@@ -173,4 +173,24 @@ final class RealTextParityTests: XCTestCase {
         let evals = try chainEng.stepChainFeeds(feeds)
         XCTAssertEqual(evals, seq, String(describing: evals) + " vs " + String(describing: seq))
     }
+    /// Acceptance diagnostics on realistic (non-synthetic) agentic text.
+    func testAcceptanceOnAgenticText() async throws {
+        setenv("MOMIJ_SPEC_MAX_M", "64", 1)
+        let store = try makeStore()
+        let tok = try await AutoTokenizer.from(modelFolder: URL(fileURLWithPath: modelDir))
+        var prompt = tok.encode(text: Self.agentText)
+        while prompt.count < 600 { prompt += tok.encode(text: " " + Self.agentText) }
+        prompt = Array(prompt.prefix(600))
+        let eng = try SeedlessDecodeEngine(store: store, fullMaxLen: 2048, enableFlashHead: false)
+        let spec = try eng.generateSuffixSpec(prompt: prompt, maxTokens: 256, eos: nil)
+        let tps = Double(spec.tokens.count)
+        print("[accept] produced=" + String(spec.tokens.count)
+            + " accepted=" + String(spec.accepted)
+            + " attempts=" + String(spec.attempts)
+            + " gated=" + String(spec.gated)
+            + " accept/attempt=" + String(format: "%.2f", Double(spec.accepted) / Double(max(spec.attempts, 1)))
+            + " accept/gen=" + String(format: "%.2f", Double(spec.accepted) / Double(max(spec.tokens.count, 1))))
+        _ = tps
+        XCTAssertEqual(spec.tokens.count, min(256, 256))
+    }
 }

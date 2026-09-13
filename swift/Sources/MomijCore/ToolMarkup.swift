@@ -66,6 +66,11 @@ public enum ToolMarkup {
     public struct ParsedToolCalls: Equatable, Sendable {
         public var cleanedContent: String
         public var calls: [OpenAIChatCompat.ToolCallSpec]
+
+        public init(cleanedContent: String, calls: [OpenAIChatCompat.ToolCallSpec] = []) {
+            self.cleanedContent = cleanedContent
+            self.calls = calls
+        }
     }
 
     /// Parse tool-call blocks out of the completion text: returns the prose

@@ -296,6 +296,7 @@ enum MomijHTTP {
                 repairNudge = "Your last reply was malformed. Respond with exactly one tool call "
                     + "in the correct format, or plain text."
             }
+            var repairFailed = false
             if parsed.calls.contains(where: { $0.name.isEmpty }) || degenerateHit != nil {
                 var repair = effective.messages
                 repair.append(OpenAIChatCompat.ChatMessage(
@@ -326,10 +327,12 @@ enum MomijHTTP {
                         finish = parsed.calls.isEmpty ? finish : "tool_calls"
                         trace.event("repair", "ok", detail: ["trigger": degenerateHit?.kind ?? "empty_name"])
                     } else {
+                        repairFailed = true
                         trace.event("repair", "error", detail: ["trigger": degenerateHit?.kind ?? "empty_name"])
                     }
                 } catch {
                     // Keep the original parse on repair failure.
+                    repairFailed = true
                     trace.event("repair", "error", detail: ["error": "\(error)"])
                 }
             }
@@ -344,6 +347,21 @@ enum MomijHTTP {
             var respContent = parsed.cleanedContent
             var respToolCalls = parsed.calls
             var respFinish = parsed.calls.isEmpty ? finish : "tool_calls"
+            // Broken-call drop (evprtr sanitize parity): when repair failed
+            // and the surviving calls are still unusable (empty name or
+            // degenerate write/edit args), they must not reach the harness —
+            // a tool_calls finish the harness cannot execute causes retry
+            // loops (observed live in the DSH subagent test).
+            let brokenCalls = parsed.calls.contains(where: { $0.name.isEmpty })
+                || ResponseVerify.degenerateToolArgs(.init(toolCalls: parsed.calls)) != nil
+            if repairFailed && brokenCalls {
+                respToolCalls = []
+                respFinish = "stop"
+                if respContent.trimmingCharacters(in: .whitespaces).isEmpty {
+                    respContent = "Previous tool call arguments were unusable and were discarded."
+                }
+                trace.event("sanitize", "ok", detail: ["action": "drop_degenerate_calls"])
+            }
             if sanitizeEnabled, let hit = verifyOutcome.first {
                 if hit.kind == "degenerate_tool_args" {
                     // evprtr sanitize: unusable calls are dropped so the
@@ -375,6 +393,9 @@ enum MomijHTTP {
                     toolCalls: respToolCalls)
                 trace.event("present", "ok", detail: [
                     "tool_calls": respToolCalls.count,
+                    "tool_args": respToolCalls.map { call in
+                        ["name": call.name, "arguments": String(call.arguments.prefix(300))]
+                    },
                     "usage": ["prompt": promptIds.count, "completion": tokens.count],
                 ])
                 recordTrace(trace)
@@ -509,6 +530,7 @@ enum MomijHTTP {
                         maxTokens: options.maxTokens,
                         eosTokenIds: options.eosTokenIds)
                     var streamToolCalls = 0
+                    var streamToolArgs: [[String: Any]] = []
                     if toolsAttached {
                         let decodeIds = OpenAIChatCompat.contentTokenIds(
                             tokens, eosTokenIds: options.eosTokenIds)
@@ -562,6 +584,9 @@ enum MomijHTTP {
                             }
                         }
                         streamToolCalls = parsed.calls.count
+                        streamToolArgs = parsed.calls.map { call in
+                            ["name": call.name, "arguments": String(call.arguments.prefix(300))]
+                        }
                         let verifyOutcome = ResponseVerify.verify(.init(
                             content: text, reasoningContent: ResponseVerify.thinkInterior(of: raw),
                             toolCalls: parsed.calls))
@@ -586,6 +611,24 @@ enum MomijHTTP {
                                 buf.writeString("data: \(line)\n\n")
                                 cont.yield(buf)
                             }
+                        }
+                        // Broken-call drop (evprtr sanitize parity): when the
+                        // surviving calls are unusable (empty name or degenerate
+                        // write/edit args) — after a failed repair — they must
+                        // not reach the harness as a tool_calls chunk.
+                        let streamBrokenCalls = parsed.calls.contains(where: { $0.name.isEmpty })
+                            || ResponseVerify.degenerateToolArgs(.init(toolCalls: parsed.calls)) != nil
+                        if streamBrokenCalls {
+                            if parsed.cleanedContent.trimmingCharacters(in: .whitespaces).isEmpty {
+                                parsed = ToolMarkup.ParsedToolCalls(
+                                    cleanedContent:
+                                    "Previous tool call arguments were unusable and were discarded.",
+                                    calls: [])
+                            } else {
+                                parsed = ToolMarkup.ParsedToolCalls(
+                                    cleanedContent: parsed.cleanedContent, calls: [])
+                            }
+                            trace.event("sanitize", "ok", detail: ["action": "drop_degenerate_calls"])
                         }
                         if !parsed.calls.isEmpty {
                             finish = "tool_calls"
@@ -681,6 +724,7 @@ enum MomijHTTP {
                         "finish": finish,
                         "tokens": tokens.count,
                         "tool_calls": streamToolCalls,
+                        "tool_args": streamToolArgs,
                         "usage": ["prompt": prompt.count, "completion": tokens.count],
                     ])
                     traces.write(trace.record(), id: trace.id)

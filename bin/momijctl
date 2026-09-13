@@ -53,8 +53,10 @@ case "$cmd" in
       for p in $pids; do kill "$p" 2>/dev/null || true; done
       for i in $(seq 1 10); do
         leftover=""
-        for p in $pids; do kill -0 "$p" 2>/dev/null && leftover="$p"; done
-        [ -z "$leftover" ] && break
+        for p in $pids; do
+          if kill -0 "$p" 2>/dev/null; then leftover="$p"; fi
+        done
+        if [ -z "$leftover" ]; then break; fi
         sleep 1
       done
       for p in $pids; do kill -9 "$p" 2>/dev/null || true; done

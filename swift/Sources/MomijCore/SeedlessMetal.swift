@@ -55,6 +55,8 @@ public enum SeedlessMetal {
     nonisolated(unsafe) static var sdpaPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var embedTokenPipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var flashArgmaxTokenPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var lmHeadArgmaxPipeline: MTLComputePipelineState?
+    nonisolated(unsafe) static var lmHeadReducePipeline: MTLComputePipelineState?
     nonisolated(unsafe) static var stopBuf: MTLBuffer?
     nonisolated(unsafe) public static var ready = false
 
@@ -95,6 +97,8 @@ public enum SeedlessMetal {
         sdpaPipeline = try pipe("maple_sdpa_d128")
         embedTokenPipeline = try pipe("maple_embed_token")
         flashArgmaxTokenPipeline = try pipe("maple_flash_argmax_token")
+        lmHeadArgmaxPipeline = try pipe("maple_lm_head_argmax")
+        lmHeadReducePipeline = try pipe("maple_lm_head_reduce")
         ready = true
         if useFold { try compileFoldPipelines(dev) }
     }
@@ -815,6 +819,45 @@ public enum SeedlessMetal {
         enc.dispatchThreadgroups(
             MTLSize(width: numHeads, height: M, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
+    }
+
+    /// Exact lm_head argmax in raw Metal: per-row 4-bit gemv + argmax fused,
+    /// banned ids excluded. Encodes two kernels (partials + fold) into `enc`;
+    /// the caller reads `out` ([M] ids) after the CB completes.
+    public static func encodeLMHeadArgmax(
+        into enc: MTLComputeCommandEncoder,
+        x: MTLBuffer, w: MTLBuffer, scales: MTLBuffer, biases: MTLBuffer,
+        banned: MTLBuffer, tgMax: MTLBuffer, tgId: MTLBuffer, out: MTLBuffer,
+        K: Int, gs: Int, V: Int, M: Int, numTG: Int, nBanned: Int
+    ) {
+        guard let aPipe = lmHeadArgmaxPipeline, let rPipe = lmHeadReducePipeline else { return }
+        enc.setComputePipelineState(aPipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(w, offset: 0, index: 1)
+        enc.setBuffer(scales, offset: 0, index: 2)
+        enc.setBuffer(biases, offset: 0, index: 3)
+        enc.setBuffer(banned, offset: 0, index: 4)
+        enc.setBuffer(tgMax, offset: 0, index: 5)
+        enc.setBuffer(tgId, offset: 0, index: 6)
+        var k32 = Int32(K), gs32 = Int32(gs), v32 = Int32(V), m32 = Int32(M)
+        var nb32 = Int32(nBanned), ntg32 = Int32(numTG)
+        enc.setBytes(&k32, length: 4, index: 7)
+        enc.setBytes(&gs32, length: 4, index: 8)
+        enc.setBytes(&v32, length: 4, index: 9)
+        enc.setBytes(&m32, length: 4, index: 10)
+        enc.setBytes(&nb32, length: 4, index: 11)
+        enc.setBytes(&ntg32, length: 4, index: 12)
+        enc.dispatchThreadgroups(MTLSize(width: numTG, height: M, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        // numTG = row blocks of 8 rows (one SIMD group per row)
+        enc.setComputePipelineState(rPipe)
+        enc.setBuffer(tgMax, offset: 0, index: 0)
+        enc.setBuffer(tgId, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        enc.setBytes(&ntg32, length: 4, index: 3)
+        enc.setBytes(&m32, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: max(M, 1), height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(max(M, 1), 64), height: 1, depth: 1))
     }
 
     /// Copy one KV cache slot from `src` (token-major head layout).
@@ -2951,6 +2994,102 @@ public enum SeedlessMetal {
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         if (simd_lid == 0) { for (int i = 0; i < v_per_thread; i++) out[i] = half(o[i]); }
+    }
+
+    // Exact lm_head argmax (4-bit affine, group gs): one SIMD GROUP per vocab
+    // row (coalesced 4-byte word loads), banned rows score -inf; a tiny second
+    // kernel folds the per-simdgroup partials. Encoded into the layer CB tail
+    // — no host sync, no MLX. Requires gs == 64 (8 words per group).
+    kernel void maple_lm_head_argmax(
+        device const half* x         [[buffer(0)]],   // [M, K]
+        device const uint* w         [[buffer(1)]],   // [V, K/8]
+        device const half* scales    [[buffer(2)]],   // [V, K/gs]
+        device const half* biases    [[buffer(3)]],   // [V, K/gs]
+        device const int* banned     [[buffer(4)]],
+        device float* tgMax          [[buffer(5)]],   // [M, numTG]
+        device int* tgId             [[buffer(6)]],   // [M, numTG]
+        constant int& K              [[buffer(7)]],
+        constant int& gs             [[buffer(8)]],
+        constant int& V              [[buffer(9)]],
+        constant int& M              [[buffer(10)]],
+        constant int& nBanned        [[buffer(11)]],
+        constant int& numTGPartial   [[buffer(12)]],
+        uint3 gid [[threadgroup_position_in_grid]],                  // x: row block, y: token row
+        uint simd_gid [[simdgroup_index_in_threadgroup]],            // row in block
+        uint simd_lid [[thread_index_in_simdgroup]])
+    {
+        int row = (int)(gid.x * 8u) + (int)simd_gid;
+        int m = (int)gid.y;
+        if (m >= M) return;
+        float acc = -INFINITY;
+        if (row < (int)V) {
+            bool keep = true;
+            for (int b = 0; b < nBanned; b++) {
+                if (banned[b] == row) { keep = false; break; }
+            }
+            if (keep) {
+                uint packs = (uint)K / 8u;
+                const device uint* wr = w + (size_t)row * packs;
+                const device half* sr = scales + (size_t)row * (uint)(K / (uint)gs);
+                const device half* br = biases + (size_t)row * (uint)(K / (uint)gs);
+                const device half* xm = x + (size_t)m * (size_t)K;
+                float accX = 0.0f;
+                for (uint wk = simd_lid; wk < packs; wk += 32u) {
+                    uint pack = wr[wk];
+                    float sc = float(sr[wk >> 3]);
+                    float bi = float(br[wk >> 3]);
+                    uint k0 = wk * 8u;
+                    for (uint e = 0; e < 8u; e++) {
+                        uint nib = (pack >> (e * 4u)) & 0xfu;
+                        accX += (float(nib) * sc + bi) * float(xm[k0 + e]);
+                    }
+                }
+                acc = simd_sum(accX);
+            }
+        }
+        float best = acc;
+        int bestId = acc == -INFINITY ? V : row;
+        for (uint off = 16u; off >= 1u; off >>= 1u) {
+            float o = simd_shuffle(best, simd_lid ^ off);
+            int oi = (int)simd_shuffle((uint)bestId, simd_lid ^ off);
+            if (o > best || (o == best && oi < bestId)) { best = o; bestId = oi; }
+        }
+        threadgroup float shMax[8];
+        threadgroup int shId[8];
+        if (simd_lid == 0) { shMax[simd_gid] = best; shId[simd_gid] = bestId; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_gid == 0u && simd_lid == 0u) {
+            float gBest = shMax[0];
+            int gId = shId[0];
+            for (int s = 1; s < 8; s++) {
+                if (shMax[s] > gBest || (shMax[s] == gBest && shId[s] < gId)) {
+                    gBest = shMax[s]; gId = shId[s];
+                }
+            }
+            tgMax[(size_t)m * (size_t)numTGPartial + (size_t)gid.x] = gBest;
+            tgId[(size_t)m * (size_t)numTGPartial + (size_t)gid.x] = gId;
+        }
+    }
+
+    // Fold per-simdgroup partials into the final argmax id per token row.
+    kernel void maple_lm_head_reduce(
+        device const float* tgMax [[buffer(0)]],
+        device const int* tgId    [[buffer(1)]],
+        device int* out           [[buffer(2)]],   // [M]
+        constant int& numTG       [[buffer(3)]],
+        constant int& M           [[buffer(4)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        int m = (int)gid.x;
+        if (m >= M) return;
+        float best = tgMax[(size_t)m * (size_t)numTG];
+        int bestId = tgId[(size_t)m * (size_t)numTG];
+        for (int t = 1; t < numTG; t++) {
+            float v = tgMax[(size_t)m * (size_t)numTG + (size_t)t];
+            int id = tgId[(size_t)m * (size_t)numTG + (size_t)t];
+            if (v > best || (v == best && id < bestId)) { best = v; bestId = id; }
+        }
+        out[m] = bestId;
     }
 
     // Gather one embedding row: out[outRow, :] = table[ids[row], :]

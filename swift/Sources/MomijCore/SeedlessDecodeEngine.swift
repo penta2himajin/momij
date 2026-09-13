@@ -31,7 +31,19 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     public var flashFused: Bool { flashHead?.fuseIntoLayerCB ?? false }
     var decodeMaxM: Int { stack.maxM }
     private(set) var lastPrefillChunks: [Int] = []
+    /// Raw-Metal exact lm_head argmax (env `MOMIJ_METAL_HEAD=0` disables).
+    let useMetalHead: Bool
+    private var metalHeadPending = false
+    private var metalHeadBannedFor: [Int] = []
     private let finalNormBuf: MTLBuffer
+    private var lmHeadW: MTLBuffer?
+    private var lmHeadS: MTLBuffer?
+    private var lmHeadB: MTLBuffer?
+    private var lmHeadTgMax: MTLBuffer?
+    private var lmHeadTgId: MTLBuffer?
+    private var lmHeadArg: MTLBuffer?
+    private var lmHeadBanned: MTLBuffer?
+    private var lmHeadNumTG = 0
     private let H: Int
     /// Max chained verify feeds (draftK+1). Env `MOMIJ_SPEC_MAX_M`, default 9.
     private let specMaxM: Int
@@ -127,6 +139,34 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         embBuf = ebuf
         normWBuf = nbuf
         finalNormBuf = device.makeBuffer(length: H * 2, options: .storageModeShared)!
+        // Raw-Metal exact lm_head argmax: alias the quantized head weights and
+        // stage small scratch buffers. Enabled only for the 4-bit head layout.
+        useMetalHead = config.headBits == 4
+            && ProcessInfo.processInfo.environment["MOMIJ_METAL_HEAD"] == "1"
+        if useMetalHead {
+            guard let wb = SeedlessMetal.mtlBuf(store.req("lm_head.weight"), device),
+                  let sb = SeedlessMetal.mtlBuf(store.req("lm_head.scales"), device),
+                  let bb = SeedlessMetal.mtlBuf(store.req("lm_head.biases"), device)
+            else { throw SeedlessError.notReady }
+            lmHeadW = wb
+            lmHeadS = sb
+            lmHeadB = bb
+            let tgCount = (vocab + 7) / 8
+            lmHeadNumTG = tgCount
+            lmHeadTgMax = device.makeBuffer(length: specMaxM * tgCount * 4, options: .storageModeShared)!
+            lmHeadTgId = device.makeBuffer(length: specMaxM * tgCount * 4, options: .storageModeShared)!
+            lmHeadArg = device.makeBuffer(length: specMaxM * 4, options: .storageModeShared)!
+            lmHeadBanned = device.makeBuffer(length: 16 * 4, options: .storageModeShared)!
+        } else {
+            lmHeadW = nil
+            lmHeadS = nil
+            lmHeadB = nil
+            lmHeadNumTG = 0
+            lmHeadTgMax = nil
+            lmHeadTgId = nil
+            lmHeadArg = nil
+            lmHeadBanned = nil
+        }
     }
 
     /// True when this call should skip FlashHead argmax (exact `lm_head`).
@@ -154,7 +194,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     public func stepChainFeeds(_ feeds: [Int]) throws -> [Int] {
         precondition(!feeds.isEmpty && feeds.count <= specMaxM)
         let wantFlash = !greedySkipFlash && flashFused && flashHead != nil
-        let packMrow = try encodeChainFeeds(feeds, withFlash: wantFlash)
+        let metalRows = (useMetalHead && !wantFlash) ? feeds.count : 0
+        let packMrow = try encodeChainFeeds(feeds, withFlash: wantFlash, metalHeadRows: metalRows)
         let M = feeds.count
         if wantFlash, let fh = flashHead {
             var evals: [Int] = []
@@ -173,6 +214,14 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                         hostH: ptr, inds: specIndsSlots[i], logits: specLogitsSlots[i]))
                 }
             }
+            return evals
+        }
+        if useMetalHead, packMrow, metalHeadPending {
+            var evals: [Int] = []
+            evals.reserveCapacity(M)
+            let ptr = lmHeadArg!.contents().bindMemory(to: Int32.self, capacity: M)
+            for i in 0 ..< M { evals.append(Int(ptr[i])) }
+            metalHeadPending = false
             return evals
         }
         return argmaxExactFromChain(M: M, packed: packMrow)
@@ -212,7 +261,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     /// One CB: embed `feeds` × layers ± packed M-row. FlashHead gather is optional.
     /// Returns whether True M-row packing ran.
     @discardableResult
-    private func encodeChainFeeds(_ feeds: [Int], withFlash: Bool) throws -> Bool {
+    private func encodeChainFeeds(_ feeds: [Int], withFlash: Bool, metalHeadRows: Int = 0) throws -> Bool {
         ensureSpecSlots()
         guard let q = SeedlessMetal.queue, let feedBuf = specFeedIds else {
             throw SeedlessError.notReady
@@ -238,6 +287,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 SeedlessMetal.encodeRms(
                     into: enc, h: stack.hBuf, w: normWBuf, out: packed,
                     H: H, eps: config.rmsNormEps, M: M)
+                if metalHeadRows > 0 {
+                    encodeMetalHead(enc, x: packed, rows: metalHeadRows)
+                }
                 if let fh {
                     for i in 0 ..< M {
                         let off = i * H * 2
@@ -302,6 +354,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     }
 
     private func pickGreedyFromFinalNorm(skipFlash: Bool) -> Int {
+        if let staged = takeMetalHeadArgmax() {
+            return staged
+        }
         if skipFlash || greedySkipFlash {
             return nextToken()
         }
@@ -404,6 +459,42 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     public func reset() {
         stack.resetCaches()
         // Keep global suffix + recycle across resets (warm multi-turn / trials).
+        metalHeadPending = false
+    }
+
+    /// Stage the banned-id list for the raw-Metal lm_head argmax kernel.
+    private func syncMetalHeadBanned() {
+        guard let buf = lmHeadBanned else { return }
+        let p = buf.contents().bindMemory(to: Int32.self, capacity: 16)
+        for i in 0 ..< 16 { p[i] = 0 }
+        for (i, id) in decodeBanned.prefix(16).enumerated() { p[i] = Int32(id) }
+    }
+
+    /// Read the raw-Metal argmax result staged by the last encoded head kernel.
+    private func takeMetalHeadArgmax(_ row: Int = 0) -> Int? {
+        guard metalHeadPending, let arg = lmHeadArg else { return nil }
+        metalHeadPending = false
+        return Int(arg.contents().bindMemory(to: Int32.self, capacity: row + 1)[row])
+    }
+
+    /// Encode the exact lm_head argmax kernel for `rows` rows of `xBuf`.
+    private func encodeMetalHead(_ enc: MTLComputeCommandEncoder, x: MTLBuffer, rows: Int) {
+        guard useMetalHead, let wB = lmHeadW, let sB = lmHeadS, let bB = lmHeadB,
+              let tm = lmHeadTgMax, let ti = lmHeadTgId, let arg = lmHeadArg,
+              let banned = lmHeadBanned else {
+            metalHeadPending = false
+            return
+        }
+        // Rows beyond the vocab (last partial TG) never write their partial;
+        // seed the TG maxima to -inf so the fold ignores them.
+        let tmPtr = tm.contents().bindMemory(to: Float.self, capacity: rows * lmHeadNumTG)
+        for i in 0 ..< (rows * lmHeadNumTG) { tmPtr[i] = -Float.infinity }
+        SeedlessMetal.encodeLMHeadArgmax(
+            into: enc, x: x, w: wB, scales: sB, biases: bB,
+            banned: banned, tgMax: tm, tgId: ti, out: arg,
+            K: H, gs: config.headGroupSize, V: vocab, M: rows,
+            numTG: lmHeadNumTG, nBanned: min(decodeBanned.count, 16))
+        metalHeadPending = rows > 0
     }
 
     private func embedToken(_ id: Int) {
@@ -466,6 +557,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                 fh.encodeFusedAfterCentroids(into: enc, h: finalNormBuf)
             }
         }
+        if useMetalHead {
+            encodeMetalHead(enc, x: finalNormBuf, rows: 1)
+        }
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
@@ -485,10 +579,17 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         // FlashHead on their own paths.
         let ptr = finalNormBuf.contents().bindMemory(to: Float16.self, capacity: H)
         let h = MLXArray(UnsafeBufferPointer(start: ptr, count: H)).reshaped([H])
+        let prof = ProcessInfo.processInfo.environment["MOMIJ_PROFILE_HEAD"] == "1"
+        let t0 = CFAbsoluteTimeGetCurrent()
         let logits = lmHead.apply(h.reshaped([1, 1, H]))
         let y = MLX.argMax(logits.reshaped([-1]), axis: -1)
         MLX.eval(y)
+        let t1 = CFAbsoluteTimeGetCurrent()
         let id = y.item(Int.self)
+        if prof {
+            fputs(String(format: "[head] eval=%.3fms item=%.3fms\n",
+                         (t1 - t0) * 1000, (CFAbsoluteTimeGetCurrent() - t1) * 1000), stderr)
+        }
         if !decodeBanned.isEmpty && decodeBanned.contains(id) {
             return nextTokenBannedFallback()
         }
@@ -997,6 +1098,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
                     fh.encodeFusedAfterCentroids(into: enc, h: finalNormBuf)
                 }
             }
+            if useMetalHead, allowed == nil {
+                encodeMetalHead(enc, x: finalNormBuf, rows: 1)
+            }
         }
         let t2 = CFAbsoluteTimeGetCurrent()
         let next: Int
@@ -1036,7 +1140,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         bannedTokenIds: [Int] = []
     ) throws -> [Int] {
         decodeBanned = bannedTokenIds
-        defer { decodeBanned = [] }
+        syncMetalHeadBanned()
+        defer { decodeBanned = []; metalHeadPending = false }
         guard !prompt.isEmpty, maxTokens > 0 else { return [] }
         // Full-attn layers need prompt+gen ≤ fullMaxLen. Fail cleanly before Metal encode.
         if prompt.count >= fullMaxLen {
@@ -1106,7 +1211,8 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         bannedTokenIds: [Int] = []
     ) throws -> (tokens: [Int], accepted: Int, attempts: Int, gated: Int) {
         decodeBanned = bannedTokenIds
-        defer { decodeBanned = [] }
+        syncMetalHeadBanned()
+        defer { decodeBanned = []; metalHeadPending = false }
         guard !prompt.isEmpty, maxTokens > 0 else { return ([], 0, 0, 0) }
         reset()
         try prefillPrompt(prompt, skipFlash: greedySkipFlash)
@@ -1337,7 +1443,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             }
 
             attempts += 1
-            let hotEnough = meanAccept >= 1.5
+            let gate = ProcessInfo.processInfo.environment["MOMIJ_SPEC_BATCH_GATE"]
+                .flatMap(Double.init) ?? 1.0
+            let hotEnough = meanAccept >= gate
             let canBatch = useMrow || (useFlashHead && flashFused)
             let useBatch = !batchOff && canBatch && (batchForce || hotEnough)
             let accepted: Int

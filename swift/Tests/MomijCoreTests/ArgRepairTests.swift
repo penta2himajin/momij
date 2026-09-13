@@ -109,6 +109,35 @@ final class ArgRepairTests: XCTestCase {
         XCTAssertTrue(json.contains("\"path\": \"notes.md\""), json)
     }
 
+    func testMissingRequiredFields() {
+        // DSH bash-like schema requires command + description.
+        let bashLines = [
+            #"{"type":"function","function":{"name":"bash","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command","description"]}}}"#,
+        ]
+        // description absent -> flagged.
+        XCTAssertEqual(
+            ArgRepair.missingRequiredFields(
+                toolLines: bashLines, tool: "bash",
+                args: ["command": "ls"]),
+            ["description"])
+        // Empty string counts as missing (the harness rejects empty required
+        // strings the same way for our purposes).
+        XCTAssertEqual(
+            ArgRepair.missingRequiredFields(
+                toolLines: bashLines, tool: "bash",
+                args: ["command": "ls", "description": ""]),
+            ["description"])
+        // All present -> empty.
+        XCTAssertTrue(
+            ArgRepair.missingRequiredFields(
+                toolLines: bashLines, tool: "bash",
+                args: ["command": "ls", "description": "List files"]).isEmpty)
+        // Unknown tool -> no schema, no opinion.
+        XCTAssertTrue(
+            ArgRepair.missingRequiredFields(
+                toolLines: bashLines, tool: "nonexistent", args: [:]).isEmpty)
+    }
+
     func testFirstJSONObjectToleratesProse() {
         let obj = ArgRepair.firstJSONObject(
             in: "Sure.\n\n{\"path\": \"a.md\"}\n\nDone.")

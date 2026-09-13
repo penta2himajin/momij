@@ -300,36 +300,66 @@ enum MomijHTTP {
             // regenerate ONLY the broken argument fields under the tool's
             // JSON schema and merge (good parts survive); (2) whole-reply
             // re-ask with a corrective nudge; (3) drop the broken calls.
+            // The fix target comes from the write/edit heuristics OR from
+            // schema-required fields missing on ANY tool (the harness-side
+            // "missing required property" rejection, caught before it leaves).
             var degenerateHit = ResponseVerify.degenerateToolArgs(.init(toolCalls: parsed.calls))
             let emptyNameAtStart = parsed.calls.contains(where: { $0.name.isEmpty })
-            if !emptyNameAtStart, let hit = degenerateHit, hit.onset < parsed.calls.count {
-                let brokenCall = parsed.calls[hit.onset]
+            var pendingFix: (idx: Int, fields: [String], reasons: [String: String], kind: String)? = nil
+            if let hit = degenerateHit, hit.onset < parsed.calls.count {
                 let fields = ArgRepair.fieldsToFix(detail: hit.detail)
                 if !fields.isEmpty {
-                    do {
-                        let merged = try await MomijHTTP.fieldRepairCall(
-                            engine: engine, eos: eos, toolsLines: chatReq.toolsLines,
-                            tool: brokenCall.name, args: ArgRepair.parseArgs(brokenCall.arguments),
-                            hitDetail: hit.detail,
-                            task: ArgRepair.originalUserText(effective.messages),
-                            baseOpts: opts)
-                        if let merged {
-                            var fixedCalls = parsed.calls
-                            fixedCalls[hit.onset] = OpenAIChatCompat.ToolCallSpec(
-                                id: brokenCall.id, name: brokenCall.name,
-                                arguments: ArgRepair.argsJSONString(merged))
-                            if ResponseVerify.degenerateToolArgs(.init(toolCalls: fixedCalls)) == nil {
-                                parsed = ToolMarkup.ParsedToolCalls(
-                                    cleanedContent: parsed.cleanedContent, calls: fixedCalls)
-                                degenerateHit = nil
-                                trace.event("repair", "ok", detail: [
-                                    "mode": "field", "fields": fields])
-                            }
-                        }
-                    } catch {
-                        trace.event("repair", "error", detail: [
-                            "mode": "field", "error": "\(error)"])
+                    let reason = (hit.detail["reason"] as? String) ?? "unusable"
+                    pendingFix = (hit.onset, fields,
+                        Dictionary(uniqueKeysWithValues: fields.map { ($0, reason) }), hit.kind)
+                }
+            }
+            if pendingFix == nil {
+                for (i, call) in parsed.calls.enumerated() where !call.name.isEmpty {
+                    let missing = ArgRepair.missingRequiredFields(
+                        toolLines: chatReq.toolsLines, tool: call.name,
+                        args: ArgRepair.parseArgs(call.arguments))
+                    if !missing.isEmpty {
+                        pendingFix = (i, missing,
+                            Dictionary(uniqueKeysWithValues: missing.map {
+                                ($0, "missing required property") }),
+                            "missing_required_property")
+                        break
                     }
+                }
+            }
+            if !emptyNameAtStart, let pf = pendingFix {
+                let brokenCall = parsed.calls[pf.idx]
+                do {
+                    let merged = try await MomijHTTP.fieldRepairCall(
+                        engine: engine, eos: eos, toolsLines: chatReq.toolsLines,
+                        tool: brokenCall.name, args: ArgRepair.parseArgs(brokenCall.arguments),
+                        fields: pf.fields, reasons: pf.reasons,
+                        task: ArgRepair.originalUserText(effective.messages),
+                        baseOpts: opts)
+                    if let merged {
+                        var fixedCalls = parsed.calls
+                        fixedCalls[pf.idx] = OpenAIChatCompat.ToolCallSpec(
+                            id: brokenCall.id, name: brokenCall.name,
+                            arguments: ArgRepair.argsJSONString(merged))
+                        let clean = ResponseVerify.degenerateToolArgs(.init(toolCalls: fixedCalls)) == nil
+                            && fixedCalls.contains {
+                                !ArgRepair.missingRequiredFields(
+                                    toolLines: chatReq.toolsLines, tool: $0.name,
+                                    args: ArgRepair.parseArgs($0.arguments)).isEmpty
+                            } == false
+                        if clean {
+                            parsed = ToolMarkup.ParsedToolCalls(
+                                cleanedContent: parsed.cleanedContent, calls: fixedCalls)
+                            degenerateHit = ResponseVerify.degenerateToolArgs(
+                                .init(toolCalls: fixedCalls))
+                            trace.event("repair", "ok", detail: [
+                                "mode": "field", "kind": pf.kind, "fields": pf.fields])
+                        }
+                    }
+                } catch {
+                    trace.event("repair", "error", detail: [
+                        "mode": "field", "kind": pf.kind, "error": "\(error)"])
                 }
             }
             let repairNudge: String
@@ -401,6 +431,11 @@ enum MomijHTTP {
             // loops (observed live in the DSH subagent test).
             let brokenCalls = parsed.calls.contains(where: { $0.name.isEmpty })
                 || ResponseVerify.degenerateToolArgs(.init(toolCalls: parsed.calls)) != nil
+                || parsed.calls.contains {
+                    !ArgRepair.missingRequiredFields(
+                        toolLines: chatReq.toolsLines, tool: $0.name,
+                        args: ArgRepair.parseArgs($0.arguments)).isEmpty
+                }
             if repairFailed && brokenCalls {
                 respToolCalls = []
                 respFinish = "stop"
@@ -538,13 +573,10 @@ enum MomijHTTP {
     /// survive — regenerating the whole reply is what breaks good parts.
     static func fieldRepairCall(
         engine: MomijEngine, eos: Int, toolsLines: [String], tool: String,
-        args: [String: Any], hitDetail: [String: Any], task: String,
-        baseOpts: GenerateOptions
+        args: [String: Any], fields: [String], reasons: [String: String],
+        task: String, baseOpts: GenerateOptions
     ) async throws -> [String: Any]? {
-        let fields = ArgRepair.fieldsToFix(detail: hitDetail)
         guard !fields.isEmpty else { return nil }
-        let reason = (hitDetail["reason"] as? String) ?? "unusable"
-        let reasons = Dictionary(uniqueKeysWithValues: fields.map { ($0, reason) })
         var opts = baseOpts.withMaxTokens(400)
         if let schema = ArgRepair.constrainedObjectSchema(
             toolLines: toolsLines, tool: tool, fields: fields),
@@ -637,40 +669,67 @@ enum MomijHTTP {
                         var degenerateHit = ResponseVerify.degenerateToolArgs(
                             .init(toolCalls: parsed.calls))
                         let streamEmptyName = parsed.calls.contains(where: { $0.name.isEmpty })
-                        if !streamEmptyName, let hit = degenerateHit,
-                           hit.onset < parsed.calls.count {
-                            let brokenCall = parsed.calls[hit.onset]
+                        var pendingFix: (idx: Int, fields: [String], reasons: [String: String], kind: String)? = nil
+                        if let hit = degenerateHit, hit.onset < parsed.calls.count {
                             let fields = ArgRepair.fieldsToFix(detail: hit.detail)
                             if !fields.isEmpty {
-                                do {
-                                    let merged = try await MomijHTTP.fieldRepairCall(
-                                        engine: engine,
-                                        eos: options.eosTokenIds.first ?? 151_645,
-                                        toolsLines: toolsLines,
-                                        tool: brokenCall.name,
-                                        args: ArgRepair.parseArgs(brokenCall.arguments),
-                                        hitDetail: hit.detail,
-                                        task: ArgRepair.originalUserText(effectiveMessages),
-                                        baseOpts: options)
-                                    if let merged {
-                                        var fixedCalls = parsed.calls
-                                        fixedCalls[hit.onset] = OpenAIChatCompat.ToolCallSpec(
-                                            id: brokenCall.id, name: brokenCall.name,
-                                            arguments: ArgRepair.argsJSONString(merged))
-                                        if ResponseVerify.degenerateToolArgs(
-                                            .init(toolCalls: fixedCalls)) == nil {
-                                            parsed = ToolMarkup.ParsedToolCalls(
-                                                cleanedContent: parsed.cleanedContent,
-                                                calls: fixedCalls)
-                                            degenerateHit = nil
-                                            trace.event("repair", "ok", detail: [
-                                                "mode": "field", "fields": fields])
-                                        }
-                                    }
-                                } catch {
-                                    trace.event("repair", "error", detail: [
-                                        "mode": "field", "error": "\(error)"])
+                                let reason = (hit.detail["reason"] as? String) ?? "unusable"
+                                pendingFix = (hit.onset, fields,
+                                    Dictionary(uniqueKeysWithValues: fields.map { ($0, reason) }),
+                                    hit.kind)
+                            }
+                        }
+                        if pendingFix == nil {
+                            for (i, call) in parsed.calls.enumerated() where !call.name.isEmpty {
+                                let missing = ArgRepair.missingRequiredFields(
+                                    toolLines: toolsLines, tool: call.name,
+                                    args: ArgRepair.parseArgs(call.arguments))
+                                if !missing.isEmpty {
+                                    pendingFix = (i, missing,
+                                        Dictionary(uniqueKeysWithValues: missing.map {
+                                            ($0, "missing required property") }),
+                                        "missing_required_property")
+                                    break
                                 }
+                            }
+                        }
+                        if !streamEmptyName, let pf = pendingFix {
+                            let brokenCall = parsed.calls[pf.idx]
+                            do {
+                                let merged = try await MomijHTTP.fieldRepairCall(
+                                    engine: engine,
+                                    eos: options.eosTokenIds.first ?? 151_645,
+                                    toolsLines: toolsLines,
+                                    tool: brokenCall.name,
+                                    args: ArgRepair.parseArgs(brokenCall.arguments),
+                                    fields: pf.fields, reasons: pf.reasons,
+                                    task: ArgRepair.originalUserText(effectiveMessages),
+                                    baseOpts: options)
+                                if let merged {
+                                    var fixedCalls = parsed.calls
+                                    fixedCalls[pf.idx] = OpenAIChatCompat.ToolCallSpec(
+                                        id: brokenCall.id, name: brokenCall.name,
+                                        arguments: ArgRepair.argsJSONString(merged))
+                                    let clean = ResponseVerify.degenerateToolArgs(
+                                        .init(toolCalls: fixedCalls)) == nil
+                                        && fixedCalls.contains {
+                                            !ArgRepair.missingRequiredFields(
+                                                toolLines: toolsLines, tool: $0.name,
+                                                args: ArgRepair.parseArgs($0.arguments)).isEmpty
+                                        } == false
+                                    if clean {
+                                        parsed = ToolMarkup.ParsedToolCalls(
+                                            cleanedContent: parsed.cleanedContent,
+                                            calls: fixedCalls)
+                                        degenerateHit = ResponseVerify.degenerateToolArgs(
+                                            .init(toolCalls: fixedCalls))
+                                        trace.event("repair", "ok", detail: [
+                                            "mode": "field", "kind": pf.kind, "fields": pf.fields])
+                                    }
+                                }
+                            } catch {
+                                trace.event("repair", "error", detail: [
+                                    "mode": "field", "kind": pf.kind, "error": "\(error)"])
                             }
                         }
                         let needsRepair = degenerateHit != nil || streamEmptyName
@@ -747,6 +806,11 @@ enum MomijHTTP {
                         // not reach the harness as a tool_calls chunk.
                         let streamBrokenCalls = parsed.calls.contains(where: { $0.name.isEmpty })
                             || ResponseVerify.degenerateToolArgs(.init(toolCalls: parsed.calls)) != nil
+                            || parsed.calls.contains {
+                                !ArgRepair.missingRequiredFields(
+                                    toolLines: toolsLines, tool: $0.name,
+                                    args: ArgRepair.parseArgs($0.arguments)).isEmpty
+                            }
                         if streamBrokenCalls {
                             if parsed.cleanedContent.trimmingCharacters(in: .whitespaces).isEmpty {
                                 parsed = ToolMarkup.ParsedToolCalls(

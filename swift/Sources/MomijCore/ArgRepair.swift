@@ -25,6 +25,22 @@ public enum ArgRepair {
         }
     }
 
+    /// Required argument fields (per the tool's JSON schema) that are absent
+    /// or null — the harness-side "missing required property" rejection,
+    /// caught here so the repair can fill them BEFORE the call leaves.
+    public static func missingRequiredFields(
+        toolLines: [String], tool: String, args: [String: Any]
+    ) -> [String] {
+        guard let schema = toolSchema(toolLines: toolLines, tool: tool) else { return [] }
+        let required = schema["required"] as? [String] ?? []
+        return required.filter { f in
+            guard let v = args[f] else { return true }
+            if v is NSNull { return true }
+            if let s = v as? String { return s.isEmpty }
+            return false
+        }
+    }
+
     /// evprtr `original_user_text`: prefer the primary user task (the
     /// longest early user message), skipping tiny placeholder turns.
     public static func originalUserText(_ messages: [OpenAIChatCompat.ChatMessage]) -> String {

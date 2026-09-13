@@ -46,7 +46,8 @@ case "$cmd" in
   stop)
     # Kill the real listener(s) on our dedicated port, not just the wrapper
     # pid — nohup's $! is the subshell and the server child survives it.
-    pids="$(lsof -ti :$PORT 2>/dev/null | sort -u | tr '\n' ' ')"
+    # (lsof exits 1 when nothing listens — neutralize for pipefail.)
+    pids="$( { lsof -ti :$PORT 2>/dev/null || true; } | sort -u | tr '\n' ' ')"
     w="$(pid)"
     [ -n "$w" ] && pids="$pids $w"
     if [ -n "$(echo $pids | tr -d ' ')" ]; then

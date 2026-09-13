@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# momijctl — manage the momij OpenAI-compatible server as a local daemon.
+#
+# Used by the DSH wiring (provider baseURL http://127.0.0.1:8755/v1).
+# Run state lives under /tmp/momij-run; traces default to the repo's
+# .momij-traces (gitignored) so tool sessions can read them.
+#
+# Usage:
+#   momijctl start|stop|restart|status|health
+#   momijctl ask "prompt" [max_tokens]
+#   momijctl logs [n] | traces [n]
+set -euo pipefail
+
+PORT="${MOMIJ_PORT:-8755}"
+MODEL_DIR="${MOMIJ_MODEL_DIR:-$HOME/models/deepgrove/maple-preview-2bit-mlx}"
+BIN="${MOMIJ_BIN:-$HOME/repos/momij/swift/.build/arm64-apple-macosx/release/momij}"
+TRACE_DIR="${MOMIJ_TRACE_DIR:-$HOME/repos/momij/.momij-traces}"
+RUN_DIR="${MOMIJ_RUN_DIR:-/tmp/momij-run}"
+PIDFILE="$RUN_DIR/momij-$PORT.pid"
+LOGFILE="$RUN_DIR/momij-$PORT.log"
+BASE="http://127.0.0.1:$PORT"
+
+mkdir -p "$RUN_DIR" "$TRACE_DIR"
+
+pid() { [ -f "$PIDFILE" ] && cat "$PIDFILE" 2>/dev/null || true; }
+alive() { p="$(pid)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+healthy() { curl -s -m 2 "$BASE/healthz" 2>/dev/null | grep -q ok; }
+
+cmd="${1:-status}"
+case "$cmd" in
+  start)
+    if alive && healthy; then echo "momij already running (pid $(pid))"; exit 0; fi
+    alive && { echo "stale process (pid $(pid)) — stopping first"; "$0" stop; }
+    if [ ! -x "$BIN" ]; then echo "binary not found: $BIN (run swift build -c release)" >&2; exit 1; fi
+    ( cd /tmp && MOMIJ_TRACE_DIR="$TRACE_DIR" nohup "$BIN" serve \
+        --model "$MODEL_DIR" --port "$PORT" --model-id maple-preview \
+        >>"$LOGFILE" 2>&1 & echo $! >"$PIDFILE" )
+    echo "starting pid $(pid) on $BASE (model load ~30s)..."
+    for i in $(seq 1 60); do
+      if healthy; then echo "up: $BASE"; exit 0; fi
+      sleep 1
+    done
+    echo "failed to become healthy; see $LOGFILE" >&2
+    exit 1
+    ;;
+  stop)
+    if alive; then
+      kill "$(pid)" 2>/dev/null || true
+      for i in $(seq 1 10); do alive || break; sleep 1; done
+      alive && kill -9 "$(pid)" 2>/dev/null || true
+      echo "stopped (pid $(pid))"; rm -f "$PIDFILE"
+    else
+      echo "not running"; rm -f "$PIDFILE"
+    fi
+    ;;
+  restart) "$0" stop; "$0" start ;;
+  status)
+    if alive; then
+      echo "running: pid $(pid), $BASE, $(healthy && echo healthy || echo NOT-RESPONDING)"
+    else
+      echo "stopped"; exit 1
+    fi
+    ;;
+  health) healthy && echo ok || echo down ;;
+  ask)
+    shift
+    prompt="${1:?usage: momijctl ask \"prompt\" [max_tokens]}"
+    max="${2:-64}"
+    python3 - "$BASE" "$prompt" "$max" <<'PYEOF'
+import json, sys, urllib.request
+base, prompt, mx = sys.argv[1], sys.argv[2], sys.argv[3]
+p = {"model": "maple-preview", "max_tokens": int(mx),
+     "messages": [{"role": "user", "content": prompt}]}
+r = json.load(urllib.request.urlopen(urllib.request.Request(base + "/v1/chat/completions",
+    data=json.dumps(p).encode(), headers={"Content-Type": "application/json"}), timeout=300))
+c = r["choices"][0]
+u = r.get("usage") or {}
+print(c["message"]["content"])
+print(f"--- finish={c['finish_reason']} completion={u.get('completion_tokens')}tok", file=sys.stderr)
+PYEOF
+    ;;
+  logs) tail -n "${2:-20}" "$LOGFILE" ;;
+  traces)
+    ls -t "$TRACE_DIR"/tr-*.json 2>/dev/null | head -n "${2:-10}" | while read -r f; do
+      python3 -c "
+import json, sys
+d = json.load(open('$f'))
+v = [e for e in d['events'] if e['stage'] == 'verify']
+hits = (v[0]['detail'].get('hits') or []) if v else []
+print(d['trace_id'][:14], 'ok' if d['ok'] else 'FAIL', [h['kind'] for h in hits])
+"
+    done
+    ;;
+  *) echo "usage: momijctl start|stop|restart|status|health|ask|logs|traces" >&2; exit 1 ;;
+esac

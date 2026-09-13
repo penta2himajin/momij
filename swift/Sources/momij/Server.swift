@@ -224,6 +224,17 @@ enum MomijHTTP {
                 }
                 effective.messages = msgs
             }
+            // Tool-call loop breaker: a trailing run of identical calls
+            // (escape-escalation variants normalize equal) gets a steering
+            // message so the retry loop ends this turn. Per-request only —
+            // the harness's own history is untouched.
+            if let loop = LoopBreaker.detect(in: effective.messages) {
+                effective.messages.append(OpenAIChatCompat.ChatMessage(
+                    role: "user", content: LoopBreaker.breakNudge(
+                        tool: loop.tool, count: loop.count)))
+                trace.event("loop_break", "ok", detail: [
+                    "tool": loop.tool, "count": loop.count])
+            }
             let promptIds: [Int]
             do {
                 promptIds = try engine.tokenizer.applyChatTemplate(effective.messages)

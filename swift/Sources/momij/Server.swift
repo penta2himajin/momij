@@ -167,9 +167,22 @@ enum MomijHTTP {
                     message: "structured output setup failed: \(error)")
             }
 
+            // Native Maple tools contract: rewrite tool history into markup
+            // form and append the tools instruction (compositor parity).
+            var effective = chatReq
+            if !chatReq.toolsLines.isEmpty {
+                var msgs = ToolMarkup.rewriteMessages(chatReq.messages)
+                let suffix = ToolMarkup.systemSuffix(toolLines: chatReq.toolsLines)
+                if let idx = msgs.firstIndex(where: { $0.role == "system" }) {
+                    msgs[idx].content = msgs[idx].content + "\n\n" + suffix
+                } else {
+                    msgs.insert(OpenAIChatCompat.ChatMessage(role: "system", content: suffix), at: 0)
+                }
+                effective.messages = msgs
+            }
             let promptIds: [Int]
             do {
-                promptIds = try engine.tokenizer.applyChatTemplate(chatReq.messages)
+                promptIds = try engine.tokenizer.applyChatTemplate(effective.messages)
             } catch {
                 return jsonError(status: .internalServerError, message: "\(error)")
             }
@@ -215,13 +228,16 @@ enum MomijHTTP {
             } catch {
                 return jsonError(status: .internalServerError, message: "decode failed: \(error)")
             }
+            let parsed = ToolMarkup.parsePseudoToolCalls(text)
+            let respFinish = parsed.calls.isEmpty ? finish : "tool_calls"
             do {
                 let data = try OpenAIChatCompat.nonStreamJSON(
                     modelID: engine.modelID,
-                    content: text,
-                    finishReason: finish,
+                    content: parsed.cleanedContent,
+                    finishReason: respFinish,
                     promptTokens: promptIds.count,
-                    completionTokens: tokens.count)
+                    completionTokens: tokens.count,
+                    toolCalls: parsed.calls)
                 return Response(
                     status: .ok,
                     headers: [.contentType: "application/json"],

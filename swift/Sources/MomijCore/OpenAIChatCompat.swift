@@ -6,16 +6,35 @@ public enum OpenAIChatCompat {
     public struct ChatMessage: Equatable, Sendable {
         public var role: String
         public var content: String
+        /// assistant messages: parsed `tool_calls` entries (OpenAI contract).
+        public var toolCalls: [ToolCallSpec]
 
-        public init(role: String, content: String) {
+        public init(role: String, content: String, toolCalls: [ToolCallSpec] = []) {
             self.role = role
             self.content = content
+            self.toolCalls = toolCalls
+        }
+    }
+
+    /// One entry of an assistant `tool_calls` array (OpenAI contract).
+    public struct ToolCallSpec: Equatable, Sendable {
+        public var id: String
+        public var name: String
+        /// The arguments as a JSON object string (as the harness sent it).
+        public var arguments: String
+
+        public init(id: String, name: String, arguments: String) {
+            self.id = id
+            self.name = name
+            self.arguments = arguments
         }
     }
 
     public struct ChatCompletionRequest: Equatable, Sendable {
         public var model: String?
         public var messages: [ChatMessage]
+        /// OpenAI `tools` entries, serialized as one JSON line per tool.
+        public var toolsLines: [String]
         public var maxTokens: Int
         public var temperature: Double
         public var topP: Double
@@ -31,6 +50,7 @@ public enum OpenAIChatCompat {
         public init(
             model: String? = nil,
             messages: [ChatMessage],
+            toolsLines: [String] = [],
             maxTokens: Int = 256,
             temperature: Double = 0,
             topP: Double = 1,
@@ -44,6 +64,7 @@ public enum OpenAIChatCompat {
         ) {
             self.model = model
             self.messages = messages
+            self.toolsLines = toolsLines
             self.maxTokens = maxTokens
             self.temperature = temperature
             self.topP = topP
@@ -96,7 +117,23 @@ public enum OpenAIChatCompat {
             }
             if role == "developer" { role = "system" }
             let content = normalizeContent(m["content"])
-            messages.append(ChatMessage(role: role, content: content))
+            var calls: [ToolCallSpec] = []
+            if let rawCalls = m["tool_calls"] as? [Any] {
+                for c in rawCalls {
+                    guard let cd = c as? [String: Any] else { continue }
+                    let cid = cd["id"] as? String ?? ""
+                    let fn = cd["function"] as? [String: Any]
+                    let name = fn?["name"] as? String ?? ""
+                    var args = ""
+                    if let a = fn?["arguments"] as? String {
+                        args = a
+                    } else if let a = fn?["arguments"] {
+                        args = compactJSON(a)
+                    }
+                    calls.append(ToolCallSpec(id: cid, name: name, arguments: args))
+                }
+            }
+            messages.append(ChatMessage(role: role, content: content, toolCalls: calls))
         }
 
         let maxTok: Int = {
@@ -105,9 +142,14 @@ public enum OpenAIChatCompat {
             return 256
         }()
 
+        var toolLines: [String] = []
+        if let rawTools = root["tools"] as? [Any] {
+            for t in rawTools { toolLines.append(compactJSON(t)) }
+        }
         return ChatCompletionRequest(
             model: root["model"] as? String,
             messages: messages,
+            toolsLines: toolLines,
             maxTokens: maxTok,
             temperature: doubleValue(root["temperature"]) ?? 0,
             topP: doubleValue(root["top_p"]) ?? 1,
@@ -177,9 +219,26 @@ public enum OpenAIChatCompat {
         finishReason: String,
         promptTokens: Int,
         completionTokens: Int,
+        toolCalls: [ToolCallSpec] = [],
         id: String = "chatcmpl-momij",
         created: Int = Int(Date().timeIntervalSince1970)
     ) throws -> Data {
+        var message: [String: Any] = [
+            "role": "assistant",
+            "content": (toolCalls.isEmpty || content.isEmpty == false) ? content : NSNull(),
+        ]
+        if !toolCalls.isEmpty {
+            message["tool_calls"] = toolCalls.map { call in
+                [
+                    "id": call.id,
+                    "type": "function",
+                    "function": [
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    ],
+                ]
+            }
+        }
         let payload: [String: Any] = [
             "id": id,
             "object": "chat.completion",
@@ -187,10 +246,7 @@ public enum OpenAIChatCompat {
             "model": modelID,
             "choices": [[
                 "index": 0,
-                "message": [
-                    "role": "assistant",
-                    "content": content,
-                ],
+                "message": message,
                 "finish_reason": finishReason,
             ]],
             "usage": [
@@ -200,6 +256,11 @@ public enum OpenAIChatCompat {
             ],
         ]
         return try JSONSerialization.data(withJSONObject: payload)
+    }
+
+    static func compactJSON(_ value: Any) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: []) else { return "" }
+        return String(data: data, encoding: .utf8) ?? ""
     }
 
     // MARK: - JSON helpers

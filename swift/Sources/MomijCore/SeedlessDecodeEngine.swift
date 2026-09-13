@@ -1398,8 +1398,11 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
             let meanAccept = acceptWindow.isEmpty ? 1.0
                 : Double(acceptWindow.reduce(0, +)) / Double(acceptWindow.count)
             // Cold / low-accept → shorter drafts via accept window; tree also caps via α·p.
+            let draftKEnv = ProcessInfo.processInfo.environment["MOMIJ_DRAFT_K"]
+                .flatMap(Int.init)
             let effK = SuffixSpec.adaptiveDraftK(
-                meanAccept: meanAccept, draftK: min(draftK, remain, specMaxM - 1))
+                meanAccept: meanAccept,
+                draftK: min(draftKEnv ?? draftK, remain, specMaxM - 1))
             localIndex.clear()
             localIndex.insert(ids)
             let treeHit = useTree

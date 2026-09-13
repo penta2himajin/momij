@@ -224,13 +224,25 @@ enum MomijHTTP {
                     "tool": loop.tool, "count": loop.count])
             }
             var effective = chatReq
+            let workspaceRoot = PathPolicy.workspaceRoot()
             if !chatReq.toolsLines.isEmpty {
                 var msgs = ToolMarkup.rewriteMessages(chatReq.messages)
-                let suffix = ToolMarkup.systemSuffix(toolLines: chatReq.toolsLines)
+                var suffix = ToolMarkup.systemSuffix(toolLines: chatReq.toolsLines)
+                if workspaceRoot != nil {
+                    suffix += "\n" + PathPolicy.suffixLine()
+                }
                 if let idx = msgs.firstIndex(where: { $0.role == "system" }) {
                     msgs[idx].content = msgs[idx].content + "\n\n" + suffix
                 } else {
                     msgs.insert(OpenAIChatCompat.ChatMessage(role: "system", content: suffix), at: 0)
+                }
+                // Workspace mode: strip the root prefix from everything the
+                // model sees (tool results, history) so its world stays
+                // relative and short.
+                if let root = workspaceRoot {
+                    for i in msgs.indices {
+                        msgs[i].content = PathPolicy.stripRootPrefix(in: msgs[i].content, root: root)
+                    }
                 }
                 effective.messages = msgs
             }
@@ -455,6 +467,13 @@ enum MomijHTTP {
                     respContent = ResponseVerify.truncateBeforeRepetition(respContent)
                 }
             }
+            if let root = workspaceRoot {
+                let (resolved, n) = MomijHTTP.resolveWorkspacePaths(respToolCalls, root: root)
+                if n > 0 {
+                    respToolCalls = resolved
+                    trace.event("path_resolve", "ok", detail: ["resolved": n])
+                }
+            }
             trace.event("verify", verifyOutcome.hits.isEmpty ? "ok" : "hit", detail: [
                 "hits": verifyOutcome.hits.map { $0.eventDetail() },
                 "sanitized": sanitizeEnabled && verifyOutcome.first != nil,
@@ -492,6 +511,37 @@ enum MomijHTTP {
             }
         }
         return router
+    }
+
+    /// Workspace mode: resolve relative path fields in the outgoing calls
+    /// against the workspace root (the model writes relative, the harness
+    /// executes absolute). Returns the rewritten calls and the change count.
+    static func resolveWorkspacePaths(
+        _ calls: [OpenAIChatCompat.ToolCallSpec], root: String
+    ) -> ([OpenAIChatCompat.ToolCallSpec], Int) {
+        var out: [OpenAIChatCompat.ToolCallSpec] = []
+        var count = 0
+        for call in calls {
+            let args = ArgRepair.parseArgs(call.arguments)
+            var changed = false
+            var outArgs = args
+            for field in PathPolicy.pathFields {
+                guard let v = args[field] as? String, !v.isEmpty else { continue }
+                let resolved = PathPolicy.resolve(v, in: root)
+                if resolved != v {
+                    outArgs[field] = resolved
+                    changed = true
+                }
+            }
+            if changed {
+                out.append(OpenAIChatCompat.ToolCallSpec(
+                    id: call.id, name: call.name, arguments: ArgRepair.argsJSONString(outArgs)))
+                count += 1
+            } else {
+                out.append(call)
+            }
+        }
+        return (out, count)
     }
 
     /// Per-request structured trace (lightweight compositor parity).
@@ -590,10 +640,14 @@ enum MomijHTTP {
                 (try? guide.allowedNext(prefix: prefix)) ?? [eos]
             }
         }
-        let prompt = ArgRepair.fieldRepairPrompt(
+        var prompt = ArgRepair.fieldRepairPrompt(
             task: task, tool: tool,
             argsJSON: ArgRepair.argsJSONString(args),
             fields: fields, reasons: reasons)
+        if let root = PathPolicy.workspaceRoot() {
+            prompt += "\n\n" + PathPolicy.suffixLine()
+                + " The workspace root is fixed; reply with paths RELATIVE to it."
+        }
         let promptIds = try engine.tokenizer.applyChatTemplate([
             OpenAIChatCompat.ChatMessage(role: "user", content: prompt)])
         let genOpts = opts
@@ -775,10 +829,6 @@ enum MomijHTTP {
                                 trace.event("repair", "error", detail: ["error": "\(error)"])
                             }
                         }
-                        streamToolCalls = parsed.calls.count
-                        streamToolArgs = parsed.calls.map { call in
-                            ["name": call.name, "arguments": String(call.arguments.prefix(300))]
-                        }
                         respContentHead = parsed.cleanedContent
                         let verifyOutcome = ResponseVerify.verify(.init(
                             content: text, reasoningContent: ResponseVerify.thinkInterior(of: raw),
@@ -830,6 +880,19 @@ enum MomijHTTP {
                         }
                         if !parsed.calls.isEmpty {
                             finish = "tool_calls"
+                            if let root = PathPolicy.workspaceRoot() {
+                                let (resolved, n) = MomijHTTP.resolveWorkspacePaths(
+                                    parsed.calls, root: root)
+                                if n > 0 {
+                                    parsed = ToolMarkup.ParsedToolCalls(
+                                        cleanedContent: parsed.cleanedContent, calls: resolved)
+                                    trace.event("path_resolve", "ok", detail: ["resolved": n])
+                                }
+                            }
+                            streamToolCalls = parsed.calls.count
+                            streamToolArgs = parsed.calls.map { call in
+                                ["name": call.name, "arguments": String(call.arguments.prefix(300))]
+                            }
                             let callsDelta: [String: Any] = [
                                 "id": "chatcmpl-momij",
                                 "object": "chat.completion.chunk",

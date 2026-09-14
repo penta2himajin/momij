@@ -1,8 +1,9 @@
 # Handoff: path-repair wiring (2026-09-14)
 
-Continues from `96b169c` on `main`. Items 1–2 of the original plan are DONE
-(`4b67fbf`), the engine long-context blocker found during live verification is
-FIXED (`38c9811`). The next session picks up from "What's left" below.
+All three workstream items are DONE and LIVE-VERIFIED on `main`:
+extraction-first path repair (`4b67fbf`, `921c4ca`, `f0df043`), protocol-tool
+absorb (`4b67fbf`), and the seedless long-context capacity fix (`38c9811`).
+The next session picks up from "What's left" below.
 
 ## Context (why this exists)
 
@@ -16,17 +17,33 @@ programmatically.
 
 ## What's done and committed (all on main, tests green)
 
-- **Item 1 — pathFromTask wiring** (`4b67fbf`): path-kind pending fixes
-  (`path_outside_workspace`, aliased path fields, missing required path) are
-  answered by `ArgRepair.taskPathMerge` (extraction from the task text)
-  BEFORE any model re-ask; adoption gated by the shared `MomijHTTP.callsClean`;
-  traced as `repair mode=field source=task`. Both paths. LIVE-FIRED 3× in the
-  probe run.
+- **Item 1 — extraction-first path repair** (`4b67fbf`, `921c4ca`, `f0df043`):
+  path-kind pending fixes (`path_outside_workspace`, aliased path fields,
+  missing required path) are answered by `ArgRepair.taskPathMerge` before any
+  model re-ask; adoption gated by `MomijHTTP.callsClean`; traced as
+  `repair mode=field source=task` with `task_head`. Both paths.
+  LIVE-VERIFIED: probe 9 repaired a hallucinated absolute path into
+  `/tmp/momij-probe/ws/scratch/momij-subagent-test/count_verify_fires.py`
+  (the task-named path), `path_resolve resolved=1`, and the harness wrote the
+  artifact there.
 - **Item 2 — ProtocolAbsorb** (`4b67fbf`): `MOMIJ_PROTOCOL_TOOLS` (default
-  `submit,ask_user_question`); a parsed call targeting one of them drops ALL
-  calls, finish=stop, description-or-placeholder as content; traced
-  `protocol_absorb`. Both paths. (Not yet observed firing live — the probe
-  run died before the model's ending fumble.)
+  `submit,ask_user_question`); a parsed call targeting one drops ALL calls,
+  finish=stop, description-or-placeholder as content; traced `protocol_absorb`.
+  LIVE-VERIFIED (probe 9): the model's ending
+  `<tool_call>{"name": "submit", "arguments": {}}` was absorbed into a clean
+  stop; the child's final answer became the placeholder "Task complete."
+- **Item 3 — task-extraction input correctness** (`921c4ca`, `f0df043`): DSH
+  sends harness scaffolding as SEPARATE user turns, each longer than the task,
+  so the old "longest early" heuristic selected them. Three shapes measured
+  live: `<system-reminder>` (adopted `.github/PULL_REQUEST_TEMPLATE.md`),
+  `<tool_result>` (role "tool" folded to user by `rewriteMessages`), and
+  `Current runtime context.` (DSH runtime/policy preamble → no path at all).
+  Extraction now skips those (`ArgRepair.nonTaskTurnPrefixes`) and reads the
+  ORIGINAL conversation (role "tool" intact) rather than the rewritten history.
+  Silent field-repair failures are now traced
+  (`no_task_path` / `unclean_after_task_merge` / `unclean_after_model_merge` /
+  `model_reply_unparsable`), the parse event records the original role layout,
+  and path-fix skips record candidate `user_heads`.
 - **Engine long-context fix** (`38c9811`): `MOMIJ_FULL_MAX_LEN` sizes the
   full-attn KV cache for the serve command; Server pre-flight rejects
   oversized prompts with an OpenAI-style 400; `maxPromptTokens` is a protocol
@@ -38,56 +55,52 @@ programmatically.
   instant 400. Measured RSS: 2.99 GiB @16k → 3.25 GiB @32k.
 - **testPathFromTask was a free function outside the class** in the WIP
   commit — XCTest never ran it; now in-class and executing.
-- Everything from the previous handoff (PathPolicy, 3-stage repair,
-  LoopBreaker, terminator recovery, lenient JSON, trace diagnostics,
-  workspace wiring) — all still in place, suite 201/201.
 
 ## What's left (the next session's job)
 
-1. **Live confirmation that extraction now reads the task text** (`921c4ca`
-   fixed both root causes with unit tests; the live firing is still
-   unconfirmed because Maple went flaky in probes 4–5 — it ended the turn
-   with plain-text plans instead of tool calls, twice in a row, on the exact
-   task that produced tool calls in probes 2–3; greedy output flips between
-   act/plan across runs — likely prefill-chunk-boundary numeric divergence,
-   unmeasured). When a run emits a path call again, check the
-   `source=task` repair event: `task_head` should now start with the task
-   text (not `<system-reminder>`) and the adopted path should be the
-   task-named relative path.
-2. **protocol_absorb live confirmation**: needs a run where Maple emits its
-   ending fumble; watch `.momij-traces` for `protocol_absorb`.
+1. **Model behaviour, not plumbing** (measured, not fixable by repair):
+   Maple's act/plan output flips with small prompt changes. It prose-ends some
+   runs (plan text + an unterminated tool call), and its bash calls use
+   absolute repo paths / the repo as workdir (`cd /Users/.../repos/momij &&
+   python3 scratch/...`). `protocol_absorb` now ends those turns cleanly, but
+   the task itself may not be completed. If probe work continues, pin the
+   workflow meta name AND task text (they are part of the delivered prompt)
+   and expect this variance.
+2. **bash escapes the workspace confinement** (measured live): `MOMIJ_WORKSPACE`
+   rewrites path FIELDS (`path`/`file_path`) only; a `bash` command string with
+   `mkdir -p scratch/...` executes in the harness workspace and created
+   `scratch/` inside the repo (removed). Path-field writes stayed confined.
+   Options if stricter isolation is needed: withhold bash from the probe, or
+   run the probe under a session whose workspace IS the probe dir.
 3. Optional (deferred): Needle 2 sidecar; momijctl docs note.
 
-## Live verification setup (UPDATED)
-
-The probe subagent must be CONFINED — Maple gravitates to writing
-`.github/PULL_REQUEST_TEMPLATE.md`-style paths and the first unconfined run
-wrote debris into the repo (`github/`, since removed):
+## Live verification setup (UPDATED, confinement-hardened)
 
 ```bash
 mkdir -p /tmp/momij-probe/ws
-ln -sfn ~/repos/momij/.momij-traces /tmp/momij-probe/ws/.momij-traces
+mkdir -p /tmp/momij-probe/ws/.momij-traces
+cp ~/repos/momij/.momij-traces/tr-*.json /tmp/momij-probe/ws/.momij-traces/
 MOMIJ_WORKSPACE=/tmp/momij-probe/ws MOMIJ_FULL_MAX_LEN=32768 \
   ./bin/momijctl restart
 # one-shot subagent via DSH workflow: provider=momij model=maple-preview,
-# task with RELATIVE paths only; audit via .momij-traces tool_args +
-# git status before/after.
+# task with RELATIVE paths only.
+# Audit: .momij-traces (repair/path_resolve/protocol_absorb + parse roles +
+# task_head/user_heads), git status, and the probe ws contents.
 ```
 
-The daemon serves on 8755; DSH provider `momij` is wired in
-`~/.dsh/settings.yaml` (contextWindow advertised 128000 — KV capacity is
-now sized by MOMIJ_FULL_MAX_LEN instead of a hard 16384).
+Use REAL trace COPIES, not a symlink: a symlinked `.momij-traces` let a model
+write land back inside the repo (observed).
 
 ## Known model-quality limits (not fixable by more plumbing)
 
-- Path CONTENT hallucination (`.github/PULL_REQUEST_TEMPLATE.md` picked from
-  in-context AGENTS.md text instead of the task's path) — FIXED in
-  `921c4ca` (reminder-skip + dot preservation); live firing pending.
-- **Act/plan flakiness**: identical task text produced tool-call runs
-  (probes 2–3) then plain-text plan endings (probes 4–5) — greedy output is
-  not stable across runs (candidate cause: M-row prefill chunk boundaries
-  shift numerics; NOT measured — parity probe would settle it).
-- Ending protocol: Maple tries submit/ask_user_question with wrong args
-  after long tool-call runs — the interception (item 2) absorbs it.
+- Path CONTENT hallucination is repaired from the task text (item 1/3), but
+  the model's own choice of path/command remains unreliable.
+- Act/plan flakiness: measured deterministic at the engine level — three
+  identical short requests produced byte-identical content/usage, and an
+  identical task+meta reproduced the acting behaviour. The flip therefore
+  comes from prompt content differing between runs (workflow meta name, task
+  escaping, DSH-injected context), not from momij nondeterminism. An earlier
+  "M-row prefill boundary" hypothesis was retracted after this measurement.
+- Ending protocol: submit/ask_user_question after long runs — absorbed.
 - rope_theta=10000 with no scaling (config.json): serving past ~32k is
   untested for quality; capacity and correctness are separate questions.

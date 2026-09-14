@@ -239,7 +239,12 @@ struct MomijMain {
         case "oracle":
             backend = try OracleBackend(modelDir: model, flashHead: has(args, "--flash-head"))
         default:
-            backend = try SeedlessBackend(modelDir: model)
+            // MOMIJ_FULL_MAX_LEN sizes the full-attn KV cache. DSH subagent
+            // conversations cross the 16384 default; size it per deployment.
+            backend = try SeedlessBackend(
+                modelDir: model,
+                fullMaxLen: SeedlessServeDefaults.fullMaxLenFromEnv(
+                    ProcessInfo.processInfo.environment["MOMIJ_FULL_MAX_LEN"]))
         }
         let engine = MomijHTTP.MomijEngine(
             tokenizer: tokenizer, backend: backend, modelID: modelID, modelDir: model)

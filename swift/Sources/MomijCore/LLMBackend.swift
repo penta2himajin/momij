@@ -113,10 +113,36 @@ public enum SeedlessServeDefaults {
     public static var exactHeadFromEnv: Bool {
         ProcessInfo.processInfo.environment["MOMIJ_EXACT_HEAD"] != "0"
     }
+
+    /// Seedless serve KV capacity for the full-attention layers
+    /// (`MOMIJ_FULL_MAX_LEN`). DSH subagent conversations carry injected
+    /// context and tool results and cross the previous hard default of
+    /// 16384 tokens, which failed the request mid-run with
+    /// `unsupported shape N=<prompt> K=16384 gs=0`. Unset / unparsable /
+    /// non-positive values fall back to the default (a zero or negative
+    /// capacity would fail every request, so it never takes effect).
+    public static func fullMaxLenFromEnv(_ raw: String?) -> Int {
+        guard let raw, let v = Int(raw.trimmingCharacters(in: .whitespaces)), v > 0 else {
+            return 16_384
+        }
+        return v
+    }
 }
 
 public protocol LLMBackend: AnyObject {
     func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncThrowingStream<Int, Error>
+
+    /// Serve-side prompt capacity for pre-flight rejection (OpenAI-style
+    /// 400 instead of a mid-stream abort). nil = the backend has no known
+    /// hard prompt limit. DECLARED IN THE PROTOCOL so the server's
+    /// `any LLMBackend` existential dispatches to the conformer — a
+    /// protocol-extension-only declaration would statically return the
+    /// default for every type (the live 91k-token hang).
+    var maxPromptTokens: Int? { get }
+}
+
+extension LLMBackend {
+    public var maxPromptTokens: Int? { nil }
 }
 
 /// Production Seedless Metal backend. Greedy / SuffixSpec verify default to the
@@ -134,6 +160,10 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         self.engine = try SeedlessDecodeEngine(store: store, fullMaxLen: fullMaxLen)
         self.speculativeSample = SeedlessServeDefaults.speculativeSampleFromEnv
     }
+
+    /// Prompt capacity for the serve pre-flight (mirrors the generate guard:
+    /// full-attn KV cache holds prompt+generation up to fullMaxLen).
+    public var maxPromptTokens: Int? { engine.fullMaxLen }
 
     public init(engine: SeedlessDecodeEngine, speculativeSample: Bool = true) {
         self.engine = engine

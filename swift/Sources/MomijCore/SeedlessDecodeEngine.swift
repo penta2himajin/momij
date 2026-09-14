@@ -841,6 +841,16 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
     }
 
     /// Non-speculative sampled decode. Penalties use prompt + generated history.
+    /// Full-attn layers need prompt+generation ≤ fullMaxLen. Every public
+    /// generate entry point checks BEFORE any Metal encode — an unchecked
+    /// prefill would write KV past the full-layer cache max (OOM-buffer
+    /// overrun) and, on the serve path, hang the request for minutes.
+    private func checkPromptCapacity(_ prompt: [Int]) throws {
+        if prompt.count >= fullMaxLen {
+            throw SeedlessError.unsupportedShape(N: prompt.count, K: fullMaxLen, gs: 0)
+        }
+    }
+
     public func generateSampled(
         prompt: [Int], maxTokens: Int,
         processor: LogitsProcessor,
@@ -848,6 +858,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         seed: UInt64? = nil
     ) throws -> [Int] {
         guard !prompt.isEmpty, maxTokens > 0 else { return [] }
+        try checkPromptCapacity(prompt)
         reset()
         var rng = SplitMix64(seed: seed ?? UInt64.random(in: 1 ... .max))
         var seen = Set(prompt)
@@ -890,6 +901,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         seed: UInt64? = nil
     ) throws -> [Int] {
         guard !prompt.isEmpty, maxTokens > 0 else { return [] }
+        try checkPromptCapacity(prompt)
         reset()
         var rng = SplitMix64(seed: seed ?? UInt64.random(in: 1 ... .max))
         var seen = Set(prompt)
@@ -1147,10 +1159,9 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         syncMetalHeadBanned()
         defer { decodeBanned = []; metalHeadPending = false }
         guard !prompt.isEmpty, maxTokens > 0 else { return [] }
-        // Full-attn layers need prompt+gen ≤ fullMaxLen. Fail cleanly before Metal encode.
-        if prompt.count >= fullMaxLen {
-            throw SeedlessError.unsupportedShape(N: prompt.count, K: fullMaxLen, gs: 0)
-        }
+        // Full-attn layers need prompt+gen ≤ fullMaxLen. Fail cleanly before
+        // Metal encode.
+        try checkPromptCapacity(prompt)
         let capped = min(maxTokens, fullMaxLen - prompt.count)
         guard capped > 0 else { return [] }
         reset()
@@ -1218,6 +1229,7 @@ public final class SeedlessDecodeEngine: @unchecked Sendable {
         syncMetalHeadBanned()
         defer { decodeBanned = []; metalHeadPending = false }
         guard !prompt.isEmpty, maxTokens > 0 else { return ([], 0, 0, 0) }
+        try checkPromptCapacity(prompt)
         reset()
         try prefillPrompt(prompt, skipFlash: greedySkipFlash)
         let y = pickGreedyFromFinalNorm(skipFlash: greedySkipFlash)

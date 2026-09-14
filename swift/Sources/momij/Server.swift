@@ -272,6 +272,18 @@ enum MomijHTTP {
                 allowedNext: allowedNext,
                 bannedTokenIds: ChatTemplatePatch.bannedAssistantTokenIds
             )
+            // Pre-flight prompt-capacity check: the seedless decode engine
+            // holds full-attn KV for prompt+generation up to fullMaxLen, and
+            // its generate() fails mid-run otherwise. Reject cleanly BEFORE
+            // any generation (an OpenAI-style 400 the harness can see)
+            // instead of an aborted stream.
+            if let cap = engine.backend.maxPromptTokens, promptIds.count >= cap {
+                return fail(
+                    .badRequest,
+                    "prompt too long: \(promptIds.count) tokens exceeds the "
+                        + "seedless decode capacity \(cap) (MOMIJ_FULL_MAX_LEN)",
+                    trace: trace)
+            }
             if chatReq.stream {
                 trace.event("route", "ok", detail: ["mode": "stream"])
                 return try await streamSSE(

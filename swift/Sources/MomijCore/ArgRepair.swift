@@ -115,9 +115,10 @@ public enum ArgRepair {
     // MARK: - Prompt
 
     /// English-only (Maple). Asks for exactly the broken fields as a JSON
-    /// object; everything else in the call is preserved by the caller.
+    /// object; everything else in the call is preserved.
     public static func fieldRepairPrompt(
-        task: String, tool: String, argsJSON: String, fields: [String], reasons: [String: String]
+        task: String, tool: String, argsJSON: String,
+        fields: [String], reasons: [String: String]
     ) -> String {
         let problemLines = fields.map { f in
             "- \(f): \(reasons[f] ?? "unusable")"
@@ -162,16 +163,15 @@ public enum ArgRepair {
     /// Parse `function.arguments` (JSON object string) leniently; falls
     /// back to an empty dict like evprtr `_fn_args`.
     public static func parseArgs(_ arguments: String) -> [String: Any] {
-        guard !arguments.isEmpty,
-              let obj = (try? JSONSerialization.jsonObject(
-                  with: Data(arguments.utf8), options: [.fragmentsAllowed])) as? [String: Any]
-        else { return [:] }
+        guard let obj = ToolMarkup.jsonParseValue(arguments) as? [String: Any] else {
+            return [:]
+        }
         return obj
     }
 
     /// Extract the first JSON object from a model reply (the constrained
     /// generation should be pure JSON; tolerate stray prose/markdown and
-    /// literal newlines inside strings — same lenient path as ToolMarkup).
+    /// literal newlines inside strings).
     public static func firstJSONObject(in text: String) -> [String: Any]? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if let obj = ToolMarkup.jsonParseValue(trimmed) as? [String: Any] {
@@ -183,4 +183,43 @@ public enum ArgRepair {
         let slice = String(trimmed[start ... end])
         return ToolMarkup.jsonParseValue(slice) as? [String: Any]
     }
+
+    /// Extract the most likely target path from a task text (deterministic —
+    /// the task names the exact relative path; the model only needs to copy
+    /// it, but live sessions showed it corrupting instead). Codeish suffixes
+    /// define candidate tokens; the longest slash-joined candidate wins.
+    /// Returns nil when the task names no path (the caller falls back to the
+    /// model re-ask).
+    public static func pathFromTask(_ task: String) -> String? {
+        let wordChars = CharacterSet(
+            charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-")
+        var tokens: [String] = []
+        var current = ""
+        for ch in task {
+            let scalars = Array(ch.unicodeScalars)
+            let isWord = scalars.allSatisfy { wordChars.contains($0) }
+            if isWord {
+                current.append(ch)
+            } else if !current.isEmpty {
+                tokens.append(current)
+                current = ""
+            }
+        }
+        if !current.isEmpty { tokens.append(current) }
+        var candidates: [String] = []
+        for tok in tokens {
+            let t = tok.trimmingCharacters(in: CharacterSet(charactersIn: "./"))
+            if t.isEmpty { continue }
+            if pathSuffixSet.contains(where: { t.lowercased().hasSuffix($0) }) {
+                candidates.append(t)
+            }
+        }
+        let slashed = candidates.filter { $0.contains("/") }
+        if let best = slashed.max(by: { $0.count < $1.count }) { return best }
+        return candidates.max(by: { $0.count < $1.count })
+    }
+
+    private static let pathSuffixSet: Set<String> = [
+        ".toml", ".rs", ".py", ".ts", ".js", ".json", ".md", ".txt", ".yml", ".yaml",
+    ]
 }

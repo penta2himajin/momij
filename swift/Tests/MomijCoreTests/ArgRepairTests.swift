@@ -145,3 +145,14 @@ final class ArgRepairTests: XCTestCase {
         XCTAssertNil(ArgRepair.firstJSONObject(in: "no object here"))
     }
 }
+    func testPathFromTask() {
+        XCTAssertEqual(
+            ArgRepair.pathFromTask(
+                "Write a Python 3 script at scratch/momij-subagent-test/count_verify_fires.py (this path is RELATIVE to the workspace root; always write paths in this relative form)."),
+            "scratch/momij-subagent-test/count_verify_fires.py")
+        XCTAssertEqual(
+            ArgRepair.pathFromTask(
+                "Create a new file named notes.md using the write tool. Put two short lines of text in it."),
+            "notes.md")
+        XCTAssertNil(ArgRepair.pathFromTask("Reply with exactly OK"))
+    }

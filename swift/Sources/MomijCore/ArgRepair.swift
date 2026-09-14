@@ -56,10 +56,10 @@ public enum ArgRepair {
 
     /// evprtr `original_user_text`: prefer the primary user task (the
     /// longest early user message), skipping tiny placeholder turns AND
-    /// harness-injected `<system-reminder>` instruction blocks (they are
-    /// longer than the task, so the length heuristic would otherwise select
-    /// them and path extraction would read repo paths quoted from the
-    /// injected context instead of the task — measured live).
+    /// harness-generated scaffolding turns. The latter are longer than the
+    /// task, so the length heuristic would otherwise select them and path
+    /// extraction would read paths quoted from injected context or tool
+    /// output instead of the task (both measured live).
     public static func originalUserText(_ messages: [OpenAIChatCompat.ChatMessage]) -> String {
         var candidates: [(idx: Int, len: Int, text: String)] = []
         for (idx, m) in messages.enumerated() where m.role == "user" {
@@ -67,7 +67,7 @@ public enum ArgRepair {
             if text.isEmpty { continue }
             let lowered = text.lowercased()
             if ["agent", "(no user text)", "no user text"].contains(lowered) { continue }
-            if isHarnessReminderBlock(text) { continue }
+            if isNonTaskUserTurn(text) { continue }
             candidates.append((idx, text.count, text))
         }
         if candidates.isEmpty { return "(no user text)" }
@@ -78,13 +78,23 @@ public enum ArgRepair {
         return pool.min { ($0.idx, -$0.len) < ($1.idx, -$1.len) }?.text ?? "(no user text)"
     }
 
-    /// A user turn that is actually a harness-injected instruction block
-    /// (DSH wraps workspace context in `<system-reminder>…</system-reminder>`).
-    /// Only the WRAPPER form (turn starts with the tag) is excluded; a task
-    /// message that merely quotes or follows a reminder stays a candidate.
-    public static func isHarnessReminderBlock(_ text: String) -> Bool {
-        text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<system-reminder>")
+    /// A user turn that is harness-generated scaffolding rather than task
+    /// text. Markers observed live in DSH subagent requests:
+    /// - `<system-reminder>`: DSH-injected workspace instructions.
+    /// - `<tool_result>`: tool output after `ToolMarkup.rewriteMessages`
+    ///   folds role "tool" into role "user" for the model-visible history.
+    /// - `Current runtime context`: the DSH runtime/policy preamble turn.
+    /// Only the WRAPPER form (turn starts with the marker) is excluded; a
+    /// task message that merely quotes one stays a candidate.
+    public static func isNonTaskUserTurn(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return nonTaskTurnPrefixes.contains { t.hasPrefix($0) }
     }
+
+    /// Prefix markers of harness scaffolding turns (see `isNonTaskUserTurn`).
+    public static let nonTaskTurnPrefixes = [
+        "<system-reminder>", "<tool_result>", "Current runtime context",
+    ]
 
     // MARK: - Schema for the constrained re-ask
 

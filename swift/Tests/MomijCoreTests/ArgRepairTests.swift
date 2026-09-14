@@ -59,6 +59,51 @@ final class ArgRepairTests: XCTestCase {
         XCTAssertEqual(ArgRepair.originalUserText(messages), task)
     }
 
+    func testOriginalUserTextSkipsToolResultTurns() {
+        // ToolMarkup.rewriteMessages turns role "tool" into role "user" with a
+        // <tool_result> wrapper. Those turns are long, so the "longest early"
+        // heuristic selected one as the task and extraction read a trace-file
+        // path out of it (measured live: task_head started with
+        // "<tool_result>\ntotal 2504\n...").
+        let toolResult = "<tool_result>\n"
+            + String(repeating: "drwxr-xr-x  315 staff  10080 Sep 14 14:05 .\n", count: 30)
+            + "</tool_result>"
+        let task = "Write a Python 3 script at scratch/momij-subagent-test/count_verify_fires.py."
+        let messages: [OpenAIChatCompat.ChatMessage] = [
+            .init(role: "user", content: task),
+            .init(role: "assistant", content: "listing the directory"),
+            .init(role: "user", content: toolResult),
+        ]
+        XCTAssertEqual(ArgRepair.originalUserText(messages), task)
+    }
+
+    func testOriginalUserTextSkipsRuntimeContextBlocks() {
+        // DSH subagent requests carry the runtime/policy preamble as its own
+        // user turn ("Current runtime context. This snapshot supersedes…"),
+        // longer than the task, so the length heuristic selected it and
+        // extraction returned no path (measured live: reason=no_task_path,
+        // task_head="Current runtime context. …").
+        let runtime = "Current runtime context. This snapshot supersedes earlier "
+            + "runtime-context snapshots.\n\nCurrent DSH file policy: workspace-write. "
+            + String(repeating: "Any available operation enforced by the DSH file sandbox. ", count: 15)
+        let task = "Write a Python 3 script at scratch/momij-subagent-test/count_verify_fires.py."
+        let messages: [OpenAIChatCompat.ChatMessage] = [
+            .init(role: "system", content: "sys"),
+            .init(role: "user", content: runtime),
+            .init(role: "user", content: task),
+        ]
+        XCTAssertEqual(ArgRepair.originalUserText(messages), task)
+    }
+
+    func testNonTaskUserTurnMarkers() {
+        // The scaffolding markers observed live; a task quoting one mid-text
+        // stays a candidate.
+        XCTAssertTrue(ArgRepair.isNonTaskUserTurn("<system-reminder>\nx"))
+        XCTAssertTrue(ArgRepair.isNonTaskUserTurn("<tool_result>\nx"))
+        XCTAssertTrue(ArgRepair.isNonTaskUserTurn("Current runtime context. This snapshot …"))
+        XCTAssertFalse(ArgRepair.isNonTaskUserTurn("Write a script per <system-reminder> notes"))
+    }
+
     // MARK: schema construction
 
     private let toolLines = [

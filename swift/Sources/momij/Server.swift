@@ -158,6 +158,10 @@ enum MomijHTTP {
                     "has_tools": !chatReq.toolsLines.isEmpty,
                     "stream": chatReq.stream,
                     "max_tokens": chatReq.maxTokens,
+                    // Original (pre-rewrite) role layout: task-extraction only
+                    // considers role "user", so the shape is what tells us
+                    // whether the task is even reachable there.
+                    "roles": chatReq.messages.map(\.role),
                 ])
             } catch let e as OpenAIChatCompat.ParseError {
                 return fail(.badRequest, e.description, trace: trace)
@@ -291,6 +295,7 @@ enum MomijHTTP {
                     toolsAttached: !chatReq.toolsLines.isEmpty,
                     toolsLines: chatReq.toolsLines,
                     effectiveMessages: effective.messages,
+                    originalMessages: chatReq.messages,
                     includeUsage: chatReq.streamOptionsIncludeUsage,
                     trace: trace, traces: traces)
             }
@@ -380,7 +385,11 @@ enum MomijHTTP {
             }
             if !emptyNameAtStart, let pf = pendingFix {
                 let brokenCall = parsed.calls[pf.idx]
-                let task = ArgRepair.originalUserText(effective.messages)
+                // Extraction reads the ORIGINAL conversation (role "tool"
+                // intact): effective.messages folds tool output into
+                // role "user" <tool_result> turns, which the task-selection
+                // heuristic then mistakes for the task.
+                let task = ArgRepair.originalUserText(chatReq.messages)
                 var adoptedByTask = false
                 // Extraction-first: a path-kind fix is answered
                 // deterministically from the task text (it names the exact
@@ -407,7 +416,27 @@ enum MomijHTTP {
                             // caught it selecting harness context).
                             "task_head": String(task.prefix(200))])
                         adoptedByTask = true
+                    } else {
+                        // Extracted a path but the call is still not clean —
+                        // fall through to the model re-ask, but say so:
+                        // silent fallthrough hid this live.
+                        trace.event("repair", "skip", detail: [
+                            "mode": "field", "source": "task", "kind": pf.kind,
+                            "reason": "unclean_after_task_merge",
+                            "task_head": String(task.prefix(200))])
                     }
+                } else if ArgRepair.isPathFix(kind: pf.kind, fields: pf.fields) {
+                    // Path-kind fix with no deterministic answer: the task
+                    // text is the extraction input, so record what was read
+                    // plus the candidate layout for the next unknown shape.
+                    trace.event("repair", "skip", detail: [
+                        "mode": "field", "source": "task", "kind": pf.kind,
+                        "reason": "no_task_path",
+                        "task_is_placeholder": task == "(no user text)",
+                        "task_head": String(task.prefix(200)),
+                        "user_heads": chatReq.messages
+                            .filter { $0.role == "user" }
+                            .map { String($0.content.prefix(60)) }])
                 }
                 if !adoptedByTask {
                     do {
@@ -429,7 +458,15 @@ enum MomijHTTP {
                                     .init(toolCalls: fixedCalls))
                                 trace.event("repair", "ok", detail: [
                                     "mode": "field", "kind": pf.kind, "fields": pf.fields])
+                            } else {
+                                trace.event("repair", "skip", detail: [
+                                    "mode": "field", "kind": pf.kind,
+                                    "reason": "unclean_after_model_merge"])
                             }
+                        } else {
+                            trace.event("repair", "skip", detail: [
+                                "mode": "field", "kind": pf.kind,
+                                "reason": "model_reply_unparsable"])
                         }
                     } catch {
                         trace.event("repair", "error", detail: [
@@ -756,6 +793,7 @@ enum MomijHTTP {
         engine: MomijEngine, prompt: [Int], options: GenerateOptions,
         toolsAttached: Bool, toolsLines: [String],
         effectiveMessages: [OpenAIChatCompat.ChatMessage],
+        originalMessages: [OpenAIChatCompat.ChatMessage],
         includeUsage: Bool,
         trace: RequestTrace, traces: TraceStore
     ) async throws -> Response {
@@ -865,7 +903,8 @@ enum MomijHTTP {
                         }
                         if !streamEmptyName, let pf = pendingFix {
                             let brokenCall = parsed.calls[pf.idx]
-                            let task = ArgRepair.originalUserText(effectiveMessages)
+                            // Original conversation (see the non-stream path).
+                            let task = ArgRepair.originalUserText(originalMessages)
                             var adoptedByTask = false
                             // Extraction-first (same contract as the
                             // non-stream path): a path-kind fix is answered
@@ -888,7 +927,21 @@ enum MomijHTTP {
                                         "kind": pf.kind, "fields": pf.fields,
                                         "task_head": String(task.prefix(200))])
                                     adoptedByTask = true
+                                } else {
+                                    trace.event("repair", "skip", detail: [
+                                        "mode": "field", "source": "task", "kind": pf.kind,
+                                        "reason": "unclean_after_task_merge",
+                                        "task_head": String(task.prefix(200))])
                                 }
+                            } else if ArgRepair.isPathFix(kind: pf.kind, fields: pf.fields) {
+                                trace.event("repair", "skip", detail: [
+                                    "mode": "field", "source": "task", "kind": pf.kind,
+                                    "reason": "no_task_path",
+                                    "task_is_placeholder": task == "(no user text)",
+                                    "task_head": String(task.prefix(200)),
+                                    "user_heads": originalMessages
+                                        .filter { $0.role == "user" }
+                                        .map { String($0.content.prefix(60)) }])
                             }
                             if !adoptedByTask {
                                 do {
@@ -915,7 +968,15 @@ enum MomijHTTP {
                                             trace.event("repair", "ok", detail: [
                                                 "mode": "field", "kind": pf.kind,
                                                 "fields": pf.fields])
+                                        } else {
+                                            trace.event("repair", "skip", detail: [
+                                                "mode": "field", "kind": pf.kind,
+                                                "reason": "unclean_after_model_merge"])
                                         }
+                                    } else {
+                                        trace.event("repair", "skip", detail: [
+                                            "mode": "field", "kind": pf.kind,
+                                            "reason": "model_reply_unparsable"])
                                     }
                                 } catch {
                                     trace.event("repair", "error", detail: [

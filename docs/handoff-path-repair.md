@@ -44,24 +44,19 @@ programmatically.
 
 ## What's left (the next session's job)
 
-1. **Extraction picked the wrong text (NEW, measured live)**: the repaired
-   path was `github/PULL_REQUEST_TEMPLATE.md` — `originalUserText` selected
-   the DSH-injected long context (which quotes `.github/PULL_REQUEST_TEMPLATE.md`
-   from AGENTS.md) instead of the task text. Two sub-fixes:
-   - Add `task_head` (first ~200 chars of the selected text) to the
-     `repair mode=field source=task` trace event so the selection is
-     observable; re-probe to confirm WHICH message wins.
-   - Then decide the fix: prefer the task-named candidate (e.g. scan ALL
-     candidate user texts, or bias toward the message containing the
-     pending-fix tool's context). Measurement first — do not spec-fix.
-2. **pathFromTask leading-dot trim**: token trimming strips a lone leading
-   `.` (`.github/...` → `github/...`, observed in the adopted path). Strip
-   only `./` pairs; keep hidden-file semantics. Red test included in the
-   fix: `pathFromTask("per .github/PULL_REQUEST_TEMPLATE.md")` should keep
-   the dot.
-3. **protocol_absorb live confirmation**: needs a run where Maple emits its
+1. **Live confirmation that extraction now reads the task text** (`921c4ca`
+   fixed both root causes with unit tests; the live firing is still
+   unconfirmed because Maple went flaky in probes 4–5 — it ended the turn
+   with plain-text plans instead of tool calls, twice in a row, on the exact
+   task that produced tool calls in probes 2–3; greedy output flips between
+   act/plan across runs — likely prefill-chunk-boundary numeric divergence,
+   unmeasured). When a run emits a path call again, check the
+   `source=task` repair event: `task_head` should now start with the task
+   text (not `<system-reminder>`) and the adopted path should be the
+   task-named relative path.
+2. **protocol_absorb live confirmation**: needs a run where Maple emits its
    ending fumble; watch `.momij-traces` for `protocol_absorb`.
-4. Optional (deferred): Needle 2 sidecar; momijctl docs note.
+3. Optional (deferred): Needle 2 sidecar; momijctl docs note.
 
 ## Live verification setup (UPDATED)
 
@@ -86,8 +81,12 @@ now sized by MOMIJ_FULL_MAX_LEN instead of a hard 16384).
 ## Known model-quality limits (not fixable by more plumbing)
 
 - Path CONTENT hallucination (`.github/PULL_REQUEST_TEMPLATE.md` picked from
-  in-context AGENTS.md text instead of the task's path) — extraction is the
-  intended fix but its TEXT SELECTION is currently wrong (item 1 above).
+  in-context AGENTS.md text instead of the task's path) — FIXED in
+  `921c4ca` (reminder-skip + dot preservation); live firing pending.
+- **Act/plan flakiness**: identical task text produced tool-call runs
+  (probes 2–3) then plain-text plan endings (probes 4–5) — greedy output is
+  not stable across runs (candidate cause: M-row prefill chunk boundaries
+  shift numerics; NOT measured — parity probe would settle it).
 - Ending protocol: Maple tries submit/ask_user_question with wrong args
   after long tool-call runs — the interception (item 2) absorbs it.
 - rope_theta=10000 with no scaling (config.json): serving past ~32k is

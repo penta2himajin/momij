@@ -374,6 +374,11 @@ enum MomijHTTP {
                                     toolLines: chatReq.toolsLines, tool: $0.name,
                                     args: ArgRepair.parseArgs($0.arguments)).isEmpty
                             } == false
+                            && fixedCalls.contains {
+                                PathPolicy.argsOutsideWorkspace(
+                                    ArgRepair.parseArgs($0.arguments),
+                                    root: PathPolicy.workspaceRoot() ?? "/")
+                            } == false
                         if clean {
                             parsed = ToolMarkup.ParsedToolCalls(
                                 cleanedContent: parsed.cleanedContent, calls: fixedCalls)
@@ -461,6 +466,11 @@ enum MomijHTTP {
                     !ArgRepair.missingRequiredFields(
                         toolLines: chatReq.toolsLines, tool: $0.name,
                         args: ArgRepair.parseArgs($0.arguments)).isEmpty
+                }
+                || parsed.calls.contains {
+                    PathPolicy.argsOutsideWorkspace(
+                        ArgRepair.parseArgs($0.arguments),
+                        root: PathPolicy.workspaceRoot() ?? "/")
                 }
             if repairFailed && brokenCalls {
                 respToolCalls = []
@@ -802,6 +812,11 @@ enum MomijHTTP {
                                                 toolLines: toolsLines, tool: $0.name,
                                                 args: ArgRepair.parseArgs($0.arguments)).isEmpty
                                         } == false
+                                        && fixedCalls.contains {
+                                            PathPolicy.argsOutsideWorkspace(
+                                                ArgRepair.parseArgs($0.arguments),
+                                                root: PathPolicy.workspaceRoot() ?? "/")
+                                        } == false
                                     if clean {
                                         parsed = ToolMarkup.ParsedToolCalls(
                                             cleanedContent: parsed.cleanedContent,
@@ -892,6 +907,11 @@ enum MomijHTTP {
                                 !ArgRepair.missingRequiredFields(
                                     toolLines: toolsLines, tool: $0.name,
                                     args: ArgRepair.parseArgs($0.arguments)).isEmpty
+                            }
+                            || parsed.calls.contains {
+                                PathPolicy.argsOutsideWorkspace(
+                                    ArgRepair.parseArgs($0.arguments),
+                                    root: PathPolicy.workspaceRoot() ?? "/")
                             }
                         if streamBrokenCalls {
                             if parsed.cleanedContent.trimmingCharacters(in: .whitespaces).isEmpty {

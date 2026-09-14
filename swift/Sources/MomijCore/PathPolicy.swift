@@ -94,6 +94,21 @@ public enum PathPolicy {
         return !cleaned.hasPrefix(root)
     }
 
+
+    /// True when ANY path field in the parsed args resolves outside the
+    /// workspace root (workspace mode only) — a repairable violation.
+    public static func argsOutsideWorkspace(
+        _ args: [String: Any], root: String
+    ) -> Bool {
+        for f in pathFields {
+            if let v = args[f] as? String, !v.isEmpty,
+               isOutsideWorkspace(v, root: root) {
+                return true
+            }
+        }
+        return false
+    }
+
     /// The instruction line appended to the tools suffix in workspace mode.
     public static func suffixLine() -> String {
         "Paths in tool calls are RELATIVE to the workspace root. "

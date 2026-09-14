@@ -144,7 +144,9 @@ final class ArgRepairTests: XCTestCase {
         XCTAssertEqual(obj?["path"] as? String, "a.md")
         XCTAssertNil(ArgRepair.firstJSONObject(in: "no object here"))
     }
-}
+
+    // MARK: extraction-first path fix (pathFromTask wiring)
+
     func testPathFromTask() {
         XCTAssertEqual(
             ArgRepair.pathFromTask(
@@ -156,3 +158,61 @@ final class ArgRepairTests: XCTestCase {
             "notes.md")
         XCTAssertNil(ArgRepair.pathFromTask("Reply with exactly OK"))
     }
+
+    func testIsPathFix() {
+        // The workspace scan's kind is always path-kind.
+        XCTAssertTrue(ArgRepair.isPathFix(kind: "path_outside_workspace", fields: ["path"]))
+        // Degenerate hits speaking of a path (aliased to file_path) too.
+        XCTAssertTrue(ArgRepair.isPathFix(kind: "degenerate_tool_args", fields: ["file_path"]))
+        // A required path property missing on the tool schema as well.
+        XCTAssertTrue(ArgRepair.isPathFix(kind: "missing_required_property", fields: ["path"]))
+        // Content/edits/description fixes are NOT answered by extraction.
+        XCTAssertFalse(ArgRepair.isPathFix(kind: "degenerate_tool_args", fields: ["content"]))
+        XCTAssertFalse(ArgRepair.isPathFix(kind: "missing_required_property", fields: ["description"]))
+    }
+
+    func testTaskPathMergeAnswersPathOutsideWorkspace() {
+        // The live task shape: the task names the exact relative path the
+        // model then hallucinated (/mijij-... instead of momij-...).
+        let task = "Write a Python 3 script at scratch/momij-subagent-test/count_verify_fires.py (this path is RELATIVE to the workspace root; always write paths in this relative form)."
+        let merged = ArgRepair.taskPathMerge(
+            kind: "path_outside_workspace", fields: ["path"],
+            args: ["path": "/mijij-subagent-test/count_verify_fires.py", "content": "print(1)"],
+            task: task)
+        XCTAssertEqual(
+            merged?["path"] as? String, "scratch/momij-subagent-test/count_verify_fires.py")
+        XCTAssertEqual(merged?["content"] as? String, "print(1)", "other fields survive")
+    }
+
+    func testTaskPathMergeAliasesFilePath() {
+        let merged = ArgRepair.taskPathMerge(
+            kind: "degenerate_tool_args", fields: ["file_path"],
+            args: ["file_path": "", "content": "body"],
+            task: "Create notes.md using the write tool. Put two short lines of text in it.")
+        XCTAssertEqual(merged?["file_path"] as? String, "notes.md")
+        XCTAssertEqual(merged?["content"] as? String, "body")
+    }
+
+    func testTaskPathMergeNilWhenNotPathKind() {
+        XCTAssertNil(ArgRepair.taskPathMerge(
+            kind: "degenerate_tool_args", fields: ["content"],
+            args: ["path": "a.py", "content": "x"],
+            task: "Write a.py with the content x"))
+    }
+
+    func testTaskPathMergeNilWhenTaskNamesNoPath() {
+        // No path in the task -> the caller falls back to the model re-ask.
+        XCTAssertNil(ArgRepair.taskPathMerge(
+            kind: "path_outside_workspace", fields: ["path"],
+            args: ["path": "/elsewhere/x.py"],
+            task: "Reply with exactly OK"))
+    }
+
+    func testTaskPathMergeNilWhenNonPathFieldsPending() {
+        // Extraction can only answer path fields; a mixed fix (path +
+        // description) must fall back to the model re-ask.
+        XCTAssertNil(ArgRepair.taskPathMerge(
+            kind: "missing_required_property", fields: ["path", "description"],
+            args: [:], task: "Write notes.md with the report"))
+    }
+}

@@ -222,4 +222,35 @@ public enum ArgRepair {
     private static let pathSuffixSet: Set<String> = [
         ".toml", ".rs", ".py", ".ts", ".js", ".json", ".md", ".txt", ".yml", ".yaml",
     ]
+
+    // MARK: - Extraction-first path fix (pathFromTask wiring)
+
+    /// True when a pending fix targets a path field: the workspace scan
+    /// (path_outside_workspace), an aliased path field from a degenerate
+    /// hit, or a schema-required path property missing on the call.
+    public static func isPathFix(kind: String, fields: [String]) -> Bool {
+        if kind == "path_outside_workspace" { return true }
+        return !Set(fields).isDisjoint(with: PathPolicy.pathFields)
+    }
+
+    /// Extraction-first answer for a path-kind pending fix: the task text
+    /// names the exact relative path, so merge `pathFromTask(task)` into
+    /// the pending path field(s) instead of re-asking the model (which
+    /// repeats its hallucination). Returns nil when the fix is not
+    /// path-kind, the task names no path, or the fix also covers non-path
+    /// fields (extraction cannot answer those — the caller falls back to
+    /// the model re-ask). The adoption decision stays with the caller's
+    /// clean check (degenerate / required / outside-workspace).
+    public static func taskPathMerge(
+        kind: String, fields: [String], args: [String: Any], task: String
+    ) -> [String: Any]? {
+        guard isPathFix(kind: kind, fields: fields) else { return nil }
+        guard let extracted = pathFromTask(task) else { return nil }
+        let pathFieldsTouched = fields.filter { PathPolicy.pathFields.contains($0) }
+        guard !pathFieldsTouched.isEmpty, pathFieldsTouched.count == fields.count
+        else { return nil }
+        var out = args
+        for f in pathFieldsTouched { out[f] = extracted }
+        return out
+    }
 }

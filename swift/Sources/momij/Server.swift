@@ -308,6 +308,18 @@ enum MomijHTTP {
                 return fail(.internalServerError, "decode failed: \(error)", trace: trace)
             }
             var parsed = ToolMarkup.parsePseudoToolCalls(text)
+            // Protocol-tool interception: the model's "I'm done" intent (a
+            // submit / ask_user_question call, often with unusable args)
+            // becomes a clean ending instead of a harness rejection loop.
+            // All calls drop, finish=stop, and the call's description (or a
+            // placeholder) is the final content.
+            if let absorb = ProtocolAbsorb.absorbCall(
+                in: parsed.calls, names: ProtocolAbsorb.toolNames()) {
+                parsed = ToolMarkup.ParsedToolCalls(
+                    cleanedContent: ProtocolAbsorb.finalContent(for: absorb), calls: [])
+                finish = "stop"
+                trace.event("protocol_absorb", "ok", detail: ["tool": absorb.name])
+            }
             // Degenerate-call repair, 3 stages: (1) targeted field re-ask —
             // regenerate ONLY the broken argument fields under the tool's
             // JSON schema and merge (good parts survive); (2) whole-reply
@@ -356,41 +368,57 @@ enum MomijHTTP {
             }
             if !emptyNameAtStart, let pf = pendingFix {
                 let brokenCall = parsed.calls[pf.idx]
-                do {
-                    let merged = try await MomijHTTP.fieldRepairCall(
-                        engine: engine, eos: eos, toolsLines: chatReq.toolsLines,
-                        tool: brokenCall.name, args: ArgRepair.parseArgs(brokenCall.arguments),
-                        fields: pf.fields, reasons: pf.reasons,
-                        task: ArgRepair.originalUserText(effective.messages),
-                        baseOpts: opts)
-                    if let merged {
-                        var fixedCalls = parsed.calls
-                        fixedCalls[pf.idx] = OpenAIChatCompat.ToolCallSpec(
-                            id: brokenCall.id, name: brokenCall.name,
-                            arguments: ArgRepair.argsJSONString(merged))
-                        let clean = ResponseVerify.degenerateToolArgs(.init(toolCalls: fixedCalls)) == nil
-                            && fixedCalls.contains {
-                                !ArgRepair.missingRequiredFields(
-                                    toolLines: chatReq.toolsLines, tool: $0.name,
-                                    args: ArgRepair.parseArgs($0.arguments)).isEmpty
-                            } == false
-                            && fixedCalls.contains {
-                                PathPolicy.argsOutsideWorkspace(
-                                    ArgRepair.parseArgs($0.arguments),
-                                    root: PathPolicy.workspaceRoot() ?? "/")
-                            } == false
-                        if clean {
-                            parsed = ToolMarkup.ParsedToolCalls(
-                                cleanedContent: parsed.cleanedContent, calls: fixedCalls)
-                            degenerateHit = ResponseVerify.degenerateToolArgs(
-                                .init(toolCalls: fixedCalls))
-                            trace.event("repair", "ok", detail: [
-                                "mode": "field", "kind": pf.kind, "fields": pf.fields])
-                        }
+                let task = ArgRepair.originalUserText(effective.messages)
+                var adoptedByTask = false
+                // Extraction-first: a path-kind fix is answered
+                // deterministically from the task text (it names the exact
+                // path; the model re-ask repeats its hallucination). Fall
+                // back to the model re-ask only when extraction gives no
+                // answer or the merged call fails the clean check.
+                if let taskMerged = ArgRepair.taskPathMerge(
+                    kind: pf.kind, fields: pf.fields,
+                    args: ArgRepair.parseArgs(brokenCall.arguments), task: task) {
+                    var fixedCalls = parsed.calls
+                    fixedCalls[pf.idx] = OpenAIChatCompat.ToolCallSpec(
+                        id: brokenCall.id, name: brokenCall.name,
+                        arguments: ArgRepair.argsJSONString(taskMerged))
+                    if callsClean(fixedCalls, toolsLines: chatReq.toolsLines) {
+                        parsed = ToolMarkup.ParsedToolCalls(
+                            cleanedContent: parsed.cleanedContent, calls: fixedCalls)
+                        degenerateHit = ResponseVerify.degenerateToolArgs(
+                            .init(toolCalls: fixedCalls))
+                        trace.event("repair", "ok", detail: [
+                            "mode": "field", "source": "task",
+                            "kind": pf.kind, "fields": pf.fields])
+                        adoptedByTask = true
                     }
-                } catch {
-                    trace.event("repair", "error", detail: [
-                        "mode": "field", "kind": pf.kind, "error": "\(error)"])
+                }
+                if !adoptedByTask {
+                    do {
+                        let merged = try await MomijHTTP.fieldRepairCall(
+                            engine: engine, eos: eos, toolsLines: chatReq.toolsLines,
+                            tool: brokenCall.name, args: ArgRepair.parseArgs(brokenCall.arguments),
+                            fields: pf.fields, reasons: pf.reasons,
+                            task: task,
+                            baseOpts: opts)
+                        if let merged {
+                            var fixedCalls = parsed.calls
+                            fixedCalls[pf.idx] = OpenAIChatCompat.ToolCallSpec(
+                                id: brokenCall.id, name: brokenCall.name,
+                                arguments: ArgRepair.argsJSONString(merged))
+                            if callsClean(fixedCalls, toolsLines: chatReq.toolsLines) {
+                                parsed = ToolMarkup.ParsedToolCalls(
+                                    cleanedContent: parsed.cleanedContent, calls: fixedCalls)
+                                degenerateHit = ResponseVerify.degenerateToolArgs(
+                                    .init(toolCalls: fixedCalls))
+                                trace.event("repair", "ok", detail: [
+                                    "mode": "field", "kind": pf.kind, "fields": pf.fields])
+                            }
+                        }
+                    } catch {
+                        trace.event("repair", "error", detail: [
+                            "mode": "field", "kind": pf.kind, "error": "\(error)"])
+                    }
                 }
             }
             let repairNudge: String
@@ -566,6 +594,26 @@ enum MomijHTTP {
             }
         }
         return (out, count)
+    }
+
+    /// Clean check for repaired calls: no degenerate args, no missing
+    /// required fields, and no outside-workspace path values (workspace
+    /// mode only — the policy is off when MOMIJ_WORKSPACE is unset).
+    /// Shared by the field-repair adoption sites on both paths.
+    static func callsClean(
+        _ calls: [OpenAIChatCompat.ToolCallSpec], toolsLines: [String]
+    ) -> Bool {
+        return ResponseVerify.degenerateToolArgs(.init(toolCalls: calls)) == nil
+            && calls.contains {
+                !ArgRepair.missingRequiredFields(
+                    toolLines: toolsLines, tool: $0.name,
+                    args: ArgRepair.parseArgs($0.arguments)).isEmpty
+            } == false
+            && calls.contains {
+                PathPolicy.argsOutsideWorkspace(
+                    ArgRepair.parseArgs($0.arguments),
+                    root: PathPolicy.workspaceRoot() ?? "/")
+            } == false
     }
 
     /// Per-request structured trace (lightweight compositor parity).
@@ -744,6 +792,17 @@ enum MomijHTTP {
                         rawHead = raw
                         let text = ChatTemplatePatch.stripThinkForContent(raw)
                         var parsed = ToolMarkup.parsePseudoToolCalls(text)
+                        // Protocol-tool interception on the stream path too:
+                        // the "I'm done" intent becomes a clean stop instead
+                        // of a rejection loop.
+                        if let absorb = ProtocolAbsorb.absorbCall(
+                            in: parsed.calls, names: ProtocolAbsorb.toolNames()) {
+                            parsed = ToolMarkup.ParsedToolCalls(
+                                cleanedContent: ProtocolAbsorb.finalContent(for: absorb),
+                                calls: [])
+                            finish = "stop"
+                            trace.event("protocol_absorb", "ok", detail: ["tool": absorb.name])
+                        }
                         // Degenerate-call repair on the stream path too, 3
                         // stages: field re-ask (merge), whole-reply nudge,
                         // then drop — a broken write/edit must not reach the
@@ -790,46 +849,62 @@ enum MomijHTTP {
                         }
                         if !streamEmptyName, let pf = pendingFix {
                             let brokenCall = parsed.calls[pf.idx]
-                            do {
-                                let merged = try await MomijHTTP.fieldRepairCall(
-                                    engine: engine,
-                                    eos: options.eosTokenIds.first ?? 151_645,
-                                    toolsLines: toolsLines,
-                                    tool: brokenCall.name,
-                                    args: ArgRepair.parseArgs(brokenCall.arguments),
-                                    fields: pf.fields, reasons: pf.reasons,
-                                    task: ArgRepair.originalUserText(effectiveMessages),
-                                    baseOpts: options)
-                                if let merged {
-                                    var fixedCalls = parsed.calls
-                                    fixedCalls[pf.idx] = OpenAIChatCompat.ToolCallSpec(
-                                        id: brokenCall.id, name: brokenCall.name,
-                                        arguments: ArgRepair.argsJSONString(merged))
-                                    let clean = ResponseVerify.degenerateToolArgs(
-                                        .init(toolCalls: fixedCalls)) == nil
-                                        && fixedCalls.contains {
-                                            !ArgRepair.missingRequiredFields(
-                                                toolLines: toolsLines, tool: $0.name,
-                                                args: ArgRepair.parseArgs($0.arguments)).isEmpty
-                                        } == false
-                                        && fixedCalls.contains {
-                                            PathPolicy.argsOutsideWorkspace(
-                                                ArgRepair.parseArgs($0.arguments),
-                                                root: PathPolicy.workspaceRoot() ?? "/")
-                                        } == false
-                                    if clean {
-                                        parsed = ToolMarkup.ParsedToolCalls(
-                                            cleanedContent: parsed.cleanedContent,
-                                            calls: fixedCalls)
-                                        degenerateHit = ResponseVerify.degenerateToolArgs(
-                                            .init(toolCalls: fixedCalls))
-                                        trace.event("repair", "ok", detail: [
-                                            "mode": "field", "kind": pf.kind, "fields": pf.fields])
-                                    }
+                            let task = ArgRepair.originalUserText(effectiveMessages)
+                            var adoptedByTask = false
+                            // Extraction-first (same contract as the
+                            // non-stream path): a path-kind fix is answered
+                            // from the task text before any model re-ask.
+                            if let taskMerged = ArgRepair.taskPathMerge(
+                                kind: pf.kind, fields: pf.fields,
+                                args: ArgRepair.parseArgs(brokenCall.arguments), task: task) {
+                                var fixedCalls = parsed.calls
+                                fixedCalls[pf.idx] = OpenAIChatCompat.ToolCallSpec(
+                                    id: brokenCall.id, name: brokenCall.name,
+                                    arguments: ArgRepair.argsJSONString(taskMerged))
+                                if callsClean(fixedCalls, toolsLines: toolsLines) {
+                                    parsed = ToolMarkup.ParsedToolCalls(
+                                        cleanedContent: parsed.cleanedContent,
+                                        calls: fixedCalls)
+                                    degenerateHit = ResponseVerify.degenerateToolArgs(
+                                        .init(toolCalls: fixedCalls))
+                                    trace.event("repair", "ok", detail: [
+                                        "mode": "field", "source": "task",
+                                        "kind": pf.kind, "fields": pf.fields])
+                                    adoptedByTask = true
                                 }
-                            } catch {
-                                trace.event("repair", "error", detail: [
-                                    "mode": "field", "kind": pf.kind, "error": "\(error)"])
+                            }
+                            if !adoptedByTask {
+                                do {
+                                    let merged = try await MomijHTTP.fieldRepairCall(
+                                        engine: engine,
+                                        eos: options.eosTokenIds.first ?? 151_645,
+                                        toolsLines: toolsLines,
+                                        tool: brokenCall.name,
+                                        args: ArgRepair.parseArgs(brokenCall.arguments),
+                                        fields: pf.fields, reasons: pf.reasons,
+                                        task: task,
+                                        baseOpts: options)
+                                    if let merged {
+                                        var fixedCalls = parsed.calls
+                                        fixedCalls[pf.idx] = OpenAIChatCompat.ToolCallSpec(
+                                            id: brokenCall.id, name: brokenCall.name,
+                                            arguments: ArgRepair.argsJSONString(merged))
+                                        if callsClean(fixedCalls, toolsLines: toolsLines) {
+                                            parsed = ToolMarkup.ParsedToolCalls(
+                                                cleanedContent: parsed.cleanedContent,
+                                                calls: fixedCalls)
+                                            degenerateHit = ResponseVerify.degenerateToolArgs(
+                                                .init(toolCalls: fixedCalls))
+                                            trace.event("repair", "ok", detail: [
+                                                "mode": "field", "kind": pf.kind,
+                                                "fields": pf.fields])
+                                        }
+                                    }
+                                } catch {
+                                    trace.event("repair", "error", detail: [
+                                        "mode": "field", "kind": pf.kind,
+                                        "error": "\(error)"])
+                                }
                             }
                         }
                         let needsRepair = degenerateHit != nil || streamEmptyName

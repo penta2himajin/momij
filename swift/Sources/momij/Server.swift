@@ -401,7 +401,11 @@ enum MomijHTTP {
                             .init(toolCalls: fixedCalls))
                         trace.event("repair", "ok", detail: [
                             "mode": "field", "source": "task",
-                            "kind": pf.kind, "fields": pf.fields])
+                            "kind": pf.kind, "fields": pf.fields,
+                            // Observable extraction-input selection: which
+                            // text originalUserText picked (the live probe
+                            // caught it selecting harness context).
+                            "task_head": String(task.prefix(200))])
                         adoptedByTask = true
                     }
                 }
@@ -881,7 +885,8 @@ enum MomijHTTP {
                                         .init(toolCalls: fixedCalls))
                                     trace.event("repair", "ok", detail: [
                                         "mode": "field", "source": "task",
-                                        "kind": pf.kind, "fields": pf.fields])
+                                        "kind": pf.kind, "fields": pf.fields,
+                                        "task_head": String(task.prefix(200))])
                                     adoptedByTask = true
                                 }
                             }

@@ -40,6 +40,25 @@ final class ArgRepairTests: XCTestCase {
         XCTAssertEqual(ArgRepair.originalUserText(messages), "(no user text)")
     }
 
+    func testOriginalUserTextSkipsHarnessReminderBlocks() {
+        // DSH wraps harness context (workspace instructions incl. repo paths
+        // like .github/PULL_REQUEST_TEMPLATE.md) as <system-reminder> user
+        // turns. They are LONGER than the task, so the "longest early"
+        // heuristic selects them and path extraction reads the wrong text
+        // (measured live: adopted path github/PULL_REQUEST_TEMPLATE.md).
+        let reminder = "<system-reminder>\nThe following workspace instructions "
+            + String(repeating: "may be relevant to your work. ", count: 30)
+            + ".github/PULL_REQUEST_TEMPLATE.md\n</system-reminder>"
+        let task = String(repeating: "write scratch/momij-subagent-test/x.py ", count: 6)
+            .trimmingCharacters(in: .whitespaces)
+        let messages: [OpenAIChatCompat.ChatMessage] = [
+            .init(role: "system", content: "sys"),
+            .init(role: "user", content: reminder),
+            .init(role: "user", content: task),
+        ]
+        XCTAssertEqual(ArgRepair.originalUserText(messages), task)
+    }
+
     // MARK: schema construction
 
     private let toolLines = [
@@ -157,6 +176,20 @@ final class ArgRepairTests: XCTestCase {
                 "Create a new file named notes.md using the write tool. Put two short lines of text in it."),
             "notes.md")
         XCTAssertNil(ArgRepair.pathFromTask("Reply with exactly OK"))
+    }
+
+    func testPathFromTaskKeepsLeadingDot() {
+        // Hidden-directory paths keep the dot: ".github/..." must not be
+        // mangled into "github/..." (the live probe adopted exactly that
+        // mangled path from the harness-injected context text).
+        XCTAssertEqual(
+            ArgRepair.pathFromTask(
+                "One PR per workstream; closes the work per .github/PULL_REQUEST_TEMPLATE.md."),
+            ".github/PULL_REQUEST_TEMPLATE.md")
+        // "./debris" and leading-slash debris still normalize; trailing
+        // sentence punctuation still strips.
+        XCTAssertEqual(ArgRepair.pathFromTask("Save to ./notes.md."), "notes.md")
+        XCTAssertEqual(ArgRepair.pathFromTask("Write /scratch/a.py now"), "scratch/a.py")
     }
 
     func testIsPathFix() {

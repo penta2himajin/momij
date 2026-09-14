@@ -55,7 +55,11 @@ public enum ArgRepair {
     }
 
     /// evprtr `original_user_text`: prefer the primary user task (the
-    /// longest early user message), skipping tiny placeholder turns.
+    /// longest early user message), skipping tiny placeholder turns AND
+    /// harness-injected `<system-reminder>` instruction blocks (they are
+    /// longer than the task, so the length heuristic would otherwise select
+    /// them and path extraction would read repo paths quoted from the
+    /// injected context instead of the task — measured live).
     public static func originalUserText(_ messages: [OpenAIChatCompat.ChatMessage]) -> String {
         var candidates: [(idx: Int, len: Int, text: String)] = []
         for (idx, m) in messages.enumerated() where m.role == "user" {
@@ -63,6 +67,7 @@ public enum ArgRepair {
             if text.isEmpty { continue }
             let lowered = text.lowercased()
             if ["agent", "(no user text)", "no user text"].contains(lowered) { continue }
+            if isHarnessReminderBlock(text) { continue }
             candidates.append((idx, text.count, text))
         }
         if candidates.isEmpty { return "(no user text)" }
@@ -71,6 +76,14 @@ public enum ArgRepair {
         let primary = candidates.filter { $0.len >= threshold }
         let pool = primary.isEmpty ? candidates : primary
         return pool.min { ($0.idx, -$0.len) < ($1.idx, -$1.len) }?.text ?? "(no user text)"
+    }
+
+    /// A user turn that is actually a harness-injected instruction block
+    /// (DSH wraps workspace context in `<system-reminder>…</system-reminder>`).
+    /// Only the WRAPPER form (turn starts with the tag) is excluded; a task
+    /// message that merely quotes or follows a reminder stays a candidate.
+    public static func isHarnessReminderBlock(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<system-reminder>")
     }
 
     // MARK: - Schema for the constrained re-ask
@@ -208,10 +221,17 @@ public enum ArgRepair {
         if !current.isEmpty { tokens.append(current) }
         var candidates: [String] = []
         for tok in tokens {
-            let t = tok.trimmingCharacters(in: CharacterSet(charactersIn: "./"))
-            if t.isEmpty { continue }
-            if pathSuffixSet.contains(where: { t.lowercased().hasSuffix($0) }) {
-                candidates.append(t)
+            // Leading "./" pairs and bare slashes are debris; a lone leading
+            // dot is hidden-directory semantics and must survive
+            // (".github/PULL_REQUEST_TEMPLATE.md" is not "github/...").
+            var t = Substring(tok)
+            while t.hasPrefix("./") { t = t.dropFirst(2) }
+            while t.hasPrefix("/") { t = t.dropFirst() }
+            while let last = t.last, last == "." || last == "/" { t = t.dropLast() }
+            let cleaned = String(t)
+            if cleaned.isEmpty { continue }
+            if pathSuffixSet.contains(where: { cleaned.lowercased().hasSuffix($0) }) {
+                candidates.append(cleaned)
             }
         }
         let slashed = candidates.filter { $0.contains("/") }

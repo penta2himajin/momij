@@ -66,7 +66,7 @@ fn condition(name: &str) -> Option<Condition> {
             0.0,
             1.0,
             0.0,
-            json!({"dry_multiplier": 0.8, "dry_base": 1.75, "dry_allowed_length": 2, "dry_penalty_last_n": -1}),
+            json!({"dry_multiplier": 0.8, "dry_base": 1.75, "dry_allowed_length": 2, "dry_penalty_last_n": 4096}),
         ),
         // The Weight-Space Programming evaluation settings.
         "wsp" => c("wsp", 0.6, 0.95, 1.5, json!({"top_k": 20})),

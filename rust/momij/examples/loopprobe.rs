@@ -11,7 +11,7 @@
 //! cargo run --release -p momij --example loopprobe -- \
 //!   --llama-url http://127.0.0.1:8080 --prompts prompts.jsonl --out runs.jsonl \
 //!   [--conditions greedy,official,dry,wsp,momij_sampled] [--samples 3] \
-//!   [--max-tokens 400] [--thinking] [--no-cache] [--only id1,id2]
+//!   [--max-tokens 400] [--thinking] [--no-cache] [--skip-done] [--only id1,id2]
 //! ```
 
 use std::collections::HashSet;
@@ -84,6 +84,8 @@ struct Args {
     thinking: bool,
     /// Send `cache_prompt: false` so a run never depends on what the slot cached before.
     no_cache: bool,
+    /// Skip (id, condition, sample) rows already in `--out`, so a restarted run resumes.
+    skip_done: bool,
     only: Option<HashSet<String>>,
 }
 
@@ -97,6 +99,7 @@ fn parse_args() -> Result<Args, String> {
         max_tokens: 400,
         thinking: false,
         no_cache: false,
+        skip_done: false,
         only: None,
     };
     let mut it = std::env::args().skip(1);
@@ -114,6 +117,7 @@ fn parse_args() -> Result<Args, String> {
             "--only" => a.only = Some(val()?.split(',').map(str::to_owned).collect()),
             "--thinking" => a.thinking = true,
             "--no-cache" => a.no_cache = true,
+            "--skip-done" => a.skip_done = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -279,6 +283,22 @@ async fn main() -> Result<(), String> {
     cfg.thinking_enabled = args.thinking;
     let engine = Engine::new(Arc::new(backend), cfg, TraceStore::new(tmp));
     let client = reqwest::Client::new();
+    let done: HashSet<(String, String, u64)> = if args.skip_done {
+        std::fs::read_to_string(&args.out)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter_map(|r| {
+                Some((
+                    r["id"].as_str()?.to_owned(),
+                    r["condition"].as_str()?.to_owned(),
+                    r["sample"].as_u64()?,
+                ))
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let mut out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -319,6 +339,9 @@ async fn main() -> Result<(), String> {
                 args.samples
             };
             for s in 0..samples {
+                if done.contains(&(id.clone(), cname.clone(), s as u64)) {
+                    continue;
+                }
                 match run_one(
                     &engine,
                     &client,

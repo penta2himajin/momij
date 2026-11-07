@@ -157,6 +157,18 @@ async fn stream_tokens(
     Ok(tokens)
 }
 
+/// Share of repeated 4-grams among all 4-grams of `tokens` (0 = all distinct,
+/// near 1 = the same few 4-grams over and over). Needs no text detector, so it
+/// also sees line-/number-separated repetition and long periods.
+fn rep4(tokens: &[TokenId]) -> f64 {
+    let grams: Vec<&[TokenId]> = tokens.windows(4).collect();
+    if grams.is_empty() {
+        return 0.0;
+    }
+    let distinct: HashSet<&[TokenId]> = grams.iter().copied().collect();
+    1.0 - distinct.len() as f64 / grams.len() as f64
+}
+
 fn head(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
@@ -199,6 +211,8 @@ async fn run_one(
         "length"
     };
     let ids = openai_compat::content_token_ids(&tokens, &options.eos_token_ids);
+    let rep4_all = rep4(&ids);
+    let rep4_tail = rep4(&ids[ids.len().saturating_sub(200)..]);
     let raw = if ids.is_empty() {
         String::new()
     } else {
@@ -237,7 +251,8 @@ async fn run_one(
         .map(|h| h.onset);
     Ok(json!({
         "condition": cond.name, "sample": sample, "tokens": tokens.len(), "finish": finish, "seconds": (secs * 10.0).round() / 10.0,
-        "looped": looped, "loop_onset_chars": first_onset, "hits": hits,
+        "looped": looped, "loop_onset_chars": first_onset,
+        "rep4_all": (rep4_all * 1000.0).round() / 1000.0, "rep4_tail": (rep4_tail * 1000.0).round() / 1000.0, "hits": hits,
         "tool_calls": parsed.calls.len(),
         "degenerate_tool_args": parsed.calls.iter().any(|c| c.name.is_empty()) || outcome.hits.iter().any(|h| h.kind == "degenerate_tool_args"),
         "chars": text.chars().count(), "text_head": head(&text, 160), "text_tail": tail(&text, 160),

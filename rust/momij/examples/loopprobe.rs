@@ -11,7 +11,7 @@
 //! cargo run --release -p momij --example loopprobe -- \
 //!   --llama-url http://127.0.0.1:8080 --prompts prompts.jsonl --out runs.jsonl \
 //!   [--conditions greedy,official,dry,wsp,momij_sampled] [--samples 3] \
-//!   [--max-tokens 400] [--thinking] [--only id1,id2]
+//!   [--max-tokens 400] [--thinking] [--no-cache] [--only id1,id2]
 //! ```
 
 use std::collections::HashSet;
@@ -82,6 +82,8 @@ struct Args {
     samples: usize,
     max_tokens: usize,
     thinking: bool,
+    /// Send `cache_prompt: false` so a run never depends on what the slot cached before.
+    no_cache: bool,
     only: Option<HashSet<String>>,
 }
 
@@ -94,6 +96,7 @@ fn parse_args() -> Result<Args, String> {
         samples: 1,
         max_tokens: 400,
         thinking: false,
+        no_cache: false,
         only: None,
     };
     let mut it = std::env::args().skip(1);
@@ -110,6 +113,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--only" => a.only = Some(val()?.split(',').map(str::to_owned).collect()),
             "--thinking" => a.thinking = true,
+            "--no-cache" => a.no_cache = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -178,6 +182,7 @@ fn tail(s: &str, n: usize) -> String {
     chars[chars.len().saturating_sub(n)..].iter().collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_one(
     engine: &Engine,
     client: &reqwest::Client,
@@ -186,6 +191,7 @@ async fn run_one(
     cond: &Condition,
     sample: usize,
     max_tokens: usize,
+    no_cache: bool,
 ) -> Result<Value, String> {
     let mut options = prepared.options.clone();
     options.max_tokens = max_tokens;
@@ -200,6 +206,9 @@ async fn run_one(
     });
     if let (Some(map), Some(extra)) = (body.as_object_mut(), cond.extra.as_object()) {
         map.extend(extra.clone());
+    }
+    if no_cache {
+        body["cache_prompt"] = json!(false);
     }
     let started = Instant::now();
     let tokens = stream_tokens(client, url, &body).await?;
@@ -318,6 +327,7 @@ async fn main() -> Result<(), String> {
                     &cond,
                     s,
                     args.max_tokens,
+                    args.no_cache,
                 )
                 .await
                 {

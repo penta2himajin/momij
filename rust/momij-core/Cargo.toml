@@ -1,0 +1,19 @@
+[package]
+name = "momij-core"
+description = "Engine core for momij (Rust port of swift/Sources/MomijCore, minus model execution)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+rand = "0.9"
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

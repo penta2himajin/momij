@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["rust/momij-core", "rust/momij"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+license-file = "LICENSE"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -31,6 +31,16 @@ Contract notes:
 - Assistant text (including `<tool_call>` markup) is returned in `choices[0].message.content`. Native OpenAI `tool_calls` are not required.
 - `Authorization` is ignored (no 401). One request at a time (in-process lock).
 
+## Rust port (llama.cpp backend)
+
+A Rust workspace (`Cargo.toml`, `rust/`) re-implements the server, repair pipeline and CLI, and runs Maple
+through the official DeepGrove `llama.cpp` fork instead of the in-process engines. See
+[docs/rust-port.md](docs/rust-port.md).
+
+```bash
+cargo run --release -p momij -- serve --llama-url http://127.0.0.1:8080 --port 8742
+```
+
 ## Setup
 
 ```bash

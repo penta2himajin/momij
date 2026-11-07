@@ -206,6 +206,62 @@ impl SseDecoder {
     }
 }
 
+/// Server-side timings of one non-stream completion.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Timings {
+    pub prompt_tokens: usize,
+    pub prompt_tps: f64,
+    pub predicted_tokens: usize,
+    pub predicted_tps: f64,
+}
+
+/// `/completion` body for a benchmark trial: exactly `n_predict` tokens
+/// (EOS ignored, like `mlx_lm.benchmark`), prompt cache off so every trial
+/// pays the prefill, greedy.
+pub fn bench_body(prompt: &[TokenId], n_predict: usize) -> Value {
+    json!({
+        "prompt": prompt,
+        "n_predict": n_predict,
+        "ignore_eos": true,
+        "cache_prompt": false,
+        "temperature": 0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "stream": false,
+    })
+}
+
+pub fn parse_timings(v: &Value) -> Result<Timings, BackendError> {
+    let t = v
+        .get("timings")
+        .ok_or_else(|| BackendError::Protocol("response has no `timings`".into()))?;
+    let num = |k: &str| {
+        t.get(k)
+            .and_then(Value::as_f64)
+            .ok_or_else(|| BackendError::Protocol(format!("timings.{k} missing")))
+    };
+    Ok(Timings {
+        prompt_tokens: num("prompt_n")? as usize,
+        prompt_tps: num("prompt_per_second")?,
+        predicted_tokens: num("predicted_n")? as usize,
+        predicted_tps: num("predicted_per_second")?,
+    })
+}
+
+impl LlamaServerBackend {
+    /// One benchmark trial (see [`bench_body`]).
+    pub async fn bench_once(
+        &self,
+        prompt: &[TokenId],
+        n_predict: usize,
+    ) -> Result<Timings, BackendError> {
+        let v = self
+            .post_json("/completion", &bench_body(prompt, n_predict))
+            .await?;
+        parse_timings(&v)
+    }
+}
+
 #[async_trait]
 impl Backend for LlamaServerBackend {
     async fn tokenize(
@@ -407,6 +463,41 @@ mod tests {
         let mut d = SseDecoder::default();
         assert!(d.push(&bytes[..12]).is_empty());
         assert_eq!(d.push(&bytes[12..]), ["{\"c\":\"日\"}"]);
+    }
+
+    #[test]
+    fn bench_body_pins_the_generation_length() {
+        let b = bench_body(&[1, 2], 32);
+        assert_eq!(
+            (
+                b["n_predict"].clone(),
+                b["ignore_eos"].clone(),
+                b["cache_prompt"].clone()
+            ),
+            (json!(32), json!(true), json!(false))
+        );
+        assert_eq!(b["stream"], false);
+    }
+
+    #[test]
+    fn timings_parse_and_report_missing_fields() {
+        let ok = json!({"timings": {"prompt_n": 64, "prompt_per_second": 137.7, "predicted_n": 8, "predicted_per_second": 35.9}});
+        assert_eq!(
+            parse_timings(&ok).unwrap(),
+            Timings {
+                prompt_tokens: 64,
+                prompt_tps: 137.7,
+                predicted_tokens: 8,
+                predicted_tps: 35.9
+            }
+        );
+        assert!(parse_timings(&json!({})).is_err());
+        assert!(
+            parse_timings(&json!({"timings": {"prompt_n": 1}}))
+                .unwrap_err()
+                .to_string()
+                .contains("prompt_per_second")
+        );
     }
 
     // MARK: fake llama-server (exercises the real HTTP client)

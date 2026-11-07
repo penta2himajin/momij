@@ -440,6 +440,52 @@ async fn broken_calls_are_dropped_after_a_failed_repair() {
     );
 }
 
+/// Kept Swift divergence (see `pipeline::Mode`): a call that still misses a
+/// required field after a failed field repair is SENT on the non-stream path
+/// (the drop only follows a failed whole-reply repair) ...
+#[tokio::test]
+async fn block_path_sends_a_call_with_a_missing_required_field_when_repair_fails() {
+    let reply = call_block("write", r#"{"path": "notes.md"}"#);
+    let h = harness(&[&reply, "no json at all"]);
+    let (_, resp) = chat(
+        &h,
+        json!({"messages": [user("Save the greeting.")], "tools": tools()}),
+    )
+    .await;
+    assert_eq!(finish(&resp), "tool_calls");
+    assert_eq!(msg(&resp)["tool_calls"][0]["function"]["name"], "write");
+}
+
+/// ... and DROPPED on the stream path.
+#[tokio::test]
+async fn stream_path_drops_a_call_with_a_missing_required_field_when_repair_fails() {
+    let reply = call_block("write", r#"{"path": "notes.md"}"#);
+    let h = harness(&[&reply, "no json at all"]);
+    let (_, events) = chat_stream(
+        &h,
+        json!({"messages": [user("Save the greeting.")], "tools": tools()}),
+    )
+    .await;
+    let parsed: Vec<Value> = events[..events.len() - 1]
+        .iter()
+        .map(|e| serde_json::from_str(e).unwrap())
+        .collect();
+    assert!(
+        parsed
+            .iter()
+            .all(|c| c["choices"][0]["delta"].get("tool_calls").is_none()),
+        "{events:?}"
+    );
+    assert_eq!(
+        parsed[0]["choices"][0]["delta"]["content"],
+        "Previous tool call arguments were unusable and were discarded."
+    );
+    assert_eq!(
+        parsed.last().unwrap()["choices"][0]["finish_reason"],
+        "stop"
+    );
+}
+
 #[tokio::test]
 async fn repeated_identical_tool_calls_get_a_loop_breaking_nudge() {
     let h = harness(&["ok"]);

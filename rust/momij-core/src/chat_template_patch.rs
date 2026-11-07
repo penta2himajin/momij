@@ -33,6 +33,20 @@ pub fn without_forced_think(template: &str) -> String {
     template.replace(FROM, TO)
 }
 
+/// Prompt-string form of [`without_forced_think`], for backends that render
+/// the chat template themselves (llama-server `/apply-template`): drop the
+/// `<think>\n` the stock template appends to the generation prompt. Only the
+/// TRAILING generation prompt is touched; reasoning rendered into earlier
+/// assistant turns is history and stays.
+pub fn without_forced_think_prompt(prompt: &str) -> String {
+    const FROM: &str = "<|im_start|>assistant\n<think>\n";
+    const TO: &str = "<|im_start|>assistant\n";
+    match prompt.strip_suffix(FROM) {
+        Some(head) => format!("{head}{TO}"),
+        None => prompt.to_owned(),
+    }
+}
+
 pub fn load_model_template(model_dir: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(model_dir.as_ref().join("chat_template.jinja")).ok()
 }
@@ -98,6 +112,25 @@ mod tests {
     fn without_forced_think_leaves_other_templates_alone() {
         let t = "{{- 'hello' }}";
         assert_eq!(without_forced_think(t), t);
+    }
+
+    #[test]
+    fn without_forced_think_prompt_only_touches_the_trailing_generation_prompt() {
+        let history = "<|im_start|>assistant\n<think>\nold\n</think>\nhi<|im_end|>\n";
+        let prompt =
+            format!("{history}<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\n");
+        let patched = without_forced_think_prompt(&prompt);
+        assert_eq!(
+            patched,
+            format!("{history}<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n")
+        );
+        assert!(
+            patched.contains("<think>\nold"),
+            "history reasoning must stay"
+        );
+        // Already patched / different shapes are left alone.
+        assert_eq!(without_forced_think_prompt(&patched), patched);
+        assert_eq!(without_forced_think_prompt("plain"), "plain");
     }
 
     #[test]

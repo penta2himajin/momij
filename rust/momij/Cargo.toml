@@ -1,14 +1,35 @@
 [package]
 name = "momij"
-description = "CLI + OpenAI-compatible server for momij (Rust port of swift/Sources/momij)"
+description = "CLI + OpenAI-compatible server for momij, backed by the official DeepGrove llama.cpp server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
 
+[lib]
+name = "momij"
+path = "src/lib.rs"
+
+[[bin]]
+name = "momij"
+path = "src/main.rs"
+
 [dependencies]
 momij-core = { path = "../momij-core" }
+async-stream = "0.3"
+async-trait = "0.1"
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true
